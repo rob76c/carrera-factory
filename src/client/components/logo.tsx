@@ -48,7 +48,7 @@ export function LogoText({ className }: LogoTextProps) {
       className={cn('tracking-tight uppercase', className)}
       style={{ fontFamily: 'Inter, system-ui, sans-serif' }}
     >
-      <span className="font-black text-foreground">Factory</span>
+      <span className="font-black text-foreground">Carrera</span>
       <span className="font-black ml-1 text-foreground/35 dark:text-brand">Factory</span>
     </span>
   );

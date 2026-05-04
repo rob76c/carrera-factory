@@ -135,7 +135,7 @@ graph TB
 
 - **VMs (Docker/Firecracker)**: Isolated execution environments, one per user. All of a user's workspaces run inside their VM as Claude CLI subprocesses managed by FF Core. User authenticates to GitHub and Anthropic inside their VM via terminal.
 
-- **FF Core Library (Open Source)**: Published to npm as `@factory-factory/core`. Provides workspace execution primitives: Claude CLI management, session management, git operations, ratchet logic. Used by both desktop and cloud VMs.
+- **FF Core Library (Open Source)**: Published to npm as `@carrera-factory/core`. Provides workspace execution primitives: Claude CLI management, session management, git operations, ratchet logic. Used by both desktop and cloud VMs.
 
 - **Claude CLI**: Subprocess managed by FF Core that wraps the Anthropic Claude API. Handles tool execution, streaming responses, and conversation management.
 
@@ -189,8 +189,8 @@ See [Appendix: Alternative Approaches](./appendix-alternatives.md) for other app
 **FF Core exposes a clean TypeScript API that both desktop and cloud use:**
 
 ```typescript
-// FF Core library (@factory-factory/core)
-import { WorkspaceManager, Session, ClaudeClient } from '@factory-factory/core';
+// FF Core library (@carrera-factory/core)
+import { WorkspaceManager, Session, ClaudeClient } from '@carrera-factory/core';
 
 // Example: FF Cloud uses FF Core to manage workspaces in VMs
 class CloudWorkspaceService {
@@ -350,7 +350,7 @@ app.post('/workspaces', authenticate, async (req, res) => {
 **Desktop FF and FF Core in VMs both use this:**
 
 ```typescript
-// @factory-factory/core (open source)
+// @carrera-factory/core (open source)
 
 export class WorkspaceManager {
   createFromIssue(issueUrl: string): Promise<Workspace>
@@ -386,7 +386,7 @@ export class RatchetService {
 **Cloud-specific orchestration and business logic:**
 
 ```typescript
-// @factory-factory/cloud (closed source)
+// @carrera-factory/cloud (closed source)
 
 export class UserService {
   authenticate(token: string): Promise<User>
@@ -419,7 +419,7 @@ export class CloudWebSocketRelay {
 
 **Current structure (this repo):**
 ```
-factory-factory/  (public repo)
+carrera-factory/  (public repo)
   src/
     backend/
       domains/
@@ -435,9 +435,9 @@ factory-factory/  (public repo)
 
 **After refactoring (same repo, reorganized):**
 ```
-factory-factory/  (public repo - stays public, stays open source)
+carrera-factory/  (public repo - stays public, stays open source)
   packages/
-    core/                          ← NEW: @factory-factory/core
+    core/                          ← NEW: @carrera-factory/core
       src/
         workspace/                 ← Extracted from src/backend/domains/workspace
         session/                   ← Extracted from src/backend/domains/session
@@ -451,12 +451,12 @@ factory-factory/  (public repo - stays public, stays open source)
     desktop/                       ← RENAMED: Everything from current src/
       src/
         backend/
-          server.ts                ← Desktop server (now uses @factory-factory/core)
+          server.ts                ← Desktop server (now uses @carrera-factory/core)
           domains/
             # Remaining desktop-specific logic
         client/                    ← Desktop UI (unchanged)
       electron/                    ← Electron wrapper (unchanged)
-      package.json                 ← Updated to depend on @factory-factory/core
+      package.json                 ← Updated to depend on @carrera-factory/core
       tsconfig.json
 
   # Root level (unchanged)
@@ -487,7 +487,7 @@ factory-factory/  (public repo - stays public, stays open source)
 3. **Move everything else to `packages/desktop/`**:
    - `src/` → `packages/desktop/src/`
    - `electron/` → `packages/desktop/electron/`
-   - Update imports to use `@factory-factory/core`
+   - Update imports to use `@carrera-factory/core`
 
 4. **Publish FF Core to npm**:
    ```bash
@@ -500,9 +500,9 @@ factory-factory/  (public repo - stays public, stays open source)
    // packages/desktop/package.json
    {
      "dependencies": {
-       "@factory-factory/core": "workspace:*"  // During dev (local)
+       "@carrera-factory/core": "workspace:*"  // During dev (local)
        // OR
-       "@factory-factory/core": "^1.0.0"      // After publishing
+       "@carrera-factory/core": "^1.0.0"      // After publishing
      }
    }
    ```
@@ -518,7 +518,7 @@ factory-factory/  (public repo - stays public, stays open source)
 
 **What changes for developers?**
 
-- **Import paths change**: Instead of `import { ClaudeClient } from '@/backend/domains/session/claude'`, now `import { ClaudeClient } from '@factory-factory/core'`
+- **Import paths change**: Instead of `import { ClaudeClient } from '@/backend/domains/session/claude'`, now `import { ClaudeClient } from '@carrera-factory/core'`
 - **Two packages to work on**: `packages/core/` and `packages/desktop/`
 - **Build order**: Build core first, then desktop (handled automatically by pnpm workspace)
 
@@ -542,8 +542,8 @@ cd packages/desktop
 pnpm dev
 
 # Build both
-pnpm --filter @factory-factory/core build
-pnpm --filter @factory-factory/desktop build
+pnpm --filter @carrera-factory/core build
+pnpm --filter @carrera-factory/desktop build
 
 # Or build all from root
 pnpm -r build  # -r = recursive (all packages)
@@ -558,16 +558,16 @@ pnpm publish
 **FF Cloud repo (separate, closed source):**
 
 ```
-factory-factory-cloud/  (private repo)
+carrera-factory-cloud/  (private repo)
   src/
     services/
       user.service.ts
       vm.service.ts
-      workspace.service.ts      ← Uses @factory-factory/core from npm
+      workspace.service.ts      ← Uses @carrera-factory/core from npm
     server.ts
   package.json
     dependencies:
-      "@factory-factory/core": "^1.0.0"  ← Installed from npm
+      "@carrera-factory/core": "^1.0.0"  ← Installed from npm
 ```
 
 ### Summary: Same Repo, Just Reorganized
@@ -589,9 +589,9 @@ factory-factory-cloud/  (private repo)
 
 | Component | Desktop (Open) | Cloud (Closed) |
 |-----------|----------------|----------------|
-| **Workspace logic** | `@factory-factory/core` | `@factory-factory/core` (in VM) |
-| **Session management** | `@factory-factory/core` | `@factory-factory/core` (in VM) |
-| **Claude CLI** | `@factory-factory/core` | `@factory-factory/core` (in VM) |
+| **Workspace logic** | `@carrera-factory/core` | `@carrera-factory/core` (in VM) |
+| **Session management** | `@carrera-factory/core` | `@carrera-factory/core` (in VM) |
+| **Claude CLI** | `@carrera-factory/core` | `@carrera-factory/core` (in VM) |
 | **Storage** | SQLite (local) | SQLite (per-VM) + PostgreSQL (multi-tenant) |
 | **UI** | Electron React app | Web app + Mobile app |
 | **Server** | Express (single-user) | Express (multi-tenant orchestration) |
@@ -617,14 +617,14 @@ factory-factory-cloud/  (private repo)
 ```bash
 # packages/core/package.json
 {
-  "name": "@factory-factory/core",
+  "name": "@carrera-factory/core",
   "version": "1.0.0",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/purplefish-ai/factory-factory"
+    "url": "https://github.com/rob76c/carrera-factory"
   }
 }
 ```
@@ -632,22 +632,22 @@ factory-factory-cloud/  (private repo)
 **FF Cloud (closed source, private repo) installs it like any npm package:**
 
 ```bash
-# In factory-factory-cloud repo
-npm install @factory-factory/core
+# In carrera-factory-cloud repo
+npm install @carrera-factory/core
 
 # or
-pnpm add @factory-factory/core
+pnpm add @carrera-factory/core
 ```
 
 **FF Cloud's package.json:**
 
 ```json
 {
-  "name": "@factory-factory/cloud",
+  "name": "@carrera-factory/cloud",
   "version": "1.0.0",
   "private": true,
   "dependencies": {
-    "@factory-factory/core": "^1.0.0",
+    "@carrera-factory/core": "^1.0.0",
     "express": "^4.18.0",
     "@prisma/client": "^5.0.0",
     "ws": "^8.0.0"
@@ -660,8 +660,8 @@ pnpm add @factory-factory/core
 
 ```typescript
 // src/services/workspace.service.ts (FF Cloud - closed source)
-import { WorkspaceManager, Session, ClaudeClient } from '@factory-factory/core';
-import type { Workspace, ClaudeProcessOptions } from '@factory-factory/core';
+import { WorkspaceManager, Session, ClaudeClient } from '@carrera-factory/core';
+import type { Workspace, ClaudeProcessOptions } from '@carrera-factory/core';
 
 export class CloudWorkspaceService {
   async createWorkspace(userId: string, issueUrl: string): Promise<Workspace> {
@@ -688,30 +688,30 @@ export class CloudWorkspaceService {
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  github.com/purplefish-ai/factory-factory           │
+│  github.com/rob76c/carrera-factory           │
 │  (PUBLIC REPO - Open Source)                        │
 │                                                     │
 │  packages/                                          │
-│    core/          ← Published to npm as @factory-factory/core
-│    desktop/       ← Uses @factory-factory/core     │
+│    core/          ← Published to npm as @carrera-factory/core
+│    desktop/       ← Uses @carrera-factory/core     │
 │                                                     │
-│  Published to: npmjs.com/package/@factory-factory/core
+│  Published to: npmjs.com/package/@carrera-factory/core
 └─────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────┐
-│  github.com/purplefish-ai/factory-factory-cloud     │
+│  github.com/rob76c/carrera-factory-cloud     │
 │  (PRIVATE REPO - Closed Source)                     │
 │                                                     │
 │  src/                                               │
 │    services/                                        │
 │      user.service.ts                                │
 │      vm.service.ts                                  │
-│      workspace.service.ts  ← Uses @factory-factory/core from npm
+│      workspace.service.ts  ← Uses @carrera-factory/core from npm
 │    server.ts                                        │
 │                                                     │
 │  package.json:                                      │
 │    dependencies:                                    │
-│      "@factory-factory/core": "^1.0.0"              │
+│      "@carrera-factory/core": "^1.0.0"              │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -719,8 +719,8 @@ export class CloudWorkspaceService {
 ### Version Management
 
 - **FF Core** uses semantic versioning (1.0.0, 1.1.0, 2.0.0)
-- **FF Desktop** uses workspace reference during dev: `"@factory-factory/core": "workspace:*"`
-- **FF Cloud** can pin to specific version: `"@factory-factory/core": "1.2.3"` for stability
+- **FF Desktop** uses workspace reference during dev: `"@carrera-factory/core": "workspace:*"`
+- **FF Cloud** can pin to specific version: `"@carrera-factory/core": "1.2.3"` for stability
 - Breaking changes in FF Core trigger a major version bump
 
 ## Implementation Phases (Cloud MVP)
@@ -729,7 +729,7 @@ See [V1 - MVP Plan](./V1%20-%20MVP%20plan/README.md) for detailed per-phase docs
 
 | Phase | Name | What it delivers |
 |-------|------|-----------------|
-| 1 | Core Library Extraction | `@factory-factory/core` published to npm, desktop works via the library |
+| 1 | Core Library Extraction | `@carrera-factory/core` published to npm, desktop works via the library |
 | 2 | FF Cloud Server + VM Execution | Per-user VMs running workspaces in Docker, terminal onboarding for gh/claude auth |
 | 3 | Auth & Billing | User accounts, multi-tenant enforcement, Stripe billing |
 | 4 | WebSocket Relay + Web Frontend | Real-time streaming and a web UI for cloud workspaces |
@@ -777,7 +777,7 @@ class VMService {
     // 2. Execute FF Core code inside VM via SSH/API
     const result = await this.executeInVM(vm.id, async () => {
       // This code runs INSIDE the VM
-      const { WorkspaceManager } = await import('@factory-factory/core');
+      const { WorkspaceManager } = await import('@carrera-factory/core');
 
       const manager = new WorkspaceManager({
         dataDir: '/workspace',
@@ -936,7 +936,7 @@ class VMWebSocketServer {
   }
 
   async handleUserMessage(msg: UserMessage) {
-    const { Session } = await import('@factory-factory/core');
+    const { Session } = await import('@carrera-factory/core');
     const session = await Session.get(msg.workspaceId);
 
     // Send to Claude CLI (FF Core manages this)

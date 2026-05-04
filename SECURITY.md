@@ -2,11 +2,11 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in Factory Factory, please report it responsibly.
+If you discover a security vulnerability in Carrera Factory, please report it responsibly.
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
-Instead, please report security issues by emailing martin@purplefish.com or opening a private security advisory on GitHub.
+Instead, please report security issues by emailing rob76c@purplefish.com or opening a private security advisory on GitHub.
 
 ### What to Include
 

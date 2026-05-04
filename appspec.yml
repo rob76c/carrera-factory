@@ -1,0 +1,14 @@
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /tmp/devtools-staging
+  - source: /scripts
+    destination: /tmp/scripts
+    overwrite: true
+file_exists_behavior: OVERWRITE
+
+hooks:
+  ApplicationStart:
+    - location: scripts/stop_and_install_devtools.sh
+      timeout: 500

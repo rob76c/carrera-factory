@@ -114,9 +114,9 @@ function parseWorktreeEntries(output: string): GitWorktreeEntry[] {
 }
 
 export interface CreateWorktreeOptions {
-  /** GitHub username or org for branch prefix (e.g., 'martin-purplefish') */
+  /** GitHub username or org for branch prefix (e.g., 'rob76c') */
   branchPrefix?: string;
-  /** Workspace name to use for branch (e.g., 'tiger' -> 'martin-purplefish/tiger') */
+  /** Workspace name to use for branch (e.g., 'tiger' -> 'rob76c/tiger') */
   workspaceName?: string;
 }
 
@@ -370,7 +370,7 @@ export class GitClient {
    * Generate a branch name with optional prefix.
    * Format: {prefix}/{workspaceName} or just {workspaceName}
    * If no workspaceName, falls back to random hex for uniqueness.
-   * Example: martin-purplefish/flux-1
+   * Example: rob76c/flux-1
    */
   generateBranchName(prefix?: string, workspaceName?: string): string {
     const suffix = workspaceName ? this.sanitizeBranchName(workspaceName) : this.nextBranchHex();
@@ -382,7 +382,7 @@ export class GitClient {
   /**
    * Generate a unique branch name that doesn't conflict with existing branches.
    * If the generated name already exists, appends -1, -2, -3, etc. until finding an available name.
-   * Example: martin-purplefish/jaguar -> martin-purplefish/jaguar-1
+   * Example: rob76c/jaguar -> rob76c/jaguar-1
    */
   async generateUniqueBranchName(prefix?: string, workspaceName?: string): Promise<string> {
     const baseName = this.generateBranchName(prefix, workspaceName);

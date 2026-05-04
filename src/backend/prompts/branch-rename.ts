@@ -6,7 +6,7 @@
  */
 
 export interface BranchRenameContext {
-  /** Prefix to use for the new branch (e.g., "martin-purplefish") */
+  /** Prefix to use for the new branch (e.g., "rob76c") */
   branchPrefix: string;
   /** Workspace name/title */
   workspaceName: string;

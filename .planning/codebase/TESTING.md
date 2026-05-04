@@ -175,21 +175,21 @@ describe('generateUniqueBranchName', () => {
   it('should return base name when branch does not exist', async () => {
     client.branchExists = () => Promise.resolve(false);
 
-    const name = await client.generateUniqueBranchName('martin-purplefish', 'jaguar');
-    expect(name).toBe('martin-purplefish/jaguar');
+    const name = await client.generateUniqueBranchName('rob76c', 'jaguar');
+    expect(name).toBe('rob76c/jaguar');
   });
 
   it('should increment until finding available name', async () => {
     const existingNames = new Set([
-      'martin-purplefish/jaguar',
-      'martin-purplefish/jaguar-1',
-      'martin-purplefish/jaguar-2',
+      'rob76c/jaguar',
+      'rob76c/jaguar-1',
+      'rob76c/jaguar-2',
     ]);
 
     client.branchExists = (branchName: string) => Promise.resolve(existingNames.has(branchName));
 
-    const name = await client.generateUniqueBranchName('martin-purplefish', 'jaguar');
-    expect(name).toBe('martin-purplefish/jaguar-3');
+    const name = await client.generateUniqueBranchName('rob76c', 'jaguar');
+    expect(name).toBe('rob76c/jaguar-3');
   });
 });
 ```
@@ -370,8 +370,8 @@ it('should increment until finding available name', async () => {
     return Promise.resolve(false);
   };
 
-  const name = await client.generateUniqueBranchName('martin-purplefish', 'jaguar');
-  expect(name).toBe('martin-purplefish/jaguar-1');
+  const name = await client.generateUniqueBranchName('rob76c', 'jaguar');
+  expect(name).toBe('rob76c/jaguar-1');
 });
 ```
 

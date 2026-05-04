@@ -215,7 +215,11 @@
       "form-data": ">=2.5.4",
       "tough-cookie": ">=4.1.3",
       "yaml": "2.8.3"
-    }
+    },
+    "ignoredBuiltDependencies": [
+      "electron-winstaller",
+      "fsevents"
+    ]
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.4",

@@ -128,8 +128,8 @@ describe('GitClient', () => {
     });
 
     it('should generate a branch name with prefix', () => {
-      const name = client.generateBranchName('martin-purplefish');
-      expect(name).toMatch(/^martin-purplefish\/[0-9a-f]{6}$/);
+      const name = client.generateBranchName('rob76c');
+      expect(name).toMatch(/^rob76c\/[0-9a-f]{6}$/);
     });
 
     it('should generate a branch name with complex prefix', () => {
@@ -159,8 +159,8 @@ describe('GitClient', () => {
     });
 
     it('should use workspace name without hash when provided', () => {
-      const name = client.generateBranchName('martin-purplefish', 'flux-1');
-      expect(name).toBe('martin-purplefish/flux-1');
+      const name = client.generateBranchName('rob76c', 'flux-1');
+      expect(name).toBe('rob76c/flux-1');
     });
 
     it('should use workspace name only when no prefix', () => {
@@ -174,8 +174,8 @@ describe('GitClient', () => {
     });
 
     it('should handle workspace names with hyphens', () => {
-      const name = client.generateBranchName('martin-purplefish', 'tiger-2');
-      expect(name).toBe('martin-purplefish/tiger-2');
+      const name = client.generateBranchName('rob76c', 'tiger-2');
+      expect(name).toBe('rob76c/tiger-2');
     });
   });
 
@@ -188,8 +188,8 @@ describe('GitClient', () => {
       // Mock branchExists to always return false
       client.branchExists = () => Promise.resolve(false);
 
-      const name = await client.generateUniqueBranchName('martin-purplefish', 'jaguar');
-      expect(name).toBe('martin-purplefish/jaguar');
+      const name = await client.generateUniqueBranchName('rob76c', 'jaguar');
+      expect(name).toBe('rob76c/jaguar');
     });
 
     it('should append -1 when base branch exists', async () => {
@@ -204,21 +204,17 @@ describe('GitClient', () => {
         return Promise.resolve(false);
       };
 
-      const name = await client.generateUniqueBranchName('martin-purplefish', 'jaguar');
-      expect(name).toBe('martin-purplefish/jaguar-1');
+      const name = await client.generateUniqueBranchName('rob76c', 'jaguar');
+      expect(name).toBe('rob76c/jaguar-1');
     });
 
     it('should increment until finding available name', async () => {
-      const existingNames = new Set([
-        'martin-purplefish/jaguar',
-        'martin-purplefish/jaguar-1',
-        'martin-purplefish/jaguar-2',
-      ]);
+      const existingNames = new Set(['rob76c/jaguar', 'rob76c/jaguar-1', 'rob76c/jaguar-2']);
 
       client.branchExists = (branchName: string) => Promise.resolve(existingNames.has(branchName));
 
-      const name = await client.generateUniqueBranchName('martin-purplefish', 'jaguar');
-      expect(name).toBe('martin-purplefish/jaguar-3');
+      const name = await client.generateUniqueBranchName('rob76c', 'jaguar');
+      expect(name).toBe('rob76c/jaguar-3');
     });
 
     it('should work without prefix', async () => {
@@ -236,17 +232,17 @@ describe('GitClient', () => {
       // All branches exist
       client.branchExists = () => Promise.resolve(true);
 
-      const name = await client.generateUniqueBranchName('martin-purplefish', 'jaguar');
+      const name = await client.generateUniqueBranchName('rob76c', 'jaguar');
       // Should fallback to random 12-character hex
-      expect(name).toMatch(/^martin-purplefish\/[0-9a-f]{12}$/);
+      expect(name).toMatch(/^rob76c\/[0-9a-f]{12}$/);
     });
 
     it('should handle auto-generated names (no workspace name)', async () => {
       client.branchExists = () => Promise.resolve(false);
 
-      const name = await client.generateUniqueBranchName('martin-purplefish');
+      const name = await client.generateUniqueBranchName('rob76c');
       // Should be prefix + 6 hex chars
-      expect(name).toMatch(/^martin-purplefish\/[0-9a-f]{6}$/);
+      expect(name).toMatch(/^rob76c\/[0-9a-f]{6}$/);
     });
   });
 
@@ -269,7 +265,7 @@ describe('GitClient', () => {
 
   describe('createWorktree', () => {
     it('creates orphan worktree in blank repositories', async () => {
-      vi.spyOn(client, 'generateUniqueBranchName').mockResolvedValue('martin-purplefish/tiger');
+      vi.spyOn(client, 'generateUniqueBranchName').mockResolvedValue('rob76c/tiger');
       vi.spyOn(client, 'isBlankRepository').mockResolvedValue(true);
       mockGitCommandC.mockResolvedValue(commandSuccess());
 
@@ -281,18 +277,18 @@ describe('GitClient', () => {
         'add',
         '--orphan',
         '-b',
-        'martin-purplefish/tiger',
+        'rob76c/tiger',
         '/test/worktrees/ws-1',
       ]);
       expect(result).toEqual({
         name: 'ws-1',
         path: '/test/worktrees/ws-1',
-        branchName: 'martin-purplefish/tiger',
+        branchName: 'rob76c/tiger',
       });
     });
 
     it('throws when orphan worktree creation fails', async () => {
-      vi.spyOn(client, 'generateUniqueBranchName').mockResolvedValue('martin-purplefish/tiger');
+      vi.spyOn(client, 'generateUniqueBranchName').mockResolvedValue('rob76c/tiger');
       vi.spyOn(client, 'isBlankRepository').mockResolvedValue(true);
       mockGitCommandC.mockResolvedValue(commandFailure('orphan failed'));
 
@@ -302,7 +298,7 @@ describe('GitClient', () => {
     });
 
     it('prefers freshly fetched origin branch when available', async () => {
-      vi.spyOn(client, 'generateUniqueBranchName').mockResolvedValue('martin-purplefish/tiger');
+      vi.spyOn(client, 'generateUniqueBranchName').mockResolvedValue('rob76c/tiger');
       vi.spyOn(client, 'isBlankRepository').mockResolvedValue(false);
       vi.spyOn(client, 'branchExists').mockResolvedValueOnce(true).mockResolvedValueOnce(false);
       mockGitCommandC
@@ -316,15 +312,15 @@ describe('GitClient', () => {
         'worktree',
         'add',
         '-b',
-        'martin-purplefish/tiger',
+        'rob76c/tiger',
         '/test/worktrees/ws-1',
         'origin/main',
       ]);
-      expect(result.branchName).toBe('martin-purplefish/tiger');
+      expect(result.branchName).toBe('rob76c/tiger');
     });
 
     it('falls back to local branch when fetch fails and local branch exists', async () => {
-      vi.spyOn(client, 'generateUniqueBranchName').mockResolvedValue('martin-purplefish/tiger');
+      vi.spyOn(client, 'generateUniqueBranchName').mockResolvedValue('rob76c/tiger');
       vi.spyOn(client, 'isBlankRepository').mockResolvedValue(false);
       vi.spyOn(client, 'branchExists').mockResolvedValueOnce(false).mockResolvedValueOnce(true);
       mockGitCommandC
@@ -337,14 +333,14 @@ describe('GitClient', () => {
         'worktree',
         'add',
         '-b',
-        'martin-purplefish/tiger',
+        'rob76c/tiger',
         '/test/worktrees/ws-1',
         'main',
       ]);
     });
 
     it('falls back to stale origin branch when fetch fails and only origin exists', async () => {
-      vi.spyOn(client, 'generateUniqueBranchName').mockResolvedValue('martin-purplefish/tiger');
+      vi.spyOn(client, 'generateUniqueBranchName').mockResolvedValue('rob76c/tiger');
       vi.spyOn(client, 'isBlankRepository').mockResolvedValue(false);
       vi.spyOn(client, 'branchExists').mockResolvedValueOnce(true).mockResolvedValueOnce(false);
       mockGitCommandC
@@ -357,14 +353,14 @@ describe('GitClient', () => {
         'worktree',
         'add',
         '-b',
-        'martin-purplefish/tiger',
+        'rob76c/tiger',
         '/test/worktrees/ws-1',
         'origin/main',
       ]);
     });
 
     it('throws when non-blank worktree creation fails', async () => {
-      vi.spyOn(client, 'generateUniqueBranchName').mockResolvedValue('martin-purplefish/tiger');
+      vi.spyOn(client, 'generateUniqueBranchName').mockResolvedValue('rob76c/tiger');
       vi.spyOn(client, 'isBlankRepository').mockResolvedValue(false);
       vi.spyOn(client, 'branchExists').mockResolvedValueOnce(false).mockResolvedValueOnce(false);
       mockGitCommandC
@@ -708,7 +704,7 @@ describe('isAutoGeneratedBranchName', () => {
 
   describe('prefixed branches with hex (single segment)', () => {
     it('should match single-segment prefix with 6 hex chars', () => {
-      expect(isAutoGeneratedBranchName('martin-purplefish/abc123')).toBe(true);
+      expect(isAutoGeneratedBranchName('rob76c/abc123')).toBe(true);
       expect(isAutoGeneratedBranchName('user/ffffff')).toBe(true);
       expect(isAutoGeneratedBranchName('feature/000000')).toBe(true);
     });
@@ -753,14 +749,14 @@ describe('isAutoGeneratedBranchName', () => {
   describe('prefixed workspace word branches', () => {
     it('should match prefixed workspace words without numeric suffix', () => {
       expect(isAutoGeneratedBranchName('adeeshaek/pulse')).toBe(true);
-      expect(isAutoGeneratedBranchName('martin-purplefish/tiger')).toBe(true);
+      expect(isAutoGeneratedBranchName('rob76c/tiger')).toBe(true);
       expect(isAutoGeneratedBranchName('user/falcon')).toBe(true);
       expect(isAutoGeneratedBranchName('org/team/nova')).toBe(true);
     });
 
     it('should match prefixed workspace words with numeric suffix', () => {
       expect(isAutoGeneratedBranchName('adeeshaek/pulse-1')).toBe(true);
-      expect(isAutoGeneratedBranchName('martin-purplefish/tiger-5')).toBe(true);
+      expect(isAutoGeneratedBranchName('rob76c/tiger-5')).toBe(true);
       expect(isAutoGeneratedBranchName('user/flux-99')).toBe(true);
       expect(isAutoGeneratedBranchName('org/team/project/dragon-2')).toBe(true);
     });
@@ -771,7 +767,7 @@ describe('isAutoGeneratedBranchName', () => {
       expect(isAutoGeneratedBranchName('main')).toBe(false);
       expect(isAutoGeneratedBranchName('develop')).toBe(false);
       expect(isAutoGeneratedBranchName('feature/add-login')).toBe(false);
-      expect(isAutoGeneratedBranchName('martin-purplefish/fix-bug-123')).toBe(false);
+      expect(isAutoGeneratedBranchName('rob76c/fix-bug-123')).toBe(false);
       expect(isAutoGeneratedBranchName('hotfix/security-patch')).toBe(false);
     });
 

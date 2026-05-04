@@ -1,0 +1,18 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - echo Install just bundles code
+
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      #- sh ./ui/scripts/git_tagging
+      #- echo AFTER GIT - BUILD COMPLETED
+
+artifacts:
+  files:
+    - ./**/*
+    - scripts/*
+    - appspec.yml
