@@ -1,3 +1,4 @@
+import { ClaudeMdService } from '@/backend/services/claude-md.service';
 import { githubCLIService, prSnapshotService } from '@/backend/services/github';
 import { createLogger } from '@/backend/services/logger.service';
 import type { AgentSessionRecord } from '@/backend/services/session/resources/agent-session.accessor';
@@ -887,6 +888,8 @@ export class SessionLifecycleService {
       });
     }
 
+    const claudeMdContent = await ClaudeMdService.readClaudeMd(workspace.worktreePath);
+
     const { workflowPrompt, systemPrompt, injectedBranchRename } =
       this.promptBuilder.buildSystemPrompt({
         workflow: session.workflow,
@@ -898,6 +901,7 @@ export class SessionLifecycleService {
           description: workspace.description ?? undefined,
         },
         project,
+        claudeMdContent,
       });
 
     logger.info('Loaded workflow prompt for session options', {
