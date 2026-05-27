@@ -203,7 +203,7 @@ ${issue.body || '(No description provided)'}
 
 ## Your Task
 
-Implement this issue following the 5-phase workflow below. Work autonomously—only ask questions if requirements are contradictory or fundamentally unclear.
+Implement this issue following the 6-phase workflow below. Work autonomously—only ask questions if requirements are contradictory or fundamentally unclear.
 
 **Protect your context by delegating to specialized agents:**
 - Exploring unfamiliar code or architecture? Use: "Please use the Explore agent to understand [specific area]"
@@ -212,7 +212,15 @@ Implement this issue following the 5-phase workflow below. Work autonomously—o
 
 ---
 
-## Phase 1: Planning
+## Phase 1: Context Gathering
+
+Before beginning, read \`CLAUDE.md\` in the root of the repository to familiarize yourself with:
+- **Agent Instructions**
+- **Repository Structure & Repository Overview**
+- **General Operating Principles**
+- **Codebase Patterns**
+
+## Phase 2: Planning
 
 1. **Understand requirements and find relevant code**
    - Read issue description and any linked resources
@@ -233,7 +241,7 @@ Implement this issue following the 5-phase workflow below. Work autonomously—o
    - What scenarios need tests?
    - What existing patterns should you follow?
 
-## Phase 2: Implementation
+## Phase 3: Implementation
 
 1. **Work through your TodoWrite tasks systematically**
    - Follow existing code patterns and conventions
@@ -252,13 +260,11 @@ Implement this issue following the 5-phase workflow below. Work autonomously—o
    - Reference issue number when relevant
    - Example: "Add session error handling (#${issue.number})"
 
-## Phase 3: Verification
+## Phase 4: Verification
 
-Run all verification checks:
+**Read \`CLAUDE.md\` in the root of the repository to find the specific commands for building, typechecking, linting, and testing the project.**
 
-\`\`\`bash
-pnpm typecheck && pnpm check:fix && pnpm test && pnpm build
-\`\`\`
+Run all quality checks as specified in \`CLAUDE.md\`.
 
 Fix any failures:
 - **Type errors**: Resolve without type casts when possible
@@ -268,7 +274,7 @@ Fix any failures:
 
 Update TodoWrite with any additional fix tasks discovered.
 
-## Phase 4: Final Review
+## Phase 5: Final Review
 
 1. **Review your changes**
    \`\`\`bash
@@ -290,7 +296,7 @@ Update TodoWrite with any additional fix tasks discovered.
    git status  # should show clean working directory
    \`\`\`
 
-## Phase 4.5: Capture UI Screenshots (if applicable)
+## Phase 5.5: Capture UI Screenshots (if applicable)
 
 If your changes affect the UI:
 
@@ -306,7 +312,7 @@ If your changes affect the UI:
 6. Reference them in the PR body using raw GitHub URLs:
    \`![Description](https://raw.githubusercontent.com/${project.githubOwner}/${project.githubRepo}/\${branch}/.factory-factory/screenshots/filename.png)\`
 
-## Phase 5: Create Pull Request [REQUIRED - DO NOT SKIP]
+## Phase 6: Create Pull Request [REQUIRED - DO NOT SKIP]
 
 **Pre-flight checklist before creating PR:**
 - [ ] All TodoWrite tasks marked completed
