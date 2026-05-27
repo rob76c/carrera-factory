@@ -453,6 +453,7 @@ async function startDevelopmentMode(
     cwd: PROJECT_ROOT,
     env,
     stdio: options.verbose ? 'inherit' : 'pipe',
+    shell: process.platform === 'win32',
   });
   processes.push({ name: 'backend', proc: backend });
 
@@ -477,6 +478,7 @@ async function startDevelopmentMode(
       cwd: PROJECT_ROOT,
       env: frontendEnv,
       stdio: options.verbose ? 'inherit' : 'pipe',
+      shell: process.platform === 'win32',
     }
   );
   processes.push({ name: 'frontend', proc: frontend });
@@ -607,6 +609,7 @@ program
         DATABASE_URL: `file:${effectivePath}`,
       },
       stdio: 'inherit',
+      shell: process.platform === 'win32',
     });
 
     await new Promise<void>((resolve) => {
@@ -646,6 +649,7 @@ program
       {
         cwd: PROJECT_ROOT,
         stdio: 'inherit',
+        shell: process.platform === 'win32',
       }
     );
 
@@ -673,6 +677,7 @@ program
       cwd: PROJECT_ROOT,
       stdio: 'inherit',
       env: { ...process.env, NODE_ENV: 'production' },
+      shell: process.platform === 'win32',
     });
 
     exitCode = await new Promise<number>((resolve) => {
