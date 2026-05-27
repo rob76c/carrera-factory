@@ -1,5 +1,8 @@
 import { access, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createLogger } from '@/backend/services/logger.service';
+
+const logger = createLogger('claude-md');
 
 /**
  * Service for reading CLAUDE.md files from repository roots.
@@ -19,9 +22,20 @@ export class ClaudeMdService {
     try {
       await access(filePath);
     } catch {
+      logger.debug('CLAUDE.md not found in repository', { repoPath });
       return null;
     }
 
-    return readFile(filePath, 'utf-8');
+    try {
+      const content = await readFile(filePath, 'utf-8');
+      logger.debug('Read CLAUDE.md from repository', { repoPath, length: content.length });
+      return content;
+    } catch (error) {
+      logger.warn('Failed to read CLAUDE.md', {
+        repoPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
   }
 }

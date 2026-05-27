@@ -1,7 +1,17 @@
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('@/backend/services/logger.service', () => ({
+  createLogger: () => ({
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  }),
+}));
+
 import { ClaudeMdService } from '@/backend/services/claude-md.service';
 
 describe('ClaudeMdService', () => {
@@ -39,6 +49,17 @@ describe('ClaudeMdService', () => {
 
     it('returns null for non-existent directory', async () => {
       const result = await ClaudeMdService.readClaudeMd(join(testDir, 'nonexistent'));
+      expect(result).toBeNull();
+    });
+
+    it('returns null when read fails after access check', async () => {
+      // Write file, then make it unreadable by replacing with a directory of the same name
+      const claudeMdPath = join(testDir, 'CLAUDE.md');
+      await writeFile(claudeMdPath, 'content', 'utf-8');
+      await rm(claudeMdPath);
+      await mkdir(claudeMdPath); // directory with same name causes readFile to fail
+
+      const result = await ClaudeMdService.readClaudeMd(testDir);
       expect(result).toBeNull();
     });
   });
