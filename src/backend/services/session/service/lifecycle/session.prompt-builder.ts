@@ -12,6 +12,7 @@ export type BuildPromptInput = {
     runScriptPort?: number | null;
   };
   project?: { githubOwner?: string | null } | null;
+  claudeMdContent?: string | null;
 };
 
 export type BuildPromptResult = {
@@ -50,7 +51,12 @@ export class SessionPromptBuilder {
     );
   }
 
-  buildSystemPrompt({ workflow, workspace, project }: BuildPromptInput): BuildPromptResult {
+  buildSystemPrompt({
+    workflow,
+    workspace,
+    project,
+    claudeMdContent,
+  }: BuildPromptInput): BuildPromptResult {
     const workflowPrompt = SessionPromptBuilder.PROMPTED_WORKFLOWS.has(workflow)
       ? (getWorkflowContent(workflow) ?? undefined)
       : undefined;
@@ -65,6 +71,10 @@ export class SessionPromptBuilder {
       });
       systemPrompt = branchRenameInstruction + (workflowPrompt ?? '');
       injectedBranchRename = true;
+    }
+
+    if (claudeMdContent) {
+      systemPrompt = `${systemPrompt ?? ''}\n\n${claudeMdContent}`;
     }
 
     if (workspace.runScriptPort) {
