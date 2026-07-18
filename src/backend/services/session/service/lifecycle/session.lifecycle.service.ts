@@ -518,6 +518,8 @@ export class SessionLifecycleService {
       throw error;
     }
 
+    await this.applyInitialModelToHandle(sessionId, handle, clientOptions.model);
+
     await this.persistAcpConfigSnapshot(sessionId, {
       provider: handle.provider as PersistAcpConfigSnapshotParams['provider'],
       providerSessionId: handle.providerSessionId,
@@ -538,6 +540,32 @@ export class SessionLifecycleService {
     });
 
     return handle;
+  }
+
+  // newSession/loadSession return the provider's default model; explicitly
+  // apply the session's stored model when it differs from that default.
+  private async applyInitialModelToHandle(
+    sessionId: string,
+    handle: AcpProcessHandle,
+    desiredModel: string | undefined
+  ): Promise<void> {
+    if (!desiredModel) {
+      return;
+    }
+    const current = handle.configOptions.find((opt) => opt.category === 'model');
+    if (!current || current.currentValue === desiredModel) {
+      return;
+    }
+    try {
+      await this.runtimeManager.setSessionModel(sessionId, desiredModel);
+    } catch (error) {
+      logger.warn('Failed to apply initial model to ACP session', {
+        sessionId,
+        desiredModel,
+        currentModel: current.currentValue,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private shouldSuppressReplayDuringAcpResume(
