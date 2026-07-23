@@ -1332,6 +1332,107 @@ describe('AcpRuntimeManager', () => {
     });
   });
 
+  describe('initial model on session creation', () => {
+    it('applies the requested model when it differs from the agent default', async () => {
+      setupSuccessfulSpawn();
+
+      const handle = await manager.getOrCreateClient(
+        'session-1',
+        { ...defaultOptions(), model: 'opus' },
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(mockSetSessionModel).toHaveBeenCalledWith({
+        sessionId: 'provider-session-123',
+        modelId: 'opus',
+      });
+      expect(handle.configOptions.find((option) => option.id === 'model')?.currentValue).toBe(
+        'opus'
+      );
+    });
+
+    it('does not set a model when the requested model matches the agent default', async () => {
+      setupSuccessfulSpawn();
+
+      await manager.getOrCreateClient(
+        'session-1',
+        { ...defaultOptions(), model: 'sonnet' },
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(mockSetSessionModel).not.toHaveBeenCalled();
+      expect(mockSetSessionConfigOption).not.toHaveBeenCalled();
+    });
+
+    it('does not set a model when no model was requested', async () => {
+      setupSuccessfulSpawn();
+
+      await manager.getOrCreateClient(
+        'session-1',
+        defaultOptions(),
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(mockSetSessionModel).not.toHaveBeenCalled();
+      expect(mockSetSessionConfigOption).not.toHaveBeenCalled();
+    });
+
+    it('keeps the agent default when the requested model is not offered', async () => {
+      setupSuccessfulSpawn();
+
+      const handle = await manager.getOrCreateClient(
+        'session-1',
+        { ...defaultOptions(), model: 'gpt-6' },
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(mockSetSessionModel).not.toHaveBeenCalled();
+      expect(mockSetSessionConfigOption).not.toHaveBeenCalled();
+      expect(handle.configOptions.find((option) => option.id === 'model')?.currentValue).toBe(
+        'sonnet'
+      );
+    });
+
+    it('does not fail session creation when applying the model fails', async () => {
+      setupSuccessfulSpawn();
+      mockSetSessionModel.mockRejectedValueOnce(new Error('model switch failed'));
+
+      const handle = await manager.getOrCreateClient(
+        'session-1',
+        { ...defaultOptions(), model: 'opus' },
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(handle.isRunning()).toBe(true);
+      expect(handle.configOptions.find((option) => option.id === 'model')?.currentValue).toBe(
+        'sonnet'
+      );
+    });
+
+    it('applies the requested model for CODEX via setSessionConfigOption', async () => {
+      setupSuccessfulSpawn();
+
+      await manager.getOrCreateClient(
+        'session-1',
+        { ...codexOptions(), model: 'opus' },
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(mockSetSessionModel).not.toHaveBeenCalled();
+      expect(mockSetSessionConfigOption).toHaveBeenCalledWith({
+        sessionId: 'provider-session-123',
+        configId: 'model',
+        value: 'opus',
+      });
+    });
+  });
+
   describe('session status methods', () => {
     it('isSessionRunning returns true for active session', async () => {
       setupSuccessfulSpawn();

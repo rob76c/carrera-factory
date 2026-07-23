@@ -382,6 +382,13 @@ function isOptionGroupArray(
   return firstOption ? isOptionGroup(firstOption) : false;
 }
 
+function getConfigOptionSelectValues(option: SessionConfigOption): string[] {
+  if (isOptionGroupArray(option.options)) {
+    return option.options.flatMap((group) => group.options.map((entry) => entry.value));
+  }
+  return option.options.map((entry) => entry.value);
+}
+
 function normalizeClaudeConfigOptions(configOptions: SessionConfigOption[]): SessionConfigOption[] {
   return configOptions.map((configOption) => {
     if (configOption.category !== 'model') {
@@ -841,9 +848,69 @@ export class AcpRuntimeManager {
     this.sessions.set(sessionId, handle);
 
     this.wireChildExitHandler(sessionId, child, handlers);
+    await this.applyInitialSessionModel(sessionId, handle, options);
     await this.notifyClientCreated(sessionId, handle, context, handlers);
 
     return handle;
+  }
+
+  /**
+   * Applies the caller-requested model to a freshly created/resumed ACP session.
+   * The agent starts on its own default model, so without this step the model
+   * selected in the UI is silently ignored.
+   */
+  private async applyInitialSessionModel(
+    sessionId: string,
+    handle: AcpProcessHandle,
+    options: AcpClientOptions
+  ): Promise<void> {
+    const modelId = options.model?.trim();
+    if (!modelId) {
+      return;
+    }
+
+    const modelOption = handle.configOptions.find((option) => option.category === 'model');
+    if (!modelOption) {
+      return;
+    }
+
+    const currentValue = isNonEmptyString(modelOption.currentValue)
+      ? modelOption.currentValue
+      : null;
+    if (currentValue === modelId) {
+      return;
+    }
+
+    const availableValues = getConfigOptionSelectValues(modelOption);
+    if (availableValues.length > 0 && !availableValues.includes(modelId)) {
+      logger.warn('Requested session model not offered by agent; keeping agent default', {
+        sessionId,
+        provider: options.provider,
+        requestedModel: modelId,
+        availableValues,
+      });
+      return;
+    }
+
+    try {
+      await withTimeout({
+        promise: this.setSessionModel(sessionId, modelId),
+        timeoutMs: this.acpStartupTimeoutMs,
+        description: 'apply initial session model',
+      });
+      logger.info('Applied initial session model', {
+        sessionId,
+        provider: options.provider,
+        modelId,
+      });
+    } catch (error) {
+      logger.warn('Failed to apply initial session model; continuing with agent default', {
+        sessionId,
+        provider: options.provider,
+        modelId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private cleanupFailedClientCreation(child: ChildProcess, sessionId: string): void {
