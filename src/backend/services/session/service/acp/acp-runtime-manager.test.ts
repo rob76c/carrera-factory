@@ -1394,6 +1394,58 @@ describe('AcpRuntimeManager', () => {
       expect(mockSetSessionConfigOption).not.toHaveBeenCalled();
     });
 
+    it('resolves a model alias to the variant the agent offers', async () => {
+      const child = createMockChildProcess();
+      mockSpawn.mockReturnValue(child);
+      mockInitialize.mockResolvedValue({
+        protocolVersion: 1,
+        agentCapabilities: { loadSession: {} },
+      });
+      // Mirrors claude-agent-acp, which offers "opus[1m]" rather than a bare "opus"
+      const aliasConfigOptions = [
+        {
+          id: 'model',
+          name: 'Model',
+          type: 'select' as const,
+          category: 'model',
+          currentValue: 'default',
+          options: [
+            { value: 'default', name: 'Default' },
+            { value: 'opus[1m]', name: 'Opus' },
+            { value: 'haiku', name: 'Haiku' },
+          ],
+        },
+        {
+          id: 'mode',
+          name: 'Mode',
+          type: 'select' as const,
+          category: 'mode',
+          currentValue: 'default',
+          options: [{ value: 'default', name: 'Default' }],
+        },
+      ];
+      mockNewSession.mockResolvedValue({
+        sessionId: 'provider-session-123',
+        configOptions: aliasConfigOptions,
+      });
+      mockSetSessionModel.mockResolvedValue({});
+
+      const handle = await manager.getOrCreateClient(
+        'session-1',
+        { ...defaultOptions(), model: 'opus' },
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(mockSetSessionModel).toHaveBeenCalledWith({
+        sessionId: 'provider-session-123',
+        modelId: 'opus[1m]',
+      });
+      expect(handle.configOptions.find((option) => option.id === 'model')?.currentValue).toBe(
+        'opus[1m]'
+      );
+    });
+
     it('keeps the agent default when the requested model is not offered', async () => {
       setupSuccessfulSpawn();
 

@@ -462,10 +462,13 @@ function IdeSettingsSection() {
   );
 }
 
+/** Mirrors DEFAULT_SESSION_MODEL_BY_PROVIDER.CLAUDE, which lives behind the backend boundary. */
+const DEFAULT_CLAUDE_MODEL = 'opus';
+
 function ChatProviderDefaultsSection() {
   const { data: settings, isLoading } = trpc.userSettings.get.useQuery();
   const utils = trpc.useUtils();
-  const [localClaudeModel, setLocalClaudeModel] = useState('sonnet');
+  const [localClaudeModel, setLocalClaudeModel] = useState(DEFAULT_CLAUDE_MODEL);
   const [localCodexModel, setLocalCodexModel] = useState('default');
   const updateSettings = trpc.userSettings.update.useMutation({
     onSuccess: () => {
@@ -478,7 +481,7 @@ function ChatProviderDefaultsSection() {
   });
 
   useEffect(() => {
-    setLocalClaudeModel(settings?.defaultClaudeModel ?? 'sonnet');
+    setLocalClaudeModel(settings?.defaultClaudeModel ?? DEFAULT_CLAUDE_MODEL);
     setLocalCodexModel(settings?.defaultCodexModel ?? 'default');
   }, [settings?.defaultClaudeModel, settings?.defaultCodexModel]);
 
@@ -497,12 +500,12 @@ function ChatProviderDefaultsSection() {
   }
 
   const currentProvider = settings?.defaultSessionProvider ?? 'CLAUDE';
-  const currentClaudeModel = settings?.defaultClaudeModel ?? 'sonnet';
+  const currentClaudeModel = settings?.defaultClaudeModel ?? DEFAULT_CLAUDE_MODEL;
   const currentCodexModel = settings?.defaultCodexModel ?? 'default';
   const currentWorkspacePermissions = settings?.defaultWorkspacePermissions ?? 'STRICT';
   const modelSettingsByProvider = {
     CLAUDE: {
-      fallbackValue: 'sonnet',
+      fallbackValue: DEFAULT_CLAUDE_MODEL,
       currentValue: currentClaudeModel,
       localValue: localClaudeModel,
       setLocalValue: setLocalClaudeModel,

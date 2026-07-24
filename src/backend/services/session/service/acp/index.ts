@@ -19,4 +19,5 @@ export {
   fetchCodexModelCatalogFromAppServer,
   runCodexAppServerAcpAdapter,
 } from './codex-app-server-adapter';
+export { resolveModelValueFromAvailable } from './model-value-resolver';
 export type { AcpClientOptions, AcpProvider, AcpSessionState, PermissionPreset } from './types';

@@ -6,6 +6,7 @@ import {
   type AcpProcessHandle,
   type AcpRuntimeManager,
   fetchCodexModelCatalogFromAppServer,
+  resolveModelValueFromAvailable,
 } from '@/backend/services/session/service/acp';
 import type { SessionDomainService } from '@/backend/services/session/service/session-domain.service';
 import { sessionDomainService } from '@/backend/services/session/service/session-domain.service';
@@ -254,7 +255,11 @@ export class SessionConfigService {
       const modelOption = acpHandle.configOptions.find((option) => option.category === 'model');
       if (modelOption && model) {
         const availableValues = this.getConfigOptionValues(modelOption);
-        if (availableValues.length > 0 && !availableValues.includes(model)) {
+        const resolvedModel =
+          availableValues.length === 0
+            ? model
+            : resolveModelValueFromAvailable(model, availableValues);
+        if (!resolvedModel) {
           logger.debug('Skipping unsupported model for ACP session', {
             sessionId,
             provider: acpHandle.provider,
@@ -264,7 +269,7 @@ export class SessionConfigService {
           return;
         }
 
-        await this.setSessionConfigOption(sessionId, modelOption.id, model);
+        await this.setSessionConfigOption(sessionId, modelOption.id, resolvedModel);
       }
       return;
     }
@@ -700,7 +705,13 @@ export class SessionConfigService {
       }
 
       const allowedValues = this.getConfigOptionValues(option);
-      if (allowedValues.length > 0 && !allowedValues.includes(value)) {
+      // Model aliases are resolved against what the agent offers ("opus" ->
+      // "opus[1m]"); every other option must match a value exactly.
+      const resolvedValue =
+        option.category === 'model'
+          ? (resolveModelValueFromAvailable(value, allowedValues) ?? value)
+          : value;
+      if (allowedValues.length > 0 && !allowedValues.includes(resolvedValue)) {
         throw new Error(
           `Unsupported value "${value}" for config option "${configId}"` +
             ` (allowed: ${allowedValues.join(', ')})`
@@ -710,7 +721,7 @@ export class SessionConfigService {
       didUpdate = true;
       return {
         ...option,
-        currentValue: value,
+        currentValue: resolvedValue,
       };
     });
 

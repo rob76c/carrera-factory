@@ -22,9 +22,18 @@ vi.mock('@/backend/services/settings', () => ({
   },
 }));
 
-vi.mock('@/backend/services/session/service/acp', () => ({
-  fetchCodexModelCatalogFromAppServer: vi.fn(),
-}));
+vi.mock('@/backend/services/session/service/acp', async () => {
+  // Pure helper with no side effects — use the real implementation so model
+  // alias resolution is exercised rather than stubbed.
+  const { resolveModelValueFromAvailable } = await vi.importActual<
+    typeof import('@/backend/services/session/service/acp/model-value-resolver')
+  >('@/backend/services/session/service/acp/model-value-resolver');
+
+  return {
+    fetchCodexModelCatalogFromAppServer: vi.fn(),
+    resolveModelValueFromAvailable,
+  };
+});
 
 describe('SessionConfigService', () => {
   const repository = {
@@ -512,6 +521,33 @@ describe('SessionConfigService', () => {
 
     expect(runtimeManager.setConfigOption).not.toHaveBeenCalled();
     expect(runtimeManager.setSessionModel).not.toHaveBeenCalled();
+  });
+
+  it('resolves a model alias to the variant the ACP session offers', async () => {
+    runtimeManager.getClient.mockReturnValue(
+      unsafeCoerce({
+        provider: 'CLAUDE',
+        providerSessionId: 'provider-session-1',
+        configOptions: [
+          {
+            id: 'model',
+            name: 'Model',
+            type: 'select',
+            category: 'model',
+            currentValue: 'default',
+            options: [
+              { value: 'default', name: 'Default' },
+              { value: 'opus[1m]', name: 'Opus' },
+            ],
+          },
+        ],
+      })
+    );
+    runtimeManager.setSessionModel.mockResolvedValue([]);
+
+    await service.setSessionModel('session-1', 'opus');
+
+    expect(runtimeManager.setSessionModel).toHaveBeenCalledWith('session-1', 'opus[1m]');
   });
 
   it('routes model config updates through ACP setSessionModel', async () => {

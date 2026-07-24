@@ -22,6 +22,7 @@ import { AcpClientHandler, type AutoApprovePolicy } from './acp-client-handler';
 import type { AcpPermissionBridge } from './acp-permission-bridge';
 import { AcpProcessHandle } from './acp-process-handle';
 import type { AcpRuntimeEvent } from './acp-runtime-events';
+import { resolveModelValueFromAvailable } from './model-value-resolver';
 import type { AcpClientOptions, PermissionPreset } from './types';
 
 const logger = createLogger('acp-runtime-manager');
@@ -894,7 +895,11 @@ export class AcpRuntimeManager {
     }
 
     const availableValues = getConfigOptionSelectValues(modelOption);
-    if (availableValues.length > 0 && !availableValues.includes(modelId)) {
+    const resolvedModelId =
+      availableValues.length === 0
+        ? modelId
+        : resolveModelValueFromAvailable(modelId, availableValues);
+    if (!resolvedModelId) {
       logger.warn('Requested session model not offered by agent; keeping agent default', {
         sessionId,
         provider: options.provider,
@@ -903,17 +908,21 @@ export class AcpRuntimeManager {
       });
       return;
     }
+    if (resolvedModelId === currentValue) {
+      return;
+    }
 
     try {
       await withTimeout({
-        promise: this.setSessionModel(sessionId, modelId),
+        promise: this.setSessionModel(sessionId, resolvedModelId),
         timeoutMs: this.acpStartupTimeoutMs,
         description: 'apply initial session model',
       });
       logger.info('Applied initial session model', {
         sessionId,
         provider: options.provider,
-        modelId,
+        requestedModel: modelId,
+        modelId: resolvedModelId,
       });
     } catch (error) {
       logger.warn('Failed to apply initial session model; continuing with agent default', {
