@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +22,7 @@ import { AcpClientHandler, type AutoApprovePolicy } from './acp-client-handler';
 import type { AcpPermissionBridge } from './acp-permission-bridge';
 import { AcpProcessHandle } from './acp-process-handle';
 import type { AcpRuntimeEvent } from './acp-runtime-events';
+import { resolveModelValueFromAvailable } from './model-value-resolver';
 import type { AcpClientOptions, PermissionPreset } from './types';
 
 const logger = createLogger('acp-runtime-manager');
@@ -56,16 +58,21 @@ function resolveAutoApprovePolicy(preset: PermissionPreset | undefined): AutoApp
   return 'none';
 }
 
+const moduleRequire = createRequire(import.meta.url);
+
 /**
- * Resolves the full path to an ACP adapter binary by finding its package
- * directory and reading the bin field from package.json.
- * Falls back to the bare command name (relies on PATH).
+ * Resolves the spawn command for an ACP adapter shipped as an npm package by
+ * locating its bin script and running it with the current Node executable.
+ * This module is ESM, so a bare `require` is unavailable (createRequire is
+ * needed), and Windows cannot spawn .js files or node_modules/.bin .cmd shims
+ * directly. Falls back to the bare command name on PATH, which is how the
+ * Docker image resolves the adapter (node_modules/.bin is on PATH there).
  */
-function resolveAcpBinary(packageName: string, binaryName: string): string {
+function resolveAcpAdapterSpawnCommand(packageName: string, binaryName: string): SpawnCommand {
   try {
-    const packageJsonPath = require.resolve(`${packageName}/package.json`);
+    const packageJsonPath = moduleRequire.resolve(`${packageName}/package.json`);
     const packageDir = dirname(packageJsonPath);
-    const pkg = require(packageJsonPath) as {
+    const pkg = moduleRequire(packageJsonPath) as {
       bin?: string | Record<string, string | undefined>;
     };
     const binPath =
@@ -75,15 +82,24 @@ function resolveAcpBinary(packageName: string, binaryName: string): string {
           ? pkg.bin[binaryName]
           : undefined;
     if (binPath) {
-      return join(packageDir, binPath);
+      const scriptPath = join(packageDir, binPath);
+      return {
+        command: process.execPath,
+        args: [scriptPath],
+        commandLabel: `${process.execPath} ${scriptPath}`,
+        // When the backend runs inside Electron, process.execPath is the
+        // Electron binary; this makes it behave as plain Node. Inert otherwise.
+        env: { ELECTRON_RUN_AS_NODE: '1' },
+      };
     }
-  } catch {
-    logger.debug('Could not resolve binary via package.json, falling back to PATH', {
+  } catch (error) {
+    logger.debug('Could not resolve adapter package bin, falling back to PATH', {
       packageName,
       binaryName,
+      error: error instanceof Error ? error.message : String(error),
     });
   }
-  return binaryName;
+  return { command: binaryName, args: [], commandLabel: binaryName };
 }
 
 type AcpErrorLogDetails = {
@@ -160,6 +176,8 @@ type SpawnCommand = {
   command: string;
   args: string[];
   commandLabel: string;
+  /** Extra environment variables required for this specific command. */
+  env?: NodeJS.ProcessEnv;
 };
 
 const DEFAULT_ACP_STARTUP_TIMEOUT_MS = 30_000;
@@ -380,6 +398,13 @@ function isOptionGroupArray(
 ): options is SessionConfigSelectGroup[] {
   const [firstOption] = options;
   return firstOption ? isOptionGroup(firstOption) : false;
+}
+
+function getConfigOptionSelectValues(option: SessionConfigOption): string[] {
+  if (isOptionGroupArray(option.options)) {
+    return option.options.flatMap((group) => group.options.map((entry) => entry.value));
+  }
+  return option.options.map((entry) => entry.value);
 }
 
 function normalizeClaudeConfigOptions(configOptions: SessionConfigOption[]): SessionConfigOption[] {
@@ -677,16 +702,10 @@ export class AcpRuntimeManager {
         }
       : isCodex
         ? resolveInternalCodexAcpSpawnCommand(this.preferSourceEntrypoint)
-        : (() => {
-            const binaryName = 'claude-agent-acp';
-            const packageName = '@agentclientprotocol/claude-agent-acp';
-            const binaryPath = resolveAcpBinary(packageName, binaryName);
-            return {
-              command: binaryPath,
-              args: [],
-              commandLabel: binaryPath,
-            };
-          })();
+        : resolveAcpAdapterSpawnCommand(
+            '@agentclientprotocol/claude-agent-acp',
+            'claude-agent-acp'
+          );
 
     logger.info('Spawning ACP subprocess', {
       sessionId,
@@ -700,6 +719,7 @@ export class AcpRuntimeManager {
       ...this.childProcessEnvProvider(),
       BROWSER: 'none',
       ...(isCodex ? { DOTENV_CONFIG_QUIET: 'true' } : {}),
+      ...(spawnCommand.env ?? {}),
     };
 
     // Spawn subprocess (CRITICAL: detached MUST be false for orphan prevention)
@@ -841,9 +861,77 @@ export class AcpRuntimeManager {
     this.sessions.set(sessionId, handle);
 
     this.wireChildExitHandler(sessionId, child, handlers);
+    await this.applyInitialSessionModel(sessionId, handle, options);
     await this.notifyClientCreated(sessionId, handle, context, handlers);
 
     return handle;
+  }
+
+  /**
+   * Applies the caller-requested model to a freshly created/resumed ACP session.
+   * The agent starts on its own default model, so without this step the model
+   * selected in the UI is silently ignored.
+   */
+  private async applyInitialSessionModel(
+    sessionId: string,
+    handle: AcpProcessHandle,
+    options: AcpClientOptions
+  ): Promise<void> {
+    const modelId = options.model?.trim();
+    if (!modelId) {
+      return;
+    }
+
+    const modelOption = handle.configOptions.find((option) => option.category === 'model');
+    if (!modelOption) {
+      return;
+    }
+
+    const currentValue = isNonEmptyString(modelOption.currentValue)
+      ? modelOption.currentValue
+      : null;
+    if (currentValue === modelId) {
+      return;
+    }
+
+    const availableValues = getConfigOptionSelectValues(modelOption);
+    const resolvedModelId =
+      availableValues.length === 0
+        ? modelId
+        : resolveModelValueFromAvailable(modelId, availableValues);
+    if (!resolvedModelId) {
+      logger.warn('Requested session model not offered by agent; keeping agent default', {
+        sessionId,
+        provider: options.provider,
+        requestedModel: modelId,
+        availableValues,
+      });
+      return;
+    }
+    if (resolvedModelId === currentValue) {
+      return;
+    }
+
+    try {
+      await withTimeout({
+        promise: this.setSessionModel(sessionId, resolvedModelId),
+        timeoutMs: this.acpStartupTimeoutMs,
+        description: 'apply initial session model',
+      });
+      logger.info('Applied initial session model', {
+        sessionId,
+        provider: options.provider,
+        requestedModel: modelId,
+        modelId: resolvedModelId,
+      });
+    } catch (error) {
+      logger.warn('Failed to apply initial session model; continuing with agent default', {
+        sessionId,
+        provider: options.provider,
+        modelId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private cleanupFailedClientCreation(child: ChildProcess, sessionId: string): void {

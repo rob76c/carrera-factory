@@ -238,10 +238,18 @@ describe('AcpRuntimeManager', () => {
         defaultContext()
       );
 
-      // Verify spawn was called with correct args
+      // Verify spawn was called with correct args: the packaged adapter bin
+      // script is run with the current Node executable so it works on Windows
       expect(mockSpawn).toHaveBeenCalledTimes(1);
       const spawnArgs = mockSpawn.mock.calls[0]!;
-      expect(spawnArgs[1]).toEqual([]);
+      expect(spawnArgs[0]).toBe(process.execPath);
+      const claudeArgs = spawnArgs[1] as string[];
+      expect(claudeArgs).toHaveLength(1);
+      expect(claudeArgs[0]).toContain('claude-agent-acp');
+      expect(claudeArgs[0]!.endsWith('.js')).toBe(true);
+      expect((spawnArgs[2] as { env?: Record<string, string> }).env?.ELECTRON_RUN_AS_NODE).toBe(
+        '1'
+      );
       expect(spawnArgs[2]).toMatchObject({
         cwd: '/tmp/workspace',
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -292,9 +300,12 @@ describe('AcpRuntimeManager', () => {
       expect(spawnArgs[1]).toContain('internal');
       expect(spawnArgs[1]).toContain('codex-app-server-acp');
       expect(
-        (spawnArgs[1] as string[]).some(
-          (arg) => arg.endsWith('src/cli/index.ts') || arg.endsWith('dist/src/cli/index.js')
-        )
+        (spawnArgs[1] as string[]).some((arg) => {
+          const normalized = arg.replaceAll('\\', '/');
+          return (
+            normalized.endsWith('src/cli/index.ts') || normalized.endsWith('dist/src/cli/index.js')
+          );
+        })
       ).toBe(true);
       expect(typeof spawnArgs[0]).toBe('string');
       expect((spawnArgs[0] as string).length).toBeGreaterThan(0);
@@ -343,9 +354,12 @@ describe('AcpRuntimeManager', () => {
         expect(args.some((arg) => arg.endsWith('tsconfig.json'))).toBe(true);
       }
       expect(
-        args.some(
-          (arg) => arg.endsWith('src/cli/index.ts') || arg.endsWith('dist/src/cli/index.js')
-        )
+        args.some((arg) => {
+          const normalized = arg.replaceAll('\\', '/');
+          return (
+            normalized.endsWith('src/cli/index.ts') || normalized.endsWith('dist/src/cli/index.js')
+          );
+        })
       ).toBe(true);
     });
 
@@ -1328,6 +1342,159 @@ describe('AcpRuntimeManager', () => {
         sessionId: 'provider-session-123',
         configId: 'model',
         value: 'gpt-5.2-codex',
+      });
+    });
+  });
+
+  describe('initial model on session creation', () => {
+    it('applies the requested model when it differs from the agent default', async () => {
+      setupSuccessfulSpawn();
+
+      const handle = await manager.getOrCreateClient(
+        'session-1',
+        { ...defaultOptions(), model: 'opus' },
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(mockSetSessionModel).toHaveBeenCalledWith({
+        sessionId: 'provider-session-123',
+        modelId: 'opus',
+      });
+      expect(handle.configOptions.find((option) => option.id === 'model')?.currentValue).toBe(
+        'opus'
+      );
+    });
+
+    it('does not set a model when the requested model matches the agent default', async () => {
+      setupSuccessfulSpawn();
+
+      await manager.getOrCreateClient(
+        'session-1',
+        { ...defaultOptions(), model: 'sonnet' },
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(mockSetSessionModel).not.toHaveBeenCalled();
+      expect(mockSetSessionConfigOption).not.toHaveBeenCalled();
+    });
+
+    it('does not set a model when no model was requested', async () => {
+      setupSuccessfulSpawn();
+
+      await manager.getOrCreateClient(
+        'session-1',
+        defaultOptions(),
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(mockSetSessionModel).not.toHaveBeenCalled();
+      expect(mockSetSessionConfigOption).not.toHaveBeenCalled();
+    });
+
+    it('resolves a model alias to the variant the agent offers', async () => {
+      const child = createMockChildProcess();
+      mockSpawn.mockReturnValue(child);
+      mockInitialize.mockResolvedValue({
+        protocolVersion: 1,
+        agentCapabilities: { loadSession: {} },
+      });
+      // Mirrors claude-agent-acp, which offers "opus[1m]" rather than a bare "opus"
+      const aliasConfigOptions = [
+        {
+          id: 'model',
+          name: 'Model',
+          type: 'select' as const,
+          category: 'model',
+          currentValue: 'default',
+          options: [
+            { value: 'default', name: 'Default' },
+            { value: 'opus[1m]', name: 'Opus' },
+            { value: 'haiku', name: 'Haiku' },
+          ],
+        },
+        {
+          id: 'mode',
+          name: 'Mode',
+          type: 'select' as const,
+          category: 'mode',
+          currentValue: 'default',
+          options: [{ value: 'default', name: 'Default' }],
+        },
+      ];
+      mockNewSession.mockResolvedValue({
+        sessionId: 'provider-session-123',
+        configOptions: aliasConfigOptions,
+      });
+      mockSetSessionModel.mockResolvedValue({});
+
+      const handle = await manager.getOrCreateClient(
+        'session-1',
+        { ...defaultOptions(), model: 'opus' },
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(mockSetSessionModel).toHaveBeenCalledWith({
+        sessionId: 'provider-session-123',
+        modelId: 'opus[1m]',
+      });
+      expect(handle.configOptions.find((option) => option.id === 'model')?.currentValue).toBe(
+        'opus[1m]'
+      );
+    });
+
+    it('keeps the agent default when the requested model is not offered', async () => {
+      setupSuccessfulSpawn();
+
+      const handle = await manager.getOrCreateClient(
+        'session-1',
+        { ...defaultOptions(), model: 'gpt-6' },
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(mockSetSessionModel).not.toHaveBeenCalled();
+      expect(mockSetSessionConfigOption).not.toHaveBeenCalled();
+      expect(handle.configOptions.find((option) => option.id === 'model')?.currentValue).toBe(
+        'sonnet'
+      );
+    });
+
+    it('does not fail session creation when applying the model fails', async () => {
+      setupSuccessfulSpawn();
+      mockSetSessionModel.mockRejectedValueOnce(new Error('model switch failed'));
+
+      const handle = await manager.getOrCreateClient(
+        'session-1',
+        { ...defaultOptions(), model: 'opus' },
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(handle.isRunning()).toBe(true);
+      expect(handle.configOptions.find((option) => option.id === 'model')?.currentValue).toBe(
+        'sonnet'
+      );
+    });
+
+    it('applies the requested model for CODEX via setSessionConfigOption', async () => {
+      setupSuccessfulSpawn();
+
+      await manager.getOrCreateClient(
+        'session-1',
+        { ...codexOptions(), model: 'opus' },
+        defaultHandlers(),
+        defaultContext()
+      );
+
+      expect(mockSetSessionModel).not.toHaveBeenCalled();
+      expect(mockSetSessionConfigOption).toHaveBeenCalledWith({
+        sessionId: 'provider-session-123',
+        configId: 'model',
+        value: 'opus',
       });
     });
   });

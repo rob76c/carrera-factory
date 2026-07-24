@@ -260,7 +260,7 @@ model AgentSession {
   workspace           Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   name                String?
   workflow            String // "explore", "implement", "test"
-  model               String        @default("sonnet")
+  model               String        @default("opus")
   status              SessionStatus @default(IDLE)
   provider            SessionProvider
   providerSessionId   String?
@@ -336,7 +336,7 @@ model UserSettings {
   ratchetEnabled            Boolean  @default(false)  // Default for new GitHub-issue-created workspaces
   ratchetReplyToPrComments  Boolean  @default(true)   // Whether Ratchet should post PR/review comment replies
   defaultSessionProvider    SessionProvider @default(CLAUDE)
-  defaultClaudeModel        String @default("sonnet")
+  defaultClaudeModel        String @default("opus")
   defaultCodexModel         String @default("default")
   defaultWorkspacePermissions SessionPermissionPreset @default(STRICT) // Default execution-mode preset for non-ratchet sessions
   ratchetPermissions        SessionPermissionPreset @default(YOLO) // Default execution-mode preset for ratchet sessions

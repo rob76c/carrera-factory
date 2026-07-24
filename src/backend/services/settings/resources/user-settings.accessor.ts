@@ -5,7 +5,10 @@ import type {
   UserSettings,
 } from '@prisma-gen/client';
 import { prisma } from '@/backend/db';
-import { normalizeSessionModelForProvider } from '@/backend/lib/session-model';
+import {
+  DEFAULT_SESSION_MODEL_BY_PROVIDER,
+  normalizeSessionModelForProvider,
+} from '@/backend/lib/session-model';
 import { workspaceOrderMapSchema } from '@/shared/schemas/persisted-stores.schema';
 
 interface UpdateUserSettingsInput {
@@ -76,7 +79,7 @@ class UserSettingsAccessor {
           customIdeCommand: null,
           playSoundOnComplete: true,
           defaultSessionProvider: 'CLAUDE',
-          defaultClaudeModel: 'sonnet',
+          defaultClaudeModel: DEFAULT_SESSION_MODEL_BY_PROVIDER.CLAUDE,
           defaultCodexModel: 'default',
           defaultWorkspacePermissions: 'STRICT',
           ratchetReplyToPrComments: true,
@@ -115,7 +118,7 @@ class UserSettingsAccessor {
         playSoundOnComplete: data.playSoundOnComplete ?? true,
         cachedSlashCommands: data.cachedSlashCommands ?? undefined,
         defaultSessionProvider: data.defaultSessionProvider ?? 'CLAUDE',
-        defaultClaudeModel: normalizedClaudeModel ?? 'sonnet',
+        defaultClaudeModel: normalizedClaudeModel ?? DEFAULT_SESSION_MODEL_BY_PROVIDER.CLAUDE,
         defaultCodexModel: normalizedCodexModel ?? 'default',
         defaultWorkspacePermissions: data.defaultWorkspacePermissions ?? 'STRICT',
         ratchetReplyToPrComments: data.ratchetReplyToPrComments ?? true,
