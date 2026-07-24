@@ -2,7 +2,11 @@ import { useCallback, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router';
 import { toast } from 'sonner';
 import { trpc } from '@/client/lib/trpc';
-import { removeWorkspaceFromProjectSummaryCache } from '@/client/lib/workspace-cache-helpers';
+import {
+  removeWorkspaceFromProjectSummaryCache,
+  restoreWorkspacesToListCache,
+  restoreWorkspacesToProjectSummaryCache,
+} from '@/client/lib/workspace-cache-helpers';
 import {
   type NewSessionProviderSelection,
   resolveExplicitSessionProvider,
@@ -123,10 +127,11 @@ export interface UseSessionManagementReturn {
     {
       workspaceId: string;
       workflow: string;
-      model: string;
+      model?: string;
       name: string;
       provider?: SessionProviderValue;
       initialMessage?: string;
+      initialPrompt?: string;
     },
     { id: string }
   >;
@@ -154,17 +159,16 @@ export function useSessionManagement({
   const navigate = useNavigate();
   const utils = trpc.useUtils();
 
-  const createSession = trpc.session.createSession.useMutation({
+  const createSession = trpc.session.createAndStartSession.useMutation({
     onSuccess: (_data) => {
       // Invalidate marks the data as stale, then immediately refetch
       // With staleTime: 0, invalidate will trigger an immediate refetch
       utils.session.listSessions.invalidate({ workspaceId });
     },
     onError: (error) => {
-      toast.error(error.message || 'Failed to create session');
+      toast.error(error.message || 'Failed to create or start session');
     },
   });
-  const startSession = trpc.session.startSession.useMutation();
 
   const deleteSession = trpc.session.deleteSession.useMutation({
     onMutate: async ({ id }) => {
@@ -236,15 +240,15 @@ export function useSessionManagement({
 
       if (context?.projectId) {
         if (context.previousWorkspaceList) {
-          utils.workspace.listWithKanbanState.setData(
-            { projectId: context.projectId },
-            context.previousWorkspaceList
+          utils.workspace.listWithKanbanState.setData({ projectId: context.projectId }, (old) =>
+            restoreWorkspacesToListCache(old, context.previousWorkspaceList, [_variables.id])
           );
         }
         if (context.previousProjectSummaryState) {
-          utils.workspace.getProjectSummaryState.setData(
-            { projectId: context.projectId },
-            context.previousProjectSummaryState
+          utils.workspace.getProjectSummaryState.setData({ projectId: context.projectId }, (old) =>
+            restoreWorkspacesToProjectSummaryCache(old, context.previousProjectSummaryState, [
+              _variables.id,
+            ])
           );
         }
       }
@@ -331,24 +335,13 @@ export function useSessionManagement({
         model,
         name,
         provider,
+        initialPrompt: '',
       },
       {
         onSuccess: (session) => {
-          const previousSessionId = selectedDbSessionId;
-          startSession.mutate(
-            { id: session.id, initialPrompt: '' },
-            {
-              onSuccess: () => {
-                // Setting the new session ID triggers WebSocket reconnection automatically
-                setSelectedDbSessionId(session.id);
-                setTimeout(() => inputRef.current?.focus(), 0);
-              },
-              onError: (error) => {
-                toast.error(error.message || 'Failed to start session');
-                setSelectedDbSessionId(previousSessionId);
-              },
-            }
-          );
+          // Setting the new session ID triggers WebSocket reconnection automatically
+          setSelectedDbSessionId(session.id);
+          setTimeout(() => inputRef.current?.focus(), 0);
         },
       }
     );
@@ -356,8 +349,6 @@ export function useSessionManagement({
     createSession,
     workspaceId,
     getNextChatName,
-    startSession,
-    selectedDbSessionId,
     setSelectedDbSessionId,
     inputRef,
     selectedModel,
@@ -368,37 +359,25 @@ export function useSessionManagement({
     (name: string, prompt: string) => {
       const provider = selectedProvider;
       const model = provider === 'CODEX' ? undefined : selectedModel || undefined;
-      const previousSessionId = selectedDbSessionId;
       createSession.mutate(
-        { workspaceId, workflow: 'followup', name, model, provider, initialMessage: prompt },
+        {
+          workspaceId,
+          workflow: 'followup',
+          name,
+          model,
+          provider,
+          initialMessage: prompt,
+          initialPrompt: '',
+        },
         {
           onSuccess: (session) => {
-            startSession.mutate(
-              { id: session.id, initialPrompt: '' },
-              {
-                onSuccess: () => {
-                  // Setting the new session ID triggers WebSocket reconnection automatically
-                  setSelectedDbSessionId(session.id);
-                },
-                onError: (error) => {
-                  toast.error(error.message || 'Failed to start session');
-                  setSelectedDbSessionId(previousSessionId);
-                },
-              }
-            );
+            // Setting the new session ID triggers WebSocket reconnection automatically
+            setSelectedDbSessionId(session.id);
           },
         }
       );
     },
-    [
-      createSession,
-      workspaceId,
-      startSession,
-      selectedDbSessionId,
-      setSelectedDbSessionId,
-      selectedModel,
-      selectedProvider,
-    ]
+    [createSession, workspaceId, setSelectedDbSessionId, selectedModel, selectedProvider]
   );
 
   return {

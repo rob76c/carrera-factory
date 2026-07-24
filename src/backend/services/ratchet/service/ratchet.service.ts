@@ -1,57 +1,76 @@
-/**
- * Ratchet Service
- *
- * Simplified ratchet loop:
- * - Poll workspaces with PRs
- * - Dispatch ratchet only when PR state changed since last dispatch
- * - Dispatch only when workspace is idle (no active ratchet or other chat session)
- */
-
 import { EventEmitter } from 'node:events';
+import type { RatchetDispatchOutcome, RatchetReviewTriggerMode } from '@prisma-gen/client';
+import pLimit from 'p-limit';
 import { toError } from '@/backend/lib/error-utils';
-import { SERVICE_INTERVAL_MS, SERVICE_TIMEOUT_MS } from '@/backend/services/constants';
+import {
+  SERVICE_INTERVAL_MS,
+  SERVICE_THRESHOLDS,
+  SERVICE_TIMEOUT_MS,
+} from '@/backend/services/constants';
 import { createLogger } from '@/backend/services/logger.service';
 import { RateLimitBackoff } from '@/backend/services/rate-limit-backoff';
-import { workspaceAccessor } from '@/backend/services/workspace';
-import { CIStatus, RatchetState } from '@/shared/core';
-import type { RatchetGitHubBridge, RatchetPRSnapshotBridge, RatchetSessionBridge } from './bridges';
+import { userSettingsService } from '@/backend/services/settings';
+import { workspaceDataService, workspaceRatchetService } from '@/backend/services/workspace';
+import { CIStatus, RatchetState, SessionStatus } from '@/shared/core';
 import type {
+  RatchetGitHubBridge,
+  RatchetPRSnapshotBridge,
+  RatchetSessionBridge,
+  RatchetWorkspaceBridge,
+} from './bridges';
+import type {
+  ActiveFixerCheckResult,
+  PRStateFetchResult,
+  PRStateFetchSkipped,
   PRStateInfo,
   RatchetAction,
   RatchetCheckResult,
   RatchetDecision,
   RatchetDecisionContext,
-  ReviewPollResult,
-  ReviewPollTracker,
   WorkspaceRatchetResult,
   WorkspaceWithPR,
 } from './ratchet.types';
 import {
-  getActiveRatchetSession as getActiveRatchetSessionHelper,
+  checkActiveFixerSession as checkActiveFixerSessionHelper,
   hasActiveSession as hasActiveSessionHelper,
 } from './ratchet-active-session.helpers';
+import { logWorkspaceRatchetingDecision as logWorkspaceRatchetingDecisionHelper } from './ratchet-decision-logging.helpers';
 import { triggerRatchetFixer } from './ratchet-fixer-dispatch.helpers';
 import type { AuthenticatedUsernameCache } from './ratchet-pr-state.helpers';
 import {
-  buildFailedCheckDiagnostics as buildFailedCheckDiagnosticsHelper,
-  buildReviewTimestampDiagnostics as buildReviewTimestampDiagnosticsHelper,
-  buildSnapshotDiagnostics as buildSnapshotDiagnosticsHelper,
-  computeDispatchSnapshotKey as computeDispatchSnapshotKeyHelper,
-  computeLatestReviewActivityAtMs as computeLatestReviewActivityAtMsHelper,
   determineRatchetState as determineRatchetStateHelper,
   fetchPRState as fetchPRStateHelper,
   getAuthenticatedUsernameCached as getAuthenticatedUsernameCachedHelper,
   hasNewReviewActivitySinceLastDispatch as hasNewReviewActivitySinceLastDispatchHelper,
+  isPRStateFetchSkipped,
   shouldSkipCleanPR as shouldSkipCleanPRHelper,
 } from './ratchet-pr-state.helpers';
-import { handleReviewCommentPoll as handleReviewCommentPollHelper } from './ratchet-review-poll.helpers';
+import { assertValidRatchetTransition } from './ratchet-state-machine';
+import {
+  RatchetWorkspaceCheckCoordinator,
+  type WorkspaceCheckScheduler,
+} from './ratchet-workspace-check-coordinator';
 
 const logger = createLogger('ratchet');
+const RATCHET_WORKSPACE_CONCURRENCY = 3;
+const ratchetWorkspaceLimit = pLimit(RATCHET_WORKSPACE_CONCURRENCY);
+const scheduleRatchetBatchCheck: WorkspaceCheckScheduler = (task) => ratchetWorkspaceLimit(task);
+
+const RECENTLY_FETCHED_REASON: PRStateFetchSkipped['reason'] = 'recently_fetched';
+
+function isRecentlyFetchedWaitResult(result: WorkspaceRatchetResult): boolean {
+  return result.action.type === 'WAITING' && result.action.reason === RECENTLY_FETCHED_REASON;
+}
 
 export type { RatchetAction, RatchetCheckResult, WorkspaceRatchetResult } from './ratchet.types';
 
 export const RATCHET_STATE_CHANGED = 'ratchet_state_changed' as const;
 export const RATCHET_TOGGLED = 'ratchet_toggled' as const;
+export const RATCHET_DISPATCH_CHANGED = 'ratchet_dispatch_changed' as const;
+
+export interface RatchetDispatchChangedEvent {
+  workspaceId: string;
+}
 
 export interface RatchetStateChangedEvent {
   workspaceId: string;
@@ -67,29 +86,53 @@ export interface RatchetToggledEvent {
   ratchetState: RatchetState;
 }
 
+export interface RatchetCheckOptions {
+  /**
+   * Fetch fresh PR state even if another service fetched this workspace's PR
+   * within the dedup cooldown. Event-driven checks (PR switch, reopen) fire
+   * right after the scheduler sync that emitted the event registered its own
+   * fetch, so without the bypass they are guaranteed to be deduped into a
+   * no-op and ratcheting would only resume on a later poll cycle.
+   */
+  bypassPrFetchCooldown?: boolean;
+}
+
 class RatchetService extends EventEmitter {
   private isShuttingDown = false;
   private monitorLoop: Promise<void> | null = null;
   private sleepTimeout: NodeJS.Timeout | null = null;
   private sleepResolve: (() => void) | null = null;
   private workspaceCheckTimeoutMs = SERVICE_TIMEOUT_MS.ratchetWorkspaceCheck;
-  private readonly inFlightWorkspaceChecks = new Map<string, Promise<WorkspaceRatchetResult>>();
+  private readonly checkCoordinator = new RatchetWorkspaceCheckCoordinator(
+    () => this.workspaceCheckTimeoutMs
+  );
   private cachedAuthenticatedUsername: AuthenticatedUsernameCache | null = null;
   private readonly backoff = new RateLimitBackoff();
-  private readonly reviewPollTrackers = new Map<string, ReviewPollTracker>();
 
   private sessionBridge: RatchetSessionBridge | null = null;
   private githubBridge: RatchetGitHubBridge | null = null;
   private snapshotBridge: RatchetPRSnapshotBridge | null = null;
+  private workspaceBridge: RatchetWorkspaceBridge | null = null;
 
   configure(bridges: {
     session: RatchetSessionBridge;
     github: RatchetGitHubBridge;
     snapshot: RatchetPRSnapshotBridge;
+    workspace: RatchetWorkspaceBridge;
   }): void {
     this.sessionBridge = bridges.session;
     this.githubBridge = bridges.github;
     this.snapshotBridge = bridges.snapshot;
+    this.workspaceBridge = bridges.workspace;
+  }
+
+  private get workspace(): RatchetWorkspaceBridge {
+    if (!this.workspaceBridge) {
+      throw new Error(
+        'RatchetService not configured: workspace bridge missing. Call configure() first.'
+      );
+    }
+    return this.workspaceBridge;
   }
 
   private get session(): RatchetSessionBridge {
@@ -206,14 +249,23 @@ class RatchetService extends EventEmitter {
       return { checked: 0, stateChanges: 0, actionsTriggered: 0, results: [] };
     }
 
-    const workspaces = await workspaceAccessor.findWithPRsForRatchet();
+    const workspaces = await workspaceRatchetService.findCandidates();
 
     if (workspaces.length === 0) {
       return { checked: 0, stateChanges: 0, actionsTriggered: 0, results: [] };
     }
 
+    const userSettings = await userSettingsService.get();
+
     const results = await Promise.all(
-      workspaces.map((workspace) => this.runWorkspaceCheckSafely(workspace))
+      workspaces.map((workspace) =>
+        this.runWorkspaceCheckSafely(
+          workspace,
+          undefined,
+          scheduleRatchetBatchCheck,
+          userSettings.ratchetReviewTriggerMode
+        )
+      )
     );
 
     const stateChanges = results.filter((r) => r.previousState !== r.newState).length;
@@ -230,32 +282,133 @@ class RatchetService extends EventEmitter {
     return { checked: workspaces.length, stateChanges, actionsTriggered, results };
   }
 
-  async checkWorkspaceById(workspaceId: string): Promise<WorkspaceRatchetResult | null> {
+  async checkWorkspaceById(
+    workspaceId: string,
+    opts?: RatchetCheckOptions
+  ): Promise<WorkspaceRatchetResult | null> {
     if (this.isShuttingDown) {
       return null;
     }
 
-    const workspace = await workspaceAccessor.findForRatchetById(workspaceId);
+    const workspace = await workspaceRatchetService.findCandidateById(workspaceId);
     if (!workspace) {
       return null;
     }
 
-    return this.runWorkspaceCheckSafely(workspace);
+    const userSettings = await userSettingsService.get();
+    const reviewTriggerMode = userSettings.ratchetReviewTriggerMode;
+
+    const result = await this.runWorkspaceCheckSafely(
+      workspace,
+      opts,
+      undefined,
+      reviewTriggerMode
+    );
+
+    // A bypassed check can still come back dedup-skipped: the coordinator may
+    // have joined a normal check that was already in flight, or another
+    // service's fetch was actively in flight. Rerun once now that the
+    // concurrent work has settled so the bypass actually applies.
+    if (opts?.bypassPrFetchCooldown && isRecentlyFetchedWaitResult(result)) {
+      const freshWorkspace = await workspaceRatchetService.findCandidateById(workspaceId);
+      if (!freshWorkspace) {
+        return result;
+      }
+      return this.runWorkspaceCheckSafely(freshWorkspace, opts, undefined, reviewTriggerMode);
+    }
+
+    return result;
   }
 
-  async clearRatchetActiveSessionIfMatching(workspaceId: string, sessionId: string): Promise<void> {
-    await workspaceAccessor.clearRatchetActiveSession(workspaceId, sessionId);
+  /**
+   * Settle the dispatch record when a fixer session ends. Conditional on the
+   * pointer still naming the session, so a stale caller cannot overwrite an
+   * outcome that was already recorded by another session-end path.
+   */
+  async recordSessionEnd(
+    workspaceId: string,
+    sessionId: string,
+    outcome: Exclude<RatchetDispatchOutcome, 'RUNNING'>
+  ): Promise<void> {
+    const settled = await this.workspace.recordSessionEnd(workspaceId, sessionId, outcome);
+    if (!settled) {
+      return;
+    }
+
+    this.emit(RATCHET_DISPATCH_CHANGED, {
+      workspaceId,
+    } satisfies RatchetDispatchChangedEvent);
+  }
+
+  /**
+   * Settle ratchet state for a workspace whose PR is closed (not merged).
+   * Closed PRs are excluded from the poll set, so the poll loop can no longer
+   * transition them to IDLE itself. Idempotent; no GitHub fetch.
+   *
+   * The transition is CAS'd on the fromState just read, so the emitted event
+   * carries the state that was actually replaced. Losing the CAS means an
+   * in-flight check wrote a fresh state concurrently; retry so that racing
+   * check does not leave the closed PR parked in a non-IDLE state (it will
+   * never be polled again). Closed PRs leave the poll set, so at most one
+   * such check can be in flight and the bounded retries are expected to
+   * always suffice; if they are ever exhausted anyway, this logs a warning
+   * and leaves the stale state for a manual ratchet toggle to clear.
+   */
+  async markPrClosed(workspaceId: string): Promise<void> {
+    const maxCasAttempts = 3;
+    for (let attempt = 0; attempt < maxCasAttempts; attempt++) {
+      const workspace = await workspaceDataService.findById(workspaceId);
+      if (!workspace?.ratchetEnabled || workspace.ratchetState === RatchetState.IDLE) {
+        return;
+      }
+
+      const fromState = workspace.ratchetState;
+      assertValidRatchetTransition(workspaceId, fromState, RatchetState.IDLE);
+      const updated = await workspaceRatchetService.transitionStateIfEnabled(
+        workspaceId,
+        fromState,
+        {
+          ratchetState: RatchetState.IDLE,
+          ratchetLastCheckedAt: new Date(),
+        }
+      );
+      if (updated) {
+        this.emit(RATCHET_STATE_CHANGED, {
+          workspaceId,
+          fromState,
+          toState: RatchetState.IDLE,
+        } satisfies RatchetStateChangedEvent);
+        return;
+      }
+    }
+
+    logger.warn('markPrClosed gave up after losing repeated state CAS races', {
+      workspaceId,
+      attempts: maxCasAttempts,
+    });
   }
 
   private async runWorkspaceCheckSafely(
-    workspace: WorkspaceWithPR
+    workspace: WorkspaceWithPR,
+    opts?: RatchetCheckOptions,
+    schedule?: WorkspaceCheckScheduler,
+    reviewTriggerMode?: RatchetReviewTriggerMode
   ): Promise<WorkspaceRatchetResult> {
-    const checkPromise = this.runWorkspaceCheck(workspace.id, () =>
-      this.processWorkspace(workspace)
-    );
-
     try {
-      return await this.withWorkspaceCheckTimeout(workspace, checkPromise);
+      return await this.checkCoordinator.run(
+        workspace,
+        (signal, commitSideEffects) => {
+          signal.throwIfAborted();
+          return this.processWorkspace(
+            workspace,
+            opts,
+            signal,
+            commitSideEffects,
+            reviewTriggerMode
+          );
+        },
+        schedule
+      );
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       logger.warn('Ratchet workspace check failed', {
@@ -272,57 +425,14 @@ class RatchetService extends EventEmitter {
     }
   }
 
-  private withWorkspaceCheckTimeout(
-    workspace: WorkspaceWithPR,
-    checkPromise: Promise<WorkspaceRatchetResult>
-  ): Promise<WorkspaceRatchetResult> {
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        if (this.inFlightWorkspaceChecks.get(workspace.id) === checkPromise) {
-          this.inFlightWorkspaceChecks.delete(workspace.id);
-        }
-        reject(new Error(`Workspace check timed out after ${this.workspaceCheckTimeoutMs}ms`));
-      }, this.workspaceCheckTimeoutMs);
-      timeout.unref?.();
-
-      checkPromise.then(resolve, reject).finally(() => {
-        clearTimeout(timeout);
-      });
-    });
-  }
-
-  private runWorkspaceCheck(
-    workspaceId: string,
-    runner: () => Promise<WorkspaceRatchetResult>
-  ): Promise<WorkspaceRatchetResult> {
-    const existing = this.inFlightWorkspaceChecks.get(workspaceId);
-    if (existing) {
-      return existing;
-    }
-
-    const inFlight = runner().finally(() => {
-      if (this.inFlightWorkspaceChecks.get(workspaceId) === inFlight) {
-        this.inFlightWorkspaceChecks.delete(workspaceId);
-      }
-    });
-    this.inFlightWorkspaceChecks.set(workspaceId, inFlight);
-    return inFlight;
-  }
-
-  /**
-   * Enable or disable ratcheting for a workspace.
-   * Ratchet domain owns ratchet state fields, so toggles flow through this service.
-   */
   async setWorkspaceRatcheting(workspaceId: string, enabled: boolean): Promise<void> {
-    const workspace = await workspaceAccessor.findById(workspaceId);
+    const workspace = await workspaceDataService.findById(workspaceId);
     if (!workspace) {
       throw new Error(`Workspace not found: ${workspaceId}`);
     }
 
     if (enabled) {
-      await workspaceAccessor.update(workspaceId, {
-        ratchetEnabled: true,
-      });
+      await workspaceRatchetService.enable(workspaceId);
       this.emit(RATCHET_TOGGLED, {
         workspaceId,
         enabled: true,
@@ -331,25 +441,11 @@ class RatchetService extends EventEmitter {
       return;
     }
 
-    const activeSessionId = workspace.ratchetActiveSessionId;
-    if (activeSessionId && this.session.isSessionRunning(activeSessionId)) {
-      try {
-        await this.session.stopSession(activeSessionId);
-      } catch (error) {
-        logger.warn('Failed to stop active ratchet session while disabling ratchet', {
-          workspaceId,
-          sessionId: activeSessionId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
+    await workspaceRatchetService.disable(workspaceId);
 
-    await workspaceAccessor.update(workspaceId, {
-      ratchetEnabled: false,
-      ratchetState: RatchetState.IDLE,
-      ratchetActiveSessionId: null,
-      ratchetLastCiRunId: null,
-    });
+    // Stops every running ratchet-workflow session, including the one the
+    // (now cleared) active-session pointer named.
+    await this.stopActiveRatchetSessionsAfterDisable(workspaceId);
 
     if (workspace.ratchetState !== RatchetState.IDLE) {
       this.emit(RATCHET_STATE_CHANGED, {
@@ -366,7 +462,16 @@ class RatchetService extends EventEmitter {
     } satisfies RatchetToggledEvent);
   }
 
-  private async processWorkspace(workspace: WorkspaceWithPR): Promise<WorkspaceRatchetResult> {
+  private async processWorkspace(
+    workspace: WorkspaceWithPR,
+    opts?: RatchetCheckOptions,
+    signal: AbortSignal = new AbortController().signal,
+    commitSideEffects: () => void = () => {
+      // Direct private-method callers do not have a coordinator timeout to disable.
+    },
+    reviewTriggerMode?: RatchetReviewTriggerMode
+  ): Promise<WorkspaceRatchetResult> {
+    signal.throwIfAborted();
     if (this.isShuttingDown) {
       return {
         workspaceId: workspace.id,
@@ -376,40 +481,74 @@ class RatchetService extends EventEmitter {
       };
     }
 
-    // Skip GitHub API calls for disabled workspaces — just settle to IDLE
     if (!workspace.ratchetEnabled) {
       const action: RatchetAction = { type: 'DISABLED', reason: 'Workspace ratcheting disabled' };
+      const fromState = workspace.ratchetState;
       const newState = RatchetState.IDLE;
-      await workspaceAccessor.update(workspace.id, {
-        ratchetState: newState,
-        ratchetLastCheckedAt: new Date(),
-      });
-      if (workspace.ratchetState !== newState) {
+      signal.throwIfAborted();
+      assertValidRatchetTransition(workspace.id, fromState, newState);
+      // CAS on the pre-read fromState: a lost swap means another path already
+      // settled (or re-enabled) the workspace, and that path emitted its own
+      // event, so emitting here with this fromState would be stale.
+      const settled = await workspaceRatchetService.settleIdleWhileDisabled(
+        workspace.id,
+        fromState
+      );
+      signal.throwIfAborted();
+      if (settled && fromState !== newState) {
         this.emit(RATCHET_STATE_CHANGED, {
           workspaceId: workspace.id,
-          fromState: workspace.ratchetState,
+          fromState,
           toState: newState,
         } satisfies RatchetStateChangedEvent);
       }
-      this.logWorkspaceRatchetingDecision(
-        workspace,
-        workspace.ratchetState,
-        newState,
-        action,
-        null
-      );
+      // A lost settle persisted nothing, so report the state unchanged rather
+      // than a transition this check never committed.
+      const reportedState = settled ? newState : fromState;
+      this.logWorkspaceRatchetingDecision(workspace, fromState, reportedState, action, null);
       return {
         workspaceId: workspace.id,
-        previousState: workspace.ratchetState,
-        newState,
+        previousState: fromState,
+        newState: reportedState,
         action,
       };
     }
 
     try {
-      const authenticatedUsername = await this.getAuthenticatedUsernameCached();
-      const prStateInfo = await this.fetchPRState(workspace, authenticatedUsername);
-      if (!prStateInfo) {
+      signal.throwIfAborted();
+      const effectiveReviewTriggerMode =
+        reviewTriggerMode ?? (await userSettingsService.get()).ratchetReviewTriggerMode;
+      signal.throwIfAborted();
+      const authenticatedUsername = await this.getAuthenticatedUsernameCached(signal);
+      signal.throwIfAborted();
+      const prStateResult = await this.fetchPRState(
+        workspace,
+        authenticatedUsername,
+        {
+          bypassRecentFetchCooldown: opts?.bypassPrFetchCooldown,
+          reviewTriggerMode: effectiveReviewTriggerMode,
+        },
+        signal
+      );
+      signal.throwIfAborted();
+      if (isPRStateFetchSkipped(prStateResult)) {
+        const action: RatchetAction = { type: 'WAITING', reason: prStateResult.reason };
+        this.logWorkspaceRatchetingDecision(
+          workspace,
+          workspace.ratchetState,
+          workspace.ratchetState,
+          action,
+          null
+        );
+        return {
+          workspaceId: workspace.id,
+          previousState: workspace.ratchetState,
+          newState: workspace.ratchetState,
+          action,
+        };
+      }
+
+      if (!prStateResult) {
         const action: RatchetAction = { type: 'ERROR', error: 'Failed to fetch PR state' };
         this.logWorkspaceRatchetingDecision(
           workspace,
@@ -426,56 +565,27 @@ class RatchetService extends EventEmitter {
         };
       }
 
-      const decisionContext = await this.buildRatchetDecisionContext(workspace, prStateInfo);
-      const decision = this.decideRatchetAction(decisionContext);
-
-      if (prStateInfo.prState === 'MERGED') {
-        this.reviewPollTrackers.delete(workspace.id);
-      } else if (decisionContext.isCleanPrWithNoNewReviewActivity) {
-        const pollDispatch = await this.processReviewCommentPoll(
-          workspace,
-          prStateInfo,
-          authenticatedUsername
-        );
-        if (pollDispatch) {
-          return pollDispatch;
-        }
-      } else {
-        this.reviewPollTrackers.delete(workspace.id);
-      }
-
-      const action = await this.applyRatchetDecision(decisionContext, decision);
-
-      await this.updateWorkspaceAfterCheck(
+      const prStateInfo = prStateResult;
+      signal.throwIfAborted();
+      const decisionContext = await this.buildRatchetDecisionContext(
         workspace,
         prStateInfo,
-        action,
-        decisionContext.finalState
+        signal
       );
-      if (decisionContext.previousState !== decisionContext.finalState) {
-        this.emit(RATCHET_STATE_CHANGED, {
-          workspaceId: workspace.id,
-          fromState: decisionContext.previousState,
-          toState: decisionContext.finalState,
-          prCiStatus: prStateInfo.ciStatus,
-        } satisfies RatchetStateChangedEvent);
-      }
-      this.logWorkspaceRatchetingDecision(
-        workspace,
-        decisionContext.previousState,
-        decisionContext.finalState,
-        action,
-        prStateInfo,
-        decisionContext
+      signal.throwIfAborted();
+      const decision = await this.decideRatchetAction(decisionContext, signal);
+      signal.throwIfAborted();
+      const action = await this.applyRatchetDecision(
+        decisionContext,
+        decision,
+        signal,
+        commitSideEffects
       );
+      signal.throwIfAborted();
 
-      return {
-        workspaceId: workspace.id,
-        previousState: decisionContext.previousState,
-        newState: decisionContext.finalState,
-        action,
-      };
+      return await this.finishRatchetCheck(workspace, prStateInfo, action, decisionContext, signal);
     } catch (error) {
+      signal.throwIfAborted();
       const errorMessage = error instanceof Error ? error.message : String(error);
       logger.error('Error processing workspace in ratchet', toError(error), {
         workspaceId: workspace.id,
@@ -505,128 +615,24 @@ class RatchetService extends EventEmitter {
     prStateInfo: PRStateInfo | null,
     decisionContext: RatchetDecisionContext | null = null
   ): void {
-    const prNumber = prStateInfo?.prNumber ?? workspace.prNumber;
-    const prNumberLabel = prNumber ?? 'unknown';
-    const workspacePrPrefix = `workspace ${workspace.id} for PR #${prNumberLabel}`;
-    const context = this.buildRatchetingLogContext(
+    logWorkspaceRatchetingDecisionHelper({
       workspace,
       previousState,
       newState,
       action,
       prStateInfo,
-      prNumber,
-      decisionContext
-    );
-
-    if (action.type === 'TRIGGERED_FIXER') {
-      logger.info(`Ratcheting ${workspacePrPrefix}`, {
-        ...context,
-        sessionId: action.sessionId,
-        promptSent: action.promptSent,
-      });
-      return;
-    }
-
-    const reason = this.describeNonRatchetingReason(action);
-
-    logger.info(`Not ratcheting ${workspacePrPrefix} because ${reason}`, context);
-  }
-
-  private buildRatchetingLogContext(
-    workspace: WorkspaceWithPR,
-    previousState: RatchetState,
-    newState: RatchetState,
-    action: RatchetAction,
-    prStateInfo: PRStateInfo | null,
-    prNumber: number | null,
-    decisionContext: RatchetDecisionContext | null
-  ) {
-    const reviewDiagnostics = this.buildReviewTimestampDiagnostics(
-      workspace,
-      prStateInfo,
-      decisionContext
-    );
-    const snapshotDiagnostics = this.buildSnapshotDiagnostics(
-      workspace,
-      prStateInfo,
-      decisionContext
-    );
-    const latestReviewActivityAt = reviewDiagnostics.latestReviewActivityAtMs;
-
-    return {
-      workspaceId: workspace.id,
-      prUrl: workspace.prUrl,
-      prNumber,
-      prState: prStateInfo?.prState ?? null,
-      ciStatus: prStateInfo?.ciStatus ?? null,
-      hasChangesRequested: prStateInfo?.hasChangesRequested ?? null,
-      hasMergeConflict: prStateInfo?.hasMergeConflict ?? null,
-      snapshotKey: prStateInfo?.snapshotKey ?? null,
-      ciSnapshotKey: snapshotDiagnostics.ciSnapshotKey,
-      snapshotComparison: snapshotDiagnostics.snapshotComparison,
-      previousState,
-      newState,
-      ratchetEnabled: workspace.ratchetEnabled,
-      ratchetActiveSessionId: workspace.ratchetActiveSessionId,
-      ratchetLastCiRunId: workspace.ratchetLastCiRunId,
-      ciStatusCheckRollup: prStateInfo?.statusCheckRollup ?? null,
-      ciFailedChecks: this.buildFailedCheckDiagnostics(prStateInfo),
-      prReviewLastCheckedAt: workspace.prReviewLastCheckedAt?.toISOString() ?? null,
-      latestReviewActivityAt: latestReviewActivityAt
-        ? new Date(latestReviewActivityAt).toISOString()
-        : null,
-      reviewTimestampComparison: reviewDiagnostics.reviewTimestampComparison,
-      actionType: action.type,
-    };
-  }
-
-  private buildSnapshotDiagnostics(
-    workspace: WorkspaceWithPR,
-    prStateInfo: PRStateInfo | null,
-    decisionContext: RatchetDecisionContext | null
-  ) {
-    return buildSnapshotDiagnosticsHelper(workspace, prStateInfo, decisionContext);
-  }
-
-  private buildReviewTimestampDiagnostics(
-    workspace: WorkspaceWithPR,
-    prStateInfo: PRStateInfo | null,
-    decisionContext: RatchetDecisionContext | null
-  ) {
-    return buildReviewTimestampDiagnosticsHelper(workspace, prStateInfo, decisionContext, logger);
-  }
-
-  private buildFailedCheckDiagnostics(prStateInfo: PRStateInfo | null) {
-    return buildFailedCheckDiagnosticsHelper(prStateInfo);
-  }
-
-  private describeNonRatchetingReason(
-    action: Exclude<RatchetAction, { type: 'TRIGGERED_FIXER' }>
-  ): string {
-    switch (action.type) {
-      case 'WAITING':
-        return action.reason;
-      case 'FIXER_ACTIVE':
-        return `Ratchet fixer session is already active (${action.sessionId})`;
-      case 'DISABLED':
-        return action.reason;
-      case 'COMPLETED':
-        return 'PR is already merged';
-      case 'ERROR':
-        return action.error;
-    }
-    const exhaustiveCheck: never = action;
-    throw new Error(`Unhandled ratchet action: ${JSON.stringify(exhaustiveCheck)}`);
+      decisionContext,
+    });
   }
 
   private async buildRatchetDecisionContext(
     workspace: WorkspaceWithPR,
-    prStateInfo: PRStateInfo
+    prStateInfo: PRStateInfo,
+    signal: AbortSignal = new AbortController().signal
   ): Promise<RatchetDecisionContext> {
     const previousState = workspace.ratchetState;
-    const newState = this.determineRatchetState(prStateInfo);
-    const finalState = workspace.ratchetEnabled ? newState : RatchetState.IDLE;
-    const hasNewReviewActivitySinceLastDispatch = this.hasNewReviewActivitySinceLastDispatch(
+    const newState = determineRatchetStateHelper(prStateInfo);
+    const hasNewReviewActivitySinceLastDispatch = hasNewReviewActivitySinceLastDispatchHelper(
       workspace,
       prStateInfo
     );
@@ -634,78 +640,42 @@ class RatchetService extends EventEmitter {
       workspace,
       prStateInfo
     );
-    const isCleanPrWithNoNewReviewActivity = this.shouldSkipCleanPR(workspace, prStateInfo);
+    const isCleanPrWithNoNewReviewActivity = shouldSkipCleanPRHelper(workspace, prStateInfo);
 
-    const activityChecks = await this.collectRatchetingActivityChecks(
-      workspace,
-      prStateInfo,
-      isCleanPrWithNoNewReviewActivity,
-      hasStateChangedSinceLastDispatch
-    );
+    // ratchetEnabled is guaranteed here: the poll query filters on it and
+    // processWorkspace returns early for disabled workspaces.
+    const activeFixerCheck: ActiveFixerCheckResult =
+      prStateInfo.prState === 'OPEN'
+        ? await this.checkActiveFixerSession(workspace, signal)
+        : { kind: 'none' };
+    signal.throwIfAborted();
+
+    // The check above may have just settled a RUNNING record (e.g. to DIED);
+    // use the settled outcome rather than the row read at the start of the check.
+    const dispatchOutcome =
+      activeFixerCheck.kind === 'settled'
+        ? activeFixerCheck.outcome
+        : workspace.ratchetDispatchOutcome;
 
     return {
       workspace,
       prStateInfo,
       previousState,
       newState,
-      finalState,
       hasNewReviewActivitySinceLastDispatch,
       hasStateChangedSinceLastDispatch,
       isCleanPrWithNoNewReviewActivity,
-      activeRatchetSession: activityChecks.activeRatchetSession,
-      hasOtherActiveSession: activityChecks.hasOtherActiveSession,
+      activeFixerCheck,
+      dispatchOutcome,
+      dispatchRetryCount: workspace.ratchetDispatchRetryCount,
     };
   }
 
-  private async collectRatchetingActivityChecks(
-    workspace: WorkspaceWithPR,
-    prStateInfo: PRStateInfo,
-    isCleanPrWithNoNewReviewActivity: boolean,
-    hasStateChangedSinceLastDispatch: boolean
-  ): Promise<{
-    activeRatchetSession: RatchetAction | null;
-    hasOtherActiveSession: boolean;
-  }> {
-    if (
-      !workspace.ratchetEnabled ||
-      prStateInfo.prState !== 'OPEN' ||
-      isCleanPrWithNoNewReviewActivity
-    ) {
-      return {
-        activeRatchetSession: null,
-        hasOtherActiveSession: false,
-      };
-    }
-
-    const activeRatchetSession = await this.getActiveRatchetSession(workspace);
-    if (activeRatchetSession) {
-      return {
-        activeRatchetSession,
-        hasOtherActiveSession: false,
-      };
-    }
-
-    if (!hasStateChangedSinceLastDispatch) {
-      return {
-        activeRatchetSession: null,
-        hasOtherActiveSession: false,
-      };
-    }
-
-    return {
-      activeRatchetSession: null,
-      hasOtherActiveSession: await this.hasActiveSession(workspace.id),
-    };
-  }
-
-  private decideRatchetAction(context: RatchetDecisionContext): RatchetDecision {
-    if (!context.workspace.ratchetEnabled) {
-      return {
-        type: 'RETURN_ACTION',
-        action: { type: 'DISABLED', reason: 'Workspace ratcheting disabled' },
-      };
-    }
-
+  private async decideRatchetAction(
+    context: RatchetDecisionContext,
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<RatchetDecision> {
+    signal.throwIfAborted();
     if (context.prStateInfo.prState === 'MERGED') {
       return { type: 'RETURN_ACTION', action: { type: 'COMPLETED' } };
     }
@@ -717,8 +687,6 @@ class RatchetService extends EventEmitter {
       };
     }
 
-    // Only dispatch when CI is in a terminal state (SUCCESS or FAILURE),
-    // unless the PR has merge conflicts which are independently actionable.
     const isTerminalCIStatus =
       context.prStateInfo.ciStatus === CIStatus.SUCCESS ||
       context.prStateInfo.ciStatus === CIStatus.FAILURE;
@@ -728,6 +696,27 @@ class RatchetService extends EventEmitter {
         type: 'RETURN_ACTION',
         action: { type: 'WAITING', reason: 'Waiting for CI to complete (not in terminal state)' },
       };
+    }
+
+    if (context.activeFixerCheck.kind === 'active') {
+      return { type: 'RETURN_ACTION', action: context.activeFixerCheck.action };
+    }
+
+    if (context.activeFixerCheck.kind === 'ended_concurrently') {
+      return {
+        type: 'RETURN_ACTION',
+        action: {
+          type: 'WAITING',
+          reason: 'Fixer session ended during this check; re-evaluating next cycle',
+        },
+      };
+    }
+
+    // A fixer that died gets re-dispatched for the same PR state (bounded),
+    // ahead of the skip gates below — the original dispatch already
+    // established that this PR state warrants a fixer.
+    if (!context.hasStateChangedSinceLastDispatch && context.dispatchOutcome === 'DIED') {
+      return this.decideDiedFixerRetry(context, signal);
     }
 
     if (context.isCleanPrWithNoNewReviewActivity) {
@@ -744,10 +733,6 @@ class RatchetService extends EventEmitter {
       };
     }
 
-    if (context.activeRatchetSession) {
-      return { type: 'RETURN_ACTION', action: context.activeRatchetSession };
-    }
-
     if (!context.hasStateChangedSinceLastDispatch) {
       return {
         type: 'RETURN_ACTION',
@@ -755,28 +740,67 @@ class RatchetService extends EventEmitter {
       };
     }
 
-    if (context.hasOtherActiveSession) {
+    // Fetched lazily as the last gate so the common no-op path issues no
+    // session query.
+    signal.throwIfAborted();
+    if (await this.hasActiveSession(context.workspace.id, signal)) {
       return {
         type: 'RETURN_ACTION',
         action: {
           type: 'WAITING',
-          reason: 'Workspace is not idle (active session)',
+          reason: 'Workspace has another working session',
         },
       };
     }
 
-    return { type: 'TRIGGER_FIXER' };
+    return { type: 'TRIGGER_FIXER', retryCount: 0 };
+  }
+
+  private async decideDiedFixerRetry(
+    context: RatchetDecisionContext,
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<RatchetDecision> {
+    if (context.dispatchRetryCount >= SERVICE_THRESHOLDS.ratchetDispatchMaxRetries) {
+      return {
+        type: 'RETURN_ACTION',
+        action: {
+          type: 'WAITING',
+          reason: `Fixer died ${context.dispatchRetryCount + 1} times for this PR state; waiting for PR state to change`,
+        },
+      };
+    }
+    signal.throwIfAborted();
+    if (await this.hasActiveSession(context.workspace.id, signal)) {
+      return {
+        type: 'RETURN_ACTION',
+        action: { type: 'WAITING', reason: 'Workspace has another working session' },
+      };
+    }
+    return { type: 'TRIGGER_FIXER', retryCount: context.dispatchRetryCount + 1 };
   }
 
   private async applyRatchetDecision(
     context: RatchetDecisionContext,
-    decision: RatchetDecision
+    decision: RatchetDecision,
+    signal: AbortSignal = new AbortController().signal,
+    commitSideEffects: () => void = () => {
+      // Direct private-method callers do not have a coordinator timeout to disable.
+    }
   ): Promise<RatchetAction> {
     if (decision.type === 'RETURN_ACTION') {
       return decision.action;
     }
 
-    return await this.triggerFixer(context.workspace, context.prStateInfo);
+    signal.throwIfAborted();
+    const action = await this.triggerFixer(
+      context.workspace,
+      context.prStateInfo,
+      decision.retryCount,
+      signal,
+      commitSideEffects
+    );
+    signal.throwIfAborted();
+    return action;
   }
 
   private hasActionableFixTrigger(prStateInfo: PRStateInfo): boolean {
@@ -788,88 +812,103 @@ class RatchetService extends EventEmitter {
       return true;
     }
 
+    if (prStateInfo.hasChangesRequested) {
+      return true;
+    }
+
     return (prStateInfo.reviewComments?.length ?? 0) > 0;
   }
 
-  private shouldSkipCleanPR(workspace: WorkspaceWithPR, prStateInfo: PRStateInfo): boolean {
-    return shouldSkipCleanPRHelper(workspace, prStateInfo, logger);
-  }
-
-  private hasNewReviewActivitySinceLastDispatch(
-    workspace: WorkspaceWithPR,
-    prStateInfo: PRStateInfo
-  ): boolean {
-    return hasNewReviewActivitySinceLastDispatchHelper(workspace, prStateInfo, logger);
-  }
-
-  private async processReviewCommentPoll(
+  private async finishRatchetCheck(
     workspace: WorkspaceWithPR,
     prStateInfo: PRStateInfo,
-    authenticatedUsername: string | null
-  ): Promise<WorkspaceRatchetResult | null> {
-    const pollResult = await this.handleReviewCommentPoll(
+    action: RatchetAction,
+    decisionContext: RatchetDecisionContext,
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<WorkspaceRatchetResult> {
+    signal.throwIfAborted();
+    const updateResult = await this.updateWorkspaceAfterCheck(
       workspace,
       prStateInfo,
-      authenticatedUsername
+      action,
+      decisionContext.newState,
+      signal
     );
+    signal.throwIfAborted();
 
-    if (pollResult.action !== 'comments-found') {
-      return null;
+    // The conditional update refused to persist: ratcheting was disabled while
+    // this check was in flight. Report DISABLED and emit nothing — the disable
+    // path already settled the workspace to IDLE.
+    if (updateResult === 'disabled') {
+      const disabledAction: RatchetAction = {
+        type: 'DISABLED',
+        reason: 'Workspace ratcheting disabled',
+      };
+      this.logWorkspaceRatchetingDecision(
+        workspace,
+        decisionContext.previousState,
+        RatchetState.IDLE,
+        disabledAction,
+        prStateInfo,
+        decisionContext
+      );
+      return {
+        workspaceId: workspace.id,
+        previousState: decisionContext.previousState,
+        newState: RatchetState.IDLE,
+        action: disabledAction,
+      };
     }
 
-    const freshContext = await this.buildRatchetDecisionContext(workspace, pollResult.freshPrState);
-    const freshDecision = this.decideRatchetAction(freshContext);
-    const freshAction = await this.applyRatchetDecision(freshContext, freshDecision);
+    // The CAS on fromState lost while ratcheting stayed enabled: another path
+    // (e.g. markPrClosed) transitioned the state mid-check and emitted its own
+    // event. This check's result is stale, so persist and emit nothing; the
+    // next cycle re-evaluates from the fresh state.
+    if (updateResult === 'superseded') {
+      const supersededAction: RatchetAction = {
+        type: 'WAITING',
+        reason: 'Ratchet state changed concurrently during this check; re-evaluating next cycle',
+      };
+      this.logWorkspaceRatchetingDecision(
+        workspace,
+        decisionContext.previousState,
+        decisionContext.previousState,
+        supersededAction,
+        prStateInfo,
+        decisionContext
+      );
+      return {
+        workspaceId: workspace.id,
+        previousState: decisionContext.previousState,
+        newState: decisionContext.previousState,
+        action: supersededAction,
+      };
+    }
 
-    await this.updateWorkspaceAfterCheck(
-      workspace,
-      pollResult.freshPrState,
-      freshAction,
-      freshContext.finalState
-    );
-    if (freshContext.previousState !== freshContext.finalState) {
+    if (decisionContext.previousState !== decisionContext.newState) {
       this.emit(RATCHET_STATE_CHANGED, {
         workspaceId: workspace.id,
-        fromState: freshContext.previousState,
-        toState: freshContext.finalState,
-        prCiStatus: pollResult.freshPrState.ciStatus,
+        fromState: decisionContext.previousState,
+        toState: decisionContext.newState,
+        prCiStatus: prStateInfo.ciStatus,
       } satisfies RatchetStateChangedEvent);
     }
 
     this.logWorkspaceRatchetingDecision(
       workspace,
-      freshContext.previousState,
-      freshContext.finalState,
-      freshAction,
-      pollResult.freshPrState,
-      freshContext
+      decisionContext.previousState,
+      decisionContext.newState,
+      action,
+      prStateInfo,
+      decisionContext
     );
 
     return {
       workspaceId: workspace.id,
-      previousState: freshContext.previousState,
-      newState: freshContext.finalState,
-      action: freshAction,
+      previousState: decisionContext.previousState,
+      newState: decisionContext.newState,
+      action,
     };
-  }
-
-  private async handleReviewCommentPoll(
-    workspace: WorkspaceWithPR,
-    prStateInfo: PRStateInfo,
-    authenticatedUsername: string | null
-  ): Promise<ReviewPollResult> {
-    return await handleReviewCommentPollHelper({
-      workspace,
-      prStateInfo,
-      authenticatedUsername,
-      reviewPollTrackers: this.reviewPollTrackers,
-      isShuttingDown: this.isShuttingDown,
-      fetchPRState: (workspaceArg, authenticatedUsernameArg) =>
-        this.fetchPRState(workspaceArg, authenticatedUsernameArg),
-      shouldSkipCleanPR: (workspaceArg, prStateInfoArg) =>
-        this.shouldSkipCleanPR(workspaceArg, prStateInfoArg),
-      logger,
-    });
   }
 
   private hasStateChangedSinceLastDispatch(
@@ -883,148 +922,152 @@ class RatchetService extends EventEmitter {
     workspace: WorkspaceWithPR,
     prStateInfo: PRStateInfo,
     action: RatchetAction,
-    nextState: RatchetState
-  ): Promise<void> {
+    nextState: RatchetState,
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<'applied' | 'disabled' | 'superseded'> {
     const now = new Date();
+    // The dispatch record itself (session pointer, snapshot key, outcome,
+    // retry count) is written atomically inside triggerFixer.
     const dispatched = action.type === 'TRIGGERED_FIXER' && action.promptSent;
 
-    await workspaceAccessor.update(workspace.id, {
-      ratchetState: nextState,
-      ratchetLastCheckedAt: now,
-      ...(dispatched
-        ? {
-            ratchetLastCiRunId: prStateInfo.snapshotKey,
-          }
-        : {}),
-    });
+    signal.throwIfAborted();
+    assertValidRatchetTransition(workspace.id, workspace.ratchetState, nextState);
+    const updated = await workspaceRatchetService.transitionStateIfEnabled(
+      workspace.id,
+      workspace.ratchetState,
+      {
+        ratchetState: nextState,
+        ratchetLastCheckedAt: now,
+      }
+    );
+    signal.throwIfAborted();
 
-    if (dispatched) {
-      await this.snapshot.recordReviewCheck(workspace.id, now);
+    if (!updated) {
+      // The CAS refused the write: either ratcheting was disabled mid-check,
+      // or another path (markPrClosed, disable+re-enable) transitioned the
+      // state away from the one this check ran against.
+      const fresh = await workspaceDataService.findById(workspace.id);
+      signal.throwIfAborted();
+      return fresh?.ratchetEnabled ? 'superseded' : 'disabled';
     }
 
-    // Sync prCiStatus when the ratchet observes a change from fresh GitHub data.
-    // This ensures the workspace's cached CI status stays current, preventing a
-    // stale "CI Running" display after CI completes between scheduler polls.
+    if (dispatched) {
+      signal.throwIfAborted();
+      await this.snapshot.recordReviewCheck(workspace.id, now);
+      signal.throwIfAborted();
+    }
+
     if (prStateInfo.ciStatus !== workspace.prCiStatus) {
+      signal.throwIfAborted();
       await this.snapshot.recordCIObservation({
         workspaceId: workspace.id,
         ciStatus: prStateInfo.ciStatus,
         observedAt: now,
       });
+      signal.throwIfAborted();
     }
+
+    return 'applied';
   }
 
-  private async getActiveRatchetSession(workspace: WorkspaceWithPR): Promise<RatchetAction | null> {
-    return await getActiveRatchetSessionHelper({
+  private async checkActiveFixerSession(
+    workspace: WorkspaceWithPR,
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<ActiveFixerCheckResult> {
+    return await checkActiveFixerSessionHelper({
       workspace,
       sessionBridge: this.session,
-      snapshotBridge: this.snapshot,
-      resetDispatchState: (workspaceId) => this.resetDispatchState(workspaceId),
-      clearActiveSession: (workspaceId) => this.clearActiveSession(workspaceId),
-      logger,
+      workspaceBridge: this.workspace,
+      signal,
+      onDispatchChanged: (event) => {
+        this.emit(RATCHET_DISPATCH_CHANGED, event satisfies RatchetDispatchChangedEvent);
+      },
     });
   }
 
-  private async hasActiveSession(workspaceId: string): Promise<boolean> {
-    return await hasActiveSessionHelper(workspaceId, this.session);
+  private async hasActiveSession(
+    workspaceId: string,
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<boolean> {
+    return await hasActiveSessionHelper(workspaceId, this.session, signal);
   }
 
   private async fetchPRState(
     workspace: WorkspaceWithPR,
-    authenticatedUsername: string | null
-  ): Promise<PRStateInfo | null> {
+    authenticatedUsername: string | null,
+    opts?: {
+      bypassRecentFetchCooldown?: boolean;
+      reviewTriggerMode?: RatchetReviewTriggerMode;
+    },
+    signal?: AbortSignal
+  ): Promise<PRStateFetchResult> {
     return await fetchPRStateHelper({
       workspace,
       authenticatedUsername,
+      reviewTriggerMode: opts?.reviewTriggerMode ?? 'CHANGES_REQUESTED',
       github: this.github,
       backoff: this.backoff,
-      logger,
-      computeLatestReviewActivityAtMs: (prDetails, reviewComments, authenticatedUsernameArg) =>
-        this.computeLatestReviewActivityAtMs(prDetails, reviewComments, authenticatedUsernameArg),
-      computeDispatchSnapshotKey: (
-        ciStatus,
-        hasChangesRequested,
-        latestReviewActivityAtMs,
-        statusChecks,
-        hasMergeConflict
-      ) =>
-        this.computeDispatchSnapshotKey(
-          ciStatus,
-          hasChangesRequested,
-          latestReviewActivityAtMs,
-          statusChecks,
-          hasMergeConflict
-        ),
+      signal,
+      bypassRecentFetchCooldown: opts?.bypassRecentFetchCooldown,
     });
   }
 
-  private computeDispatchSnapshotKey(
-    ciStatus: CIStatus,
-    hasChangesRequested: boolean,
-    latestReviewActivityAtMs: number | null,
-    statusChecks: PRStateInfo['statusCheckRollup'],
-    hasMergeConflict?: boolean
-  ): string {
-    return computeDispatchSnapshotKeyHelper(
-      ciStatus,
-      hasChangesRequested,
-      latestReviewActivityAtMs,
-      statusChecks,
-      hasMergeConflict
-    );
-  }
-
-  private computeLatestReviewActivityAtMs(
-    prDetails: {
-      reviews: Array<{ submittedAt: string | null; author: { login: string } }>;
-      comments: Array<{ updatedAt: string; author: { login: string } }>;
-    },
-    reviewComments: Array<{ updatedAt: string; author: { login: string } }>,
-    authenticatedUsername: string | null
-  ): number | null {
-    return computeLatestReviewActivityAtMsHelper(prDetails, reviewComments, authenticatedUsername);
-  }
-
-  private async getAuthenticatedUsernameCached(): Promise<string | null> {
+  private async getAuthenticatedUsernameCached(signal?: AbortSignal): Promise<string | null> {
     const { username, cache } = await getAuthenticatedUsernameCachedHelper({
       cachedValue: this.cachedAuthenticatedUsername,
       github: this.github,
+      signal,
     });
     this.cachedAuthenticatedUsername = cache;
     return username;
   }
 
-  private determineRatchetState(pr: PRStateInfo): RatchetState {
-    return determineRatchetStateHelper(pr);
-  }
-
   private async triggerFixer(
     workspace: WorkspaceWithPR,
-    prStateInfo: PRStateInfo
+    prStateInfo: PRStateInfo,
+    retryCount: number,
+    signal: AbortSignal = new AbortController().signal,
+    commitSideEffects: () => void = () => {
+      // Direct private-method callers do not have a coordinator timeout to disable.
+    }
   ): Promise<RatchetAction> {
-    return await triggerRatchetFixer({
+    const action = await triggerRatchetFixer({
       workspace,
       prStateInfo,
+      retryCount,
       sessionBridge: this.session,
-      setActiveSession: (workspaceId, sessionId) => this.setActiveSession(workspaceId, sessionId),
-      clearActiveSession: (workspaceId) => this.clearActiveSession(workspaceId),
-      logger,
+      signal,
+      commitSideEffects,
+      onDispatchChanged: (event) => {
+        this.emit(RATCHET_DISPATCH_CHANGED, event satisfies RatchetDispatchChangedEvent);
+      },
     });
+    return action;
   }
 
-  private async setActiveSession(workspaceId: string, sessionId: string): Promise<void> {
-    await workspaceAccessor.update(workspaceId, { ratchetActiveSessionId: sessionId });
-  }
+  private async stopActiveRatchetSessionsAfterDisable(workspaceId: string): Promise<void> {
+    const sessions = await this.session.findSessionsByWorkspaceId(workspaceId);
+    const activeRatchetSessions = sessions.filter(
+      (session) =>
+        session.workflow === 'ratchet' &&
+        (session.status === SessionStatus.RUNNING || session.status === SessionStatus.IDLE)
+    );
 
-  private async clearActiveSession(workspaceId: string): Promise<void> {
-    await workspaceAccessor.update(workspaceId, { ratchetActiveSessionId: null });
-  }
+    for (const session of activeRatchetSessions) {
+      if (!this.session.isSessionRunning(session.id)) {
+        continue;
+      }
 
-  private async resetDispatchState(workspaceId: string): Promise<void> {
-    await workspaceAccessor.update(workspaceId, {
-      ratchetActiveSessionId: null,
-      ratchetLastCiRunId: null,
-    });
+      try {
+        await this.session.stopSession(session.id);
+      } catch (error) {
+        logger.warn('Failed to stop ratchet session after disabling ratchet', {
+          workspaceId,
+          sessionId: session.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
   }
 }
 

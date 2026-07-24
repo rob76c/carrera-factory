@@ -1,9 +1,10 @@
 import type {
-  Prisma,
+  RatchetReviewTriggerMode,
   SessionPermissionPreset,
   SessionProvider,
   UserSettings,
 } from '@prisma-gen/client';
+import { Prisma } from '@prisma-gen/client';
 import { prisma } from '@/backend/db';
 import { normalizeSessionModelForProvider } from '@/backend/lib/session-model';
 import { workspaceOrderMapSchema } from '@/shared/schemas/persisted-stores.schema';
@@ -17,15 +18,20 @@ interface UpdateUserSettingsInput {
   // Ratchet settings
   ratchetEnabled?: boolean;
   ratchetReplyToPrComments?: boolean;
+  ratchetReviewTriggerMode?: RatchetReviewTriggerMode;
   defaultSessionProvider?: SessionProvider;
   defaultClaudeModel?: string;
   defaultCodexModel?: string;
+  defaultClaudeReasoningEffort?: string | null;
+  defaultCodexReasoningEffort?: string | null;
   defaultWorkspacePermissions?: SessionPermissionPreset;
   ratchetPermissions?: SessionPermissionPreset;
 }
 
 // Type for workspace order storage: { [projectId]: workspaceId[] }
 export type WorkspaceOrderMap = Record<string, string[]>;
+
+const WORKSPACE_ORDER_UPDATE_MAX_ATTEMPTS = 5;
 
 function parseWorkspaceOrderMap(value: Prisma.JsonValue | null): WorkspaceOrderMap {
   const parsed = workspaceOrderMapSchema.safeParse(value);
@@ -55,6 +61,21 @@ function normalizeDefaultSessionModels(data: UpdateUserSettingsInput): {
   return { normalizedClaudeModel, normalizedCodexModel };
 }
 
+function normalizeOptionalEffort(value: string | null | undefined): string | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null) {
+    return null;
+  }
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function isUniqueConstraintError(error: unknown): error is Prisma.PrismaClientKnownRequestError {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
+}
+
 class UserSettingsAccessor {
   /**
    * Get user settings for the default user.
@@ -63,13 +84,16 @@ class UserSettingsAccessor {
   async get(): Promise<UserSettings> {
     const userId = 'default';
 
-    let settings = await prisma.userSettings.findUnique({
+    const existing = await prisma.userSettings.findUnique({
       where: { userId },
     });
 
-    // Create default settings if they don't exist
-    if (!settings) {
-      settings = await prisma.userSettings.create({
+    if (existing) {
+      return existing;
+    }
+
+    try {
+      return await prisma.userSettings.create({
         data: {
           userId,
           preferredIde: 'cursor',
@@ -78,14 +102,29 @@ class UserSettingsAccessor {
           defaultSessionProvider: 'CLAUDE',
           defaultClaudeModel: 'sonnet',
           defaultCodexModel: 'default',
+          defaultClaudeReasoningEffort: null,
+          defaultCodexReasoningEffort: null,
           defaultWorkspacePermissions: 'STRICT',
           ratchetReplyToPrComments: true,
+          ratchetReviewTriggerMode: 'CHANGES_REQUESTED',
           ratchetPermissions: 'YOLO',
         },
       });
-    }
+    } catch (error) {
+      if (!isUniqueConstraintError(error)) {
+        throw error;
+      }
 
-    return settings;
+      const settings = await prisma.userSettings.findUnique({
+        where: { userId },
+      });
+
+      if (!settings) {
+        throw error;
+      }
+
+      return settings;
+    }
   }
 
   async getDefaultSessionProvider(): Promise<SessionProvider> {
@@ -100,6 +139,8 @@ class UserSettingsAccessor {
   async update(data: UpdateUserSettingsInput): Promise<UserSettings> {
     const userId = 'default';
     const { normalizedClaudeModel, normalizedCodexModel } = normalizeDefaultSessionModels(data);
+    const normalizedClaudeEffort = normalizeOptionalEffort(data.defaultClaudeReasoningEffort);
+    const normalizedCodexEffort = normalizeOptionalEffort(data.defaultCodexReasoningEffort);
 
     return await prisma.userSettings.upsert({
       where: { userId },
@@ -107,6 +148,8 @@ class UserSettingsAccessor {
         ...data,
         defaultClaudeModel: normalizedClaudeModel,
         defaultCodexModel: normalizedCodexModel,
+        defaultClaudeReasoningEffort: normalizedClaudeEffort,
+        defaultCodexReasoningEffort: normalizedCodexEffort,
       },
       create: {
         userId,
@@ -117,11 +160,25 @@ class UserSettingsAccessor {
         defaultSessionProvider: data.defaultSessionProvider ?? 'CLAUDE',
         defaultClaudeModel: normalizedClaudeModel ?? 'sonnet',
         defaultCodexModel: normalizedCodexModel ?? 'default',
+        defaultClaudeReasoningEffort: normalizedClaudeEffort ?? null,
+        defaultCodexReasoningEffort: normalizedCodexEffort ?? null,
         defaultWorkspacePermissions: data.defaultWorkspacePermissions ?? 'STRICT',
         ratchetReplyToPrComments: data.ratchetReplyToPrComments ?? true,
+        ratchetReviewTriggerMode: data.ratchetReviewTriggerMode ?? 'CHANGES_REQUESTED',
         ratchetPermissions: data.ratchetPermissions ?? 'YOLO',
       },
     });
+  }
+
+  async compareAndSetCachedSlashCommands(
+    expectedUpdatedAt: Date,
+    cachedSlashCommands: Prisma.InputJsonValue
+  ): Promise<boolean> {
+    const result = await prisma.userSettings.updateMany({
+      where: { userId: 'default', updatedAt: expectedUpdatedAt },
+      data: { cachedSlashCommands },
+    });
+    return result.count === 1;
   }
 
   /**
@@ -138,18 +195,35 @@ class UserSettingsAccessor {
    */
   async updateWorkspaceOrder(projectId: string, workspaceIds: string[]): Promise<UserSettings> {
     const userId = 'default';
-    const settings = await this.get();
-    const orderMap = parseWorkspaceOrderMap(settings.workspaceOrder);
 
-    // Update the order for this project
-    orderMap[projectId] = workspaceIds;
+    for (let attempt = 0; attempt < WORKSPACE_ORDER_UPDATE_MAX_ATTEMPTS; attempt += 1) {
+      const settings = await this.get();
+      const orderMap = parseWorkspaceOrderMap(settings.workspaceOrder);
+      const nextOrderMap = {
+        ...orderMap,
+        [projectId]: workspaceIds,
+      };
 
-    return await prisma.userSettings.update({
-      where: { userId },
-      data: {
-        workspaceOrder: orderMap,
-      },
-    });
+      const result = await prisma.userSettings.updateMany({
+        where: {
+          userId,
+          updatedAt: settings.updatedAt,
+        },
+        data: {
+          workspaceOrder: nextOrderMap,
+        },
+      });
+
+      if (result.count === 1) {
+        return await prisma.userSettings.findUniqueOrThrow({
+          where: { userId },
+        });
+      }
+    }
+
+    throw new Error(
+      `Failed to update workspace order for project ${projectId} after ${WORKSPACE_ORDER_UPDATE_MAX_ATTEMPTS} attempts`
+    );
   }
 }
 

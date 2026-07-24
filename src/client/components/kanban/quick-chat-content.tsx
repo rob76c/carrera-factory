@@ -1,4 +1,4 @@
-import { ArrowDown } from 'lucide-react';
+import { ArrowDownIcon } from '@phosphor-icons/react';
 import { useCallback, useMemo } from 'react';
 import {
   ChatInput,
@@ -74,7 +74,7 @@ export function QuickChatContent({
             onClick={scrollToBottom}
             className="rounded-full shadow-lg"
           >
-            <ArrowDown className="h-4 w-4 mr-1" />
+            <ArrowDownIcon className="h-4 w-4 mr-1" />
             Scroll to bottom
           </Button>
         </div>
@@ -105,6 +105,8 @@ export function QuickChatContent({
           settings={chatState.chatSettings}
           capabilities={chatState.chatCapabilities}
           onSettingsChange={chatState.updateSettings}
+          slashCommands={chatState.slashCommands}
+          slashCommandsLoaded={chatState.slashCommandsLoaded}
           value={chatState.inputDraft}
           onChange={chatState.setInputDraft}
           onHeightChange={handleHeightChange}

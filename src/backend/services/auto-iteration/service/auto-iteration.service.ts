@@ -5,11 +5,15 @@ import type {
   AutoIterationConfig,
   AutoIterationProgress,
   AutoIterationSnapshot,
-  CritiqueResult,
   IterationPhase,
-  MetricEvaluation,
   TestCommandResult,
 } from './auto-iteration.types';
+import {
+  createFailedResumeRunningLoop,
+  createInitialRunningLoop,
+  getPromptTimeoutMs,
+  type RunningLoop,
+} from './auto-iteration-loop-state';
 import type {
   AutoIterationLogbookBridge,
   AutoIterationSessionBridge,
@@ -34,36 +38,13 @@ import {
   buildStrategyFileTemplate,
   buildSystemPrompt,
 } from './prompts';
+import { parseCritiqueResult, parseMetricEvaluation } from './response-parsing';
 import { runTestCommand, truncateTestOutput } from './test-runner.service';
 
 type Logger = ReturnType<typeof createLogger>;
 
-/** Default prompt timeout: 5 minutes. A single focused code change should not take longer. */
-const DEFAULT_PROMPT_TIMEOUT_SECONDS = 300;
-
 /** Stop the loop after this many consecutive prompt timeouts — something is fundamentally wrong. */
 const MAX_CONSECUTIVE_TIMEOUT_RETRIES = 3;
-
-/** Get prompt timeout in milliseconds from config, or the default. */
-function getPromptTimeoutMs(config: AutoIterationConfig): number | undefined {
-  const seconds = config.promptTimeoutSeconds ?? DEFAULT_PROMPT_TIMEOUT_SECONDS;
-  return seconds > 0 ? seconds * 1000 : undefined;
-}
-
-interface RunningLoop {
-  workspaceId: string;
-  sessionId: string;
-  config: AutoIterationConfig;
-  progress: AutoIterationProgress;
-  pauseRequested: boolean;
-  stopRequested: boolean;
-  /** Set when the session died unexpectedly, so the loop finalizes as FAILED, not STOPPED. */
-  failedByDeath: boolean;
-  /** Tracks the active loop promise to prevent concurrent loops on resume. */
-  loopPromise: Promise<void> | null;
-  /** Number of consecutive prompt timeouts. Reset on any successful iteration. */
-  consecutiveTimeoutCount: number;
-}
 
 /**
  * Core auto-iteration loop orchestrator.
@@ -115,30 +96,7 @@ export class AutoIterationService {
     if (this.loops.has(workspaceId)) {
       throw new Error(`Auto-iteration already running for workspace ${workspaceId}`);
     }
-    const placeholder: RunningLoop = {
-      workspaceId,
-      sessionId: '',
-      config,
-      progress: {
-        currentIteration: 0,
-        baselineMetricSummary: '',
-        currentMetricSummary: '',
-        acceptedCount: 0,
-        rejectedRegressionCount: 0,
-        rejectedCritiqueCount: 0,
-        crashedCount: 0,
-        sessionRecycleCount: 0,
-        startedAt: new Date().toISOString(),
-        lastIterationAt: null,
-        currentPhase: 'baseline',
-        lastTestOutput: null,
-      },
-      pauseRequested: false,
-      stopRequested: false,
-      failedByDeath: false,
-      loopPromise: null,
-      consecutiveTimeoutCount: 0,
-    };
+    const placeholder = createInitialRunningLoop(workspaceId, config);
     this.loops.set(workspaceId, placeholder);
 
     try {
@@ -216,8 +174,7 @@ export class AutoIterationService {
       // Run the loop (fire-and-forget — errors are caught internally)
       placeholder.loopPromise = this.runLoop(placeholder, worktreePath).catch((err) => {
         this.logger.error('Auto-iteration loop failed', { workspaceId, error: String(err) });
-        void this.workspace.updateAutoIterationStatus(workspaceId, AutoIterationStatus.FAILED);
-        this.loops.delete(workspaceId);
+        return this.finishLoopAfterFailure(placeholder, AutoIterationStatus.FAILED);
       });
     } catch (err) {
       // Clean up the session if one was started before the failure
@@ -227,10 +184,15 @@ export class AutoIterationService {
         } catch {
           // Session cleanup is best-effort
         }
-        void this.workspace.updateAutoIterationSessionId(workspaceId, null);
       }
-      this.loops.delete(workspaceId);
-      void this.workspace.updateAutoIterationStatus(workspaceId, AutoIterationStatus.FAILED);
+      try {
+        await this.finishFailedSetup(placeholder);
+      } catch (cleanupError) {
+        this.logger.error('Failed to persist auto-iteration setup failure', {
+          workspaceId,
+          error: String(cleanupError),
+        });
+      }
       throw err;
     }
   }
@@ -268,25 +230,41 @@ export class AutoIterationService {
       );
     }
 
-    loop.pauseRequested = false;
-
-    // Set a sentinel promise synchronously to prevent concurrent resume() calls from
-    // both passing the swap-check guard — mirrors how start() uses a synchronous map insertion.
-    // A second concurrent resume() will see loopPromise changed and bail out at the swap-check.
-    const sentinel = Promise.resolve();
+    // Set a pending sentinel synchronously so concurrent resume() calls wait until
+    // this call has swapped in the real runLoop promise or reset after failure.
+    let releaseSentinel = (): void => undefined;
+    const sentinel = new Promise<void>((resolve) => {
+      releaseSentinel = resolve;
+    });
     loop.loopPromise = sentinel;
 
-    await this.workspace.updateAutoIterationStatus(workspaceId, AutoIterationStatus.RUNNING);
+    try {
+      const worktreePath = await this.workspace.getWorktreePath(workspaceId);
+      await this.workspace.updateAutoIterationStatus(workspaceId, AutoIterationStatus.RUNNING);
 
-    const worktreePath = await this.workspace.getWorktreePath(workspaceId);
-    loop.loopPromise = this.runLoop(loop, worktreePath).catch((err) => {
-      this.logger.error('Auto-iteration loop failed on resume', {
-        workspaceId,
-        error: String(err),
+      loop.pauseRequested = false;
+      loop.loopPromise = this.runLoop(loop, worktreePath).catch((err) => {
+        this.logger.error('Auto-iteration loop failed on resume', {
+          workspaceId,
+          error: String(err),
+        });
+        return this.finishLoopAfterFailure(loop, AutoIterationStatus.FAILED);
       });
-      void this.workspace.updateAutoIterationStatus(workspaceId, AutoIterationStatus.FAILED);
-      this.loops.delete(workspaceId);
-    });
+    } catch (err) {
+      loop.pauseRequested = true;
+      loop.loopPromise = null;
+      try {
+        await this.workspace.updateAutoIterationStatus(workspaceId, AutoIterationStatus.PAUSED);
+      } catch (recoveryError) {
+        this.logger.error('Failed to restore paused auto-iteration status after resume failure', {
+          workspaceId,
+          error: String(recoveryError),
+        });
+      }
+      throw err;
+    } finally {
+      releaseSentinel();
+    }
   }
 
   /**
@@ -302,17 +280,7 @@ export class AutoIterationService {
     if (this.loops.has(workspaceId)) {
       throw new Error(`Auto-iteration already running for workspace ${workspaceId}`);
     }
-    const placeholder: RunningLoop = {
-      workspaceId,
-      sessionId: '',
-      config,
-      progress: { ...progress, currentPhase: 'idle' },
-      pauseRequested: false,
-      stopRequested: false,
-      failedByDeath: false,
-      loopPromise: null,
-      consecutiveTimeoutCount: 0,
-    };
+    const placeholder = createFailedResumeRunningLoop(workspaceId, config, progress);
     this.loops.set(workspaceId, placeholder);
 
     try {
@@ -348,8 +316,7 @@ export class AutoIterationService {
           workspaceId,
           error: String(err),
         });
-        void this.workspace.updateAutoIterationStatus(workspaceId, AutoIterationStatus.FAILED);
-        this.loops.delete(workspaceId);
+        return this.finishLoopAfterFailure(placeholder, AutoIterationStatus.FAILED);
       });
     } catch (err) {
       // Clean up the session if one was started before the failure
@@ -359,10 +326,15 @@ export class AutoIterationService {
         } catch {
           // Session cleanup is best-effort
         }
-        void this.workspace.updateAutoIterationSessionId(workspaceId, null);
       }
-      this.loops.delete(workspaceId);
-      void this.workspace.updateAutoIterationStatus(workspaceId, AutoIterationStatus.FAILED);
+      try {
+        await this.finishFailedSetup(placeholder);
+      } catch (cleanupError) {
+        this.logger.error('Failed to persist auto-iteration setup failure', {
+          workspaceId,
+          error: String(cleanupError),
+        });
+      }
       throw err;
     }
   }
@@ -408,9 +380,7 @@ export class AutoIterationService {
     this.logger.warn('Auto-iteration session died unexpectedly', { workspaceId, sessionId });
     loop.failedByDeath = true;
     loop.stopRequested = true;
-    void this.workspace.updateAutoIterationStatus(workspaceId, AutoIterationStatus.FAILED);
-    void this.workspace.updateAutoIterationSessionId(workspaceId, null);
-    this.loops.delete(workspaceId);
+    loop.loopPromise = this.finishLoopAfterFailure(loop, AutoIterationStatus.FAILED);
   }
 
   // --- Phase tracking ---
@@ -916,82 +886,69 @@ export class AutoIterationService {
     } catch {
       // Session may already be stopped
     }
-    await this.workspace.updateAutoIterationStatus(loop.workspaceId, status);
-    await this.workspace.updateAutoIterationSessionId(loop.workspaceId, null);
-    this.loops.delete(loop.workspaceId);
+    await this.finishLoopIfSessionMatches(loop, status);
   }
-}
 
-// --- JSON parsing helpers ---
-
-function parseMetricEvaluation(response: string): MetricEvaluation {
-  try {
-    const json = extractJson(response);
-    return {
-      metricSummary: String(json.metricSummary ?? 'Unknown'),
-      improved: Boolean(json.improved),
-      targetReached: Boolean(json.targetReached),
-    };
-  } catch {
-    return {
-      metricSummary: response.slice(0, 200),
-      improved: false,
-      targetReached: false,
-    };
+  private async finishLoopIfSessionMatches(
+    loop: RunningLoop,
+    status: AutoIterationStatus
+  ): Promise<boolean> {
+    try {
+      return await this.workspace.finishAutoIterationIfSessionMatches(
+        loop.workspaceId,
+        loop.sessionId,
+        status
+      );
+    } finally {
+      this.deleteLoopIfCurrent(loop);
+    }
   }
-}
 
-function parseCritiqueResult(response: string): CritiqueResult {
-  try {
-    const json = extractJson(response);
-    return {
-      approved: Boolean(json.approved),
-      notes: String(json.notes ?? ''),
-    };
-  } catch {
-    // If we can't parse, reject — silently accepting unreviewed changes is riskier than blocking
-    return {
-      approved: false,
-      notes: `Could not parse critique response: ${response.slice(0, 200)}`,
-    };
+  private async finishLoopAfterFailure(
+    loop: RunningLoop,
+    status: AutoIterationStatus
+  ): Promise<void> {
+    try {
+      await this.finishLoopIfSessionMatches(loop, status);
+    } catch (error) {
+      this.logger.error('Failed to persist auto-iteration terminal state', {
+        workspaceId: loop.workspaceId,
+        error: String(error),
+      });
+    }
   }
-}
 
-function extractJson(text: string): Record<string, unknown> {
-  // Find the first balanced JSON object in the response (may be wrapped in markdown code blocks).
-  // Uses brace counting instead of greedy regex to avoid matching from first `{` to last `}`.
-  const start = text.indexOf('{');
-  if (start === -1) {
-    throw new Error('No JSON found');
-  }
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (ch === '\\' && inString) {
-      escaped = true;
-      continue;
-    }
-    if (ch === '"') {
-      inString = !inString;
-      continue;
-    }
-    if (inString) {
-      continue;
-    }
-    if (ch === '{') {
-      depth++;
-    } else if (ch === '}') {
-      depth--;
-      if (depth === 0) {
-        return JSON.parse(text.slice(start, i + 1));
+  private async finishFailedSetup(loop: RunningLoop): Promise<void> {
+    try {
+      if (!loop.sessionId) {
+        if (this.loops.get(loop.workspaceId) === loop) {
+          await this.workspace.updateAutoIterationStatus(
+            loop.workspaceId,
+            AutoIterationStatus.FAILED
+          );
+        }
+        return;
       }
+
+      const finished = await this.workspace.finishAutoIterationIfSessionMatches(
+        loop.workspaceId,
+        loop.sessionId,
+        AutoIterationStatus.FAILED
+      );
+      if (finished || this.loops.get(loop.workspaceId) !== loop) {
+        return;
+      }
+
+      await this.workspace.updateAutoIterationStatus(loop.workspaceId, AutoIterationStatus.FAILED);
+      await this.workspace.updateAutoIterationSessionId(loop.workspaceId, null);
+    } finally {
+      this.deleteLoopIfCurrent(loop);
     }
   }
-  throw new Error('No JSON found');
+
+  private deleteLoopIfCurrent(loop: RunningLoop): void {
+    if (this.loops.get(loop.workspaceId) === loop) {
+      this.loops.delete(loop.workspaceId);
+    }
+  }
 }

@@ -1,5 +1,5 @@
+import { SpinnerGapIcon } from '@phosphor-icons/react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Loader2 } from 'lucide-react';
 import { memo, useCallback, useEffect, useMemo, useRef } from 'react';
 import { GroupedMessageItemRenderer, LoadingIndicator } from '@/components/agent-activity';
 import { ThinkingCompletionProvider } from '@/components/agent-activity/message-renderers';
@@ -44,6 +44,8 @@ interface VirtualizedMessageListProps {
   getUuidForMessageId?: (messageId: string) => string | undefined;
   /** Callback when user initiates rewind to a message */
   onRewindToMessage?: (uuid: string) => void;
+  resolveWorkspaceFileLink?: (href: string) => string | null;
+  onWorkspaceFileLink?: (path: string) => void;
   /** Init banner for showing workspace initialization status */
   initBanner?: WorkspaceInitBanner | null;
 }
@@ -119,6 +121,8 @@ interface VirtualRowProps {
   userMessageUuid?: string;
   /** Callback when user initiates rewind to this message */
   onRewindToMessage?: (uuid: string) => void;
+  resolveWorkspaceFileLink?: (href: string) => string | null;
+  onWorkspaceFileLink?: (path: string) => void;
   /** Reads persisted expansion state for tool rows/groups */
   getToolExpansionState?: (key: string, defaultOpen: boolean) => boolean;
   /** Persists expansion state for tool rows/groups */
@@ -135,6 +139,8 @@ const VirtualRow = memo(function VirtualRow({
   onRemove,
   userMessageUuid,
   onRewindToMessage,
+  resolveWorkspaceFileLink,
+  onWorkspaceFileLink,
   getToolExpansionState,
   setToolExpansionState,
   toolExpansionToken,
@@ -147,6 +153,8 @@ const VirtualRow = memo(function VirtualRow({
         onRemove={onRemove}
         userMessageUuid={userMessageUuid}
         onRewindToMessage={onRewindToMessage}
+        resolveWorkspaceFileLink={resolveWorkspaceFileLink}
+        onWorkspaceFileLink={onWorkspaceFileLink}
         getToolExpansionState={getToolExpansionState}
         setToolExpansionState={setToolExpansionState}
         toolExpansionToken={toolExpansionToken}
@@ -176,6 +184,8 @@ export const VirtualizedMessageList = memo(function VirtualizedMessageList({
   isCompacting = false,
   getUuidForMessageId,
   onRewindToMessage,
+  resolveWorkspaceFileLink,
+  onWorkspaceFileLink,
   initBanner,
 }: VirtualizedMessageListProps) {
   const { getExpansionState, setExpansionState } = useWorkspaceToolExpansionState(workspaceId);
@@ -448,7 +458,7 @@ export const VirtualizedMessageList = memo(function VirtualizedMessageList({
       <div className="flex flex-col items-center justify-center h-full text-center p-8 gap-4">
         {showingInitSpinner && (
           <div className="flex items-center gap-2 text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
+            <SpinnerGapIcon className="h-4 w-4 animate-spin" />
             <span className="text-sm">{initBanner?.message}</span>
           </div>
         )}
@@ -513,6 +523,8 @@ export const VirtualizedMessageList = memo(function VirtualizedMessageList({
                   }
                   userMessageUuid={userMessageUuid}
                   onRewindToMessage={onRewindToMessage}
+                  resolveWorkspaceFileLink={resolveWorkspaceFileLink}
+                  onWorkspaceFileLink={onWorkspaceFileLink}
                   getToolExpansionState={getToolExpansionState}
                   setToolExpansionState={setToolExpansionState}
                   toolExpansionToken={toolExpansionToken}
@@ -528,7 +540,7 @@ export const VirtualizedMessageList = memo(function VirtualizedMessageList({
         {/* Workspace initialization spinner (e.g., creating worktree, running init script) */}
         {initBanner && initBanner.kind === 'info' && (
           <div className="flex items-center gap-2 text-muted-foreground py-4">
-            <Loader2 className="h-4 w-4 animate-spin" />
+            <SpinnerGapIcon className="h-4 w-4 animate-spin" />
             <span className="text-sm">{initBanner.message}</span>
           </div>
         )}
@@ -536,7 +548,7 @@ export const VirtualizedMessageList = memo(function VirtualizedMessageList({
         {/* Agent starting spinner */}
         {startingSession && !running && (
           <div className="flex items-center gap-2 text-muted-foreground py-4">
-            <Loader2 className="h-4 w-4 animate-spin" />
+            <SpinnerGapIcon className="h-4 w-4 animate-spin" />
             <span className="text-sm">{startingLabel}</span>
           </div>
         )}

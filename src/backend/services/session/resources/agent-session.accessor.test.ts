@@ -1,14 +1,14 @@
 import { Prisma } from '@prisma-gen/client';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { resolveSessionModelForProvider } from '@/backend/lib/session-model';
 import { SessionStatus } from '@/shared/core';
 
 const mockCreate = vi.fn();
 const mockFindUnique = vi.fn();
 const mockFindMany = vi.fn();
+const mockCount = vi.fn();
 const mockUpdate = vi.fn();
+const mockUpdateMany = vi.fn();
 const mockDelete = vi.fn();
-const mockUserSettingsGet = vi.fn();
 
 vi.mock('@/backend/db', () => ({
   prisma: {
@@ -16,16 +16,12 @@ vi.mock('@/backend/db', () => ({
       create: (...args: unknown[]) => mockCreate(...args),
       findUnique: (...args: unknown[]) => mockFindUnique(...args),
       findMany: (...args: unknown[]) => mockFindMany(...args),
+      count: (...args: unknown[]) => mockCount(...args),
       update: (...args: unknown[]) => mockUpdate(...args),
+      updateMany: (...args: unknown[]) => mockUpdateMany(...args),
       delete: (...args: unknown[]) => mockDelete(...args),
     },
     $transaction: vi.fn(),
-  },
-}));
-
-vi.mock('@/backend/services/settings', () => ({
-  userSettingsAccessor: {
-    get: (...args: unknown[]) => mockUserSettingsGet(...args),
   },
 }));
 
@@ -34,18 +30,16 @@ import { agentSessionAccessor } from './agent-session.accessor';
 describe('agentSessionAccessor', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockUserSettingsGet.mockResolvedValue({
-      defaultClaudeModel: 'opus',
-      defaultCodexModel: 'gpt-5-codex',
-    });
   });
 
-  it('create applies default provider and model resolution', async () => {
+  it('create persists the resolved provider and model', async () => {
     mockCreate.mockResolvedValue({ id: 'session-1' });
 
     await agentSessionAccessor.create({
       workspaceId: 'workspace-1',
       workflow: 'user',
+      provider: 'CLAUDE',
+      model: 'opus',
     });
 
     expect(mockCreate).toHaveBeenCalledWith({
@@ -53,7 +47,7 @@ describe('agentSessionAccessor', () => {
         workspaceId: 'workspace-1',
         name: undefined,
         workflow: 'user',
-        model: resolveSessionModelForProvider(undefined, 'CLAUDE', 'opus'),
+        model: 'opus',
         provider: 'CLAUDE',
         providerProjectPath: null,
       },
@@ -77,11 +71,85 @@ describe('agentSessionAccessor', () => {
         workspaceId: 'workspace-1',
         name: 'Chat 1',
         workflow: 'ratchet-fixer',
-        model: resolveSessionModelForProvider('gpt-5-codex', 'CODEX', 'gpt-5-codex'),
+        model: 'gpt-5-codex',
         provider: 'CODEX',
         providerProjectPath: '/tmp/workspace',
       },
     });
+  });
+
+  it('createWithinWorkspaceLimit creates when active sessions are below the limit', async () => {
+    mockCount.mockResolvedValue(1);
+    mockCreate.mockResolvedValue({ id: 'session-3' });
+
+    await expect(
+      agentSessionAccessor.createWithinWorkspaceLimit({
+        workspaceId: 'workspace-1',
+        workflow: 'user',
+        provider: 'CODEX',
+        model: 'gpt-5-codex',
+        maxSessions: 2,
+      })
+    ).resolves.toEqual({ outcome: 'created', session: { id: 'session-3' } });
+
+    expect(mockCount).toHaveBeenCalledWith({
+      where: {
+        workspaceId: 'workspace-1',
+        status: { in: [SessionStatus.RUNNING, SessionStatus.IDLE] },
+      },
+    });
+    expect(mockCreate).toHaveBeenCalledWith({
+      data: {
+        workspaceId: 'workspace-1',
+        name: undefined,
+        workflow: 'user',
+        model: 'gpt-5-codex',
+        provider: 'CODEX',
+        providerProjectPath: null,
+      },
+    });
+  });
+
+  it('createWithinWorkspaceLimit rejects creation when active sessions meet the limit', async () => {
+    mockCount.mockResolvedValue(2);
+
+    await expect(
+      agentSessionAccessor.createWithinWorkspaceLimit({
+        workspaceId: 'workspace-1',
+        workflow: 'user',
+        provider: 'CLAUDE',
+        model: 'opus',
+        maxSessions: 2,
+      })
+    ).resolves.toEqual({ outcome: 'limit_reached' });
+
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it('createWithinWorkspaceLimit does not count failed rollback sessions as active', async () => {
+    mockCount.mockResolvedValue(1);
+    mockCreate.mockResolvedValue({ id: 'session-after-failed-rollback' });
+
+    await expect(
+      agentSessionAccessor.createWithinWorkspaceLimit({
+        workspaceId: 'workspace-1',
+        workflow: 'user',
+        provider: 'CLAUDE',
+        model: 'opus',
+        maxSessions: 2,
+      })
+    ).resolves.toEqual({
+      outcome: 'created',
+      session: { id: 'session-after-failed-rollback' },
+    });
+
+    expect(mockCount).toHaveBeenCalledWith({
+      where: {
+        workspaceId: 'workspace-1',
+        status: { in: [SessionStatus.RUNNING, SessionStatus.IDLE] },
+      },
+    });
+    expect(mockCreate).toHaveBeenCalled();
   });
 
   it('findById includes workspace relation', async () => {
@@ -133,6 +201,19 @@ describe('agentSessionAccessor', () => {
     });
   });
 
+  it('countActiveByWorkspaceId counts only running and idle sessions', async () => {
+    mockCount.mockResolvedValue(2);
+
+    await expect(agentSessionAccessor.countActiveByWorkspaceId('workspace-1')).resolves.toBe(2);
+
+    expect(mockCount).toHaveBeenCalledWith({
+      where: {
+        workspaceId: 'workspace-1',
+        status: { in: [SessionStatus.RUNNING, SessionStatus.IDLE] },
+      },
+    });
+  });
+
   it('update maps null providerMetadata to Prisma.JsonNull', async () => {
     mockUpdate.mockResolvedValue({ id: 'session-1' });
 
@@ -168,6 +249,40 @@ describe('agentSessionAccessor', () => {
     });
   });
 
+  it('updateIfStatus updates only sessions currently in allowed statuses', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 1 });
+
+    await expect(
+      agentSessionAccessor.updateIfStatus(
+        'session-1',
+        {
+          status: SessionStatus.IDLE,
+          providerMetadata: null,
+        },
+        [SessionStatus.RUNNING]
+      )
+    ).resolves.toBe(1);
+
+    expect(mockUpdateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'session-1',
+        status: { in: [SessionStatus.RUNNING] },
+      },
+      data: expect.objectContaining({
+        status: SessionStatus.IDLE,
+        providerMetadata: Prisma.JsonNull,
+      }),
+    });
+  });
+
+  it('updateIfStatus skips Prisma when no allowed statuses are provided', async () => {
+    await expect(
+      agentSessionAccessor.updateIfStatus('session-1', { status: SessionStatus.IDLE }, [])
+    ).resolves.toBe(0);
+
+    expect(mockUpdateMany).not.toHaveBeenCalled();
+  });
+
   it('delete removes session by id', async () => {
     mockDelete.mockResolvedValue({ id: 'session-1' });
 
@@ -186,6 +301,22 @@ describe('agentSessionAccessor', () => {
         providerProcessPid: { not: null },
       },
       orderBy: { updatedAt: 'desc' },
+    });
+  });
+
+  it('recoverStaleRunning marks persisted running sessions idle and clears pids', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 2 });
+
+    await expect(agentSessionAccessor.recoverStaleRunning()).resolves.toBe(2);
+
+    expect(mockUpdateMany).toHaveBeenCalledWith({
+      where: {
+        status: SessionStatus.RUNNING,
+      },
+      data: {
+        status: SessionStatus.IDLE,
+        providerProcessPid: null,
+      },
     });
   });
 });

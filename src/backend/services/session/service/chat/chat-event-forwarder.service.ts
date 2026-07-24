@@ -10,13 +10,11 @@
  * This service retains the workspace notification and pending request management responsibilities.
  */
 
-import { WS_READY_STATE } from '@/backend/constants/websocket';
-import { toError } from '@/backend/lib/error-utils';
 import { createLogger } from '@/backend/services/logger.service';
 import type { SessionWorkspaceBridge } from '@/backend/services/session/service/bridges';
 import { sessionDomainService } from '@/backend/services/session/service/session-domain.service';
+import { sessionEventBus } from '@/backend/services/session/service/session-event-bus';
 import type { PendingInteractiveRequest } from '@/shared/pending-request-types';
-import { chatConnectionService } from './chat-connection.service';
 
 const logger = createLogger('chat-event-forwarder');
 
@@ -102,24 +100,15 @@ class ChatEventForwarderService {
 
       logger.debug('Broadcasting workspace notification request', { workspaceId });
 
-      // Send to all open connections so any workspace can hear the notification
-      const message = JSON.stringify({
+      // Publish to all connected clients so any workspace can hear the
+      // notification; the WebSocket adapter owns delivery.
+      sessionEventBus.publishToAllClients({
         type: 'workspace_notification_request',
         workspaceId,
         workspaceName,
         sessionCount,
         finishedAt: finishedAt.toISOString(),
       });
-
-      for (const info of chatConnectionService.values()) {
-        if (info.ws.readyState === WS_READY_STATE.OPEN) {
-          try {
-            info.ws.send(message);
-          } catch (error) {
-            logger.error('Failed to send workspace notification', toError(error));
-          }
-        }
-      }
     });
   }
 

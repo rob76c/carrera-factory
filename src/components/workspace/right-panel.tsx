@@ -1,4 +1,14 @@
-import { Camera, FileQuestion, Files, ListTodo, Plus, RefreshCw, Terminal } from 'lucide-react';
+import {
+  ArrowsClockwiseIcon,
+  CalendarIcon,
+  CameraIcon,
+  FileDashedIcon,
+  FilesIcon,
+  ListChecksIcon,
+  PlusIcon,
+  TerminalIcon,
+  TreeStructureIcon,
+} from '@phosphor-icons/react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { trpc } from '@/client/lib/trpc';
 import type { ChatMessage } from '@/components/chat';
@@ -8,16 +18,17 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { cn } from '@/lib/utils';
 
 import { AutoIterationPanel } from './auto-iteration-panel';
+import { ChildWorkspacesPanel } from './child-workspaces-panel';
 import { CombinedChangesPanel } from './combined-changes-panel';
 import { DevLogsPanel } from './dev-logs-panel';
 import { FileBrowserPanel } from './file-browser-panel';
+import { PeriodicTaskPanel } from './periodic-task-panel';
 import { ScreenshotsPanel } from './screenshots-panel';
 import { SetupLogsPanel } from './setup-logs-panel';
 import { TerminalPanel, type TerminalPanelRef, type TerminalTabState } from './terminal-panel';
 import { TerminalTabBar } from './terminal-tab-bar';
 import { TodoPanelContainer } from './todo-panel-container';
-import { useDevLogs } from './use-dev-logs';
-import { usePostRunLogs } from './use-post-run-logs';
+import { useLogStream } from './use-log-stream';
 import { type BottomPanelTab, useWorkspacePanel } from './workspace-panel-context';
 
 // =============================================================================
@@ -30,7 +41,14 @@ const STORAGE_KEY_TOP_TAB_PREFIX = 'workspace-right-panel-tab-';
 // Types
 // =============================================================================
 
-type TopPanelTab = 'changes' | 'files' | 'tasks' | 'screenshots' | 'auto-iteration';
+type TopPanelTab =
+  | 'changes'
+  | 'files'
+  | 'tasks'
+  | 'screenshots'
+  | 'auto-iteration'
+  | 'periodic-task'
+  | 'child-workspaces';
 type LogsBottomTab = Exclude<BottomPanelTab, 'terminal'>;
 
 interface PersistedTopPanelState {
@@ -47,7 +65,9 @@ function parseStoredTopTab(value: string | null): TopPanelTab | null {
     value === 'files' ||
     value === 'tasks' ||
     value === 'screenshots' ||
-    value === 'auto-iteration'
+    value === 'auto-iteration' ||
+    value === 'periodic-task' ||
+    value === 'child-workspaces'
   ) {
     return value;
   }
@@ -101,6 +121,8 @@ interface TopPanelAreaProps {
   onTopTabChange: (tab: TopPanelTab) => void;
   onTakeScreenshots: () => void;
   isAutoIteration: boolean;
+  periodicTaskId: string | null;
+  isParentWorkspace: boolean;
 }
 
 function TopPanelArea({
@@ -110,12 +132,16 @@ function TopPanelArea({
   onTopTabChange,
   onTakeScreenshots,
   isAutoIteration,
+  periodicTaskId,
+  isParentWorkspace,
 }: TopPanelAreaProps) {
   const showChanges = activeTopTab === 'changes';
   const showFiles = activeTopTab === 'files';
   const showTasks = activeTopTab === 'tasks';
   const showScreenshots = activeTopTab === 'screenshots';
   const showAutoIteration = isAutoIteration && activeTopTab === 'auto-iteration';
+  const showPeriodicTask = !!periodicTaskId && activeTopTab === 'periodic-task';
+  const showChildWorkspaces = isParentWorkspace && activeTopTab === 'child-workspaces';
 
   const screenshotsButtonClassName = cn(
     'h-6 w-6 flex-shrink-0 flex items-center justify-center rounded-md transition-colors',
@@ -130,28 +156,44 @@ function TopPanelArea({
       <div className="flex items-center gap-0.5 p-1 bg-muted/50 border-b">
         <TabButton
           label="Changes"
-          icon={<FileQuestion className="h-3.5 w-3.5" />}
+          icon={<FileDashedIcon className="h-3.5 w-3.5" />}
           isActive={showChanges}
           onSelect={() => onTopTabChange('changes')}
         />
         <TabButton
           label="Files"
-          icon={<Files className="h-3.5 w-3.5" />}
+          icon={<FilesIcon className="h-3.5 w-3.5" />}
           isActive={showFiles}
           onSelect={() => onTopTabChange('files')}
         />
         <TabButton
           label="Tasks"
-          icon={<ListTodo className="h-3.5 w-3.5" />}
+          icon={<ListChecksIcon className="h-3.5 w-3.5" />}
           isActive={showTasks}
           onSelect={() => onTopTabChange('tasks')}
         />
         {isAutoIteration && (
           <TabButton
             label="Iterations"
-            icon={<RefreshCw className="h-3.5 w-3.5" />}
+            icon={<ArrowsClockwiseIcon className="h-3.5 w-3.5" />}
             isActive={showAutoIteration}
             onSelect={() => onTopTabChange('auto-iteration')}
+          />
+        )}
+        {periodicTaskId && (
+          <TabButton
+            label="Periodic Task"
+            icon={<CalendarIcon className="h-3.5 w-3.5" />}
+            isActive={showPeriodicTask}
+            onSelect={() => onTopTabChange('periodic-task')}
+          />
+        )}
+        {isParentWorkspace && (
+          <TabButton
+            label="Children"
+            icon={<TreeStructureIcon className="h-3.5 w-3.5" />}
+            isActive={showChildWorkspaces}
+            onSelect={() => onTopTabChange('child-workspaces')}
           />
         )}
 
@@ -166,7 +208,7 @@ function TopPanelArea({
                 className={screenshotsButtonClassName}
                 aria-label="Screenshots"
               >
-                <Camera className="h-3.5 w-3.5" />
+                <CameraIcon className="h-3.5 w-3.5" />
               </button>
             </TooltipTrigger>
             <TooltipContent>
@@ -185,6 +227,10 @@ function TopPanelArea({
           <ScreenshotsPanel workspaceId={workspaceId} onTakeScreenshots={onTakeScreenshots} />
         )}
         {showAutoIteration && <AutoIterationPanel workspaceId={workspaceId} />}
+        {showPeriodicTask && periodicTaskId && (
+          <PeriodicTaskPanel periodicTaskId={periodicTaskId} />
+        )}
+        {showChildWorkspaces && <ChildWorkspacesPanel workspaceId={workspaceId} />}
       </div>
     </div>
   );
@@ -203,8 +249,12 @@ export function RightPanel({
   const terminalPanelRef = useRef<TerminalPanelRef>(null);
 
   // Single shared dev logs connection for both tab indicator and panel content
-  const devLogs = useDevLogs(workspaceId);
-  const postRunLogs = usePostRunLogs(workspaceId);
+  const devLogs = useLogStream('/dev-logs', workspaceId, activeBottomTab === 'dev-logs');
+  const postRunLogs = useLogStream(
+    '/post-run-logs',
+    workspaceId,
+    activeBottomTab === 'post-run-logs'
+  );
 
   // Terminal tab state lifted up from TerminalPanel for inline rendering
   const [terminalTabState, setTerminalTabState] = useState<TerminalTabState | null>(null);
@@ -221,6 +271,12 @@ export function RightPanel({
     { enabled: !!workspaceId }
   );
   const isAutoIteration = workspace?.mode === 'AUTO_ITERATION';
+  const periodicTaskId =
+    (workspace as { periodicTaskId?: string | null } | undefined)?.periodicTaskId ?? null;
+  const creationSource =
+    (workspace as { creationSource?: string | null } | undefined)?.creationSource ?? null;
+  // Show children tab for all workspaces that are not themselves children
+  const isParentWorkspace = creationSource !== 'CHILD_WORKSPACE';
 
   const { data: initStatus } = trpc.workspace.getInitStatus.useQuery(
     { id: workspaceId },
@@ -272,32 +328,41 @@ export function RightPanel({
     onTakeScreenshots?.();
   }, [handleTopTabChange, onTakeScreenshots]);
 
-  // Auto-select the auto-iteration tab on first load for auto-iteration workspaces,
+  // Auto-select the auto-iteration or periodic-task tab on first load,
   // but only when the user has no persisted tab preference for this workspace.
   const autoIterationTabSelectedRef = useRef(false);
+  const periodicTaskTabSelectedRef = useRef(false);
   const prevWorkspaceIdRef = useRef(workspaceId);
   useEffect(() => {
     if (prevWorkspaceIdRef.current !== workspaceId) {
       prevWorkspaceIdRef.current = workspaceId;
       autoIterationTabSelectedRef.current = false;
+      periodicTaskTabSelectedRef.current = false;
     }
+    const hasPersistedTabCheck = () => {
+      if (typeof window === 'undefined') {
+        return false;
+      }
+      try {
+        return localStorage.getItem(`${STORAGE_KEY_TOP_TAB_PREFIX}${workspaceId}`) != null;
+      } catch {
+        return false;
+      }
+    };
+
     if (isAutoIteration && !autoIterationTabSelectedRef.current) {
       autoIterationTabSelectedRef.current = true;
-      // Only auto-select when the user has no persisted tab for this workspace
-      let hasPersistedTab = false;
-      if (typeof window !== 'undefined') {
-        try {
-          hasPersistedTab =
-            localStorage.getItem(`${STORAGE_KEY_TOP_TAB_PREFIX}${workspaceId}`) != null;
-        } catch {
-          hasPersistedTab = false;
-        }
-      }
-      if (!hasPersistedTab) {
+      if (!hasPersistedTabCheck()) {
         handleTopTabChange('auto-iteration');
       }
     }
-  }, [isAutoIteration, handleTopTabChange, workspaceId]);
+    if (periodicTaskId && !periodicTaskTabSelectedRef.current) {
+      periodicTaskTabSelectedRef.current = true;
+      if (!hasPersistedTabCheck()) {
+        handleTopTabChange('periodic-task');
+      }
+    }
+  }, [isAutoIteration, periodicTaskId, handleTopTabChange, workspaceId]);
 
   const handleBottomTabChange = useCallback(
     (tab: BottomPanelTab) => {
@@ -363,6 +428,8 @@ export function RightPanel({
           onTopTabChange={handleTopTabChange}
           onTakeScreenshots={handleTakeScreenshots}
           isAutoIteration={isAutoIteration}
+          periodicTaskId={periodicTaskId}
+          isParentWorkspace={isParentWorkspace}
         />
       </ResizablePanel>
 
@@ -393,7 +460,7 @@ export function RightPanel({
               <>
                 <TabButton
                   label="Terminal"
-                  icon={<Terminal className="h-3.5 w-3.5" />}
+                  icon={<TerminalIcon className="h-3.5 w-3.5" />}
                   isActive={activeBottomTab === 'terminal'}
                   onSelect={() => handleBottomTabChange('terminal')}
                 />
@@ -564,7 +631,7 @@ function NewTerminalButton({ onNewTab }: NewTerminalButtonProps) {
             onClick={onNewTab}
             className="h-6 w-6 flex-shrink-0 flex items-center justify-center rounded-md transition-colors text-muted-foreground hover:bg-sidebar-accent hover:text-foreground"
           >
-            <Plus className="h-3 w-3" />
+            <PlusIcon className="h-3 w-3" />
           </button>
         </TooltipTrigger>
         <TooltipContent>

@@ -2,7 +2,6 @@
 
 import { type ChildProcess, spawn } from 'node:child_process';
 import { cpSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import chalk from 'chalk';
@@ -12,8 +11,10 @@ import open from 'open';
 import { runMigrations as runDbMigrations } from '@/backend/migrate';
 import { createLogger, getLogFilePath } from '@/backend/services/logger.service';
 import { runCodexAppServerAcpAdapter } from '@/backend/services/session';
+import { resolveDatabasePath } from './database-path';
 import { runProxyCommand } from './proxy';
 import { ensureDataDir, findAvailablePort, treeKillAsync, waitForPort } from './runtime-utils';
+import { buildServeEnv } from './serve-env';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -159,11 +160,6 @@ interface ProxyOptions {
 }
 
 const program = new Command();
-
-function resolveDatabasePath(options: ServeOptions): string {
-  const defaultDbPath = join(homedir(), 'factory-factory', 'data.db');
-  return options.databasePath || process.env.DATABASE_PATH || defaultDbPath;
-}
 
 async function resolvePortsOrExit(
   options: ServeOptions,
@@ -325,21 +321,6 @@ function printReadyBanner(opts: {
   console.log(chalk.gray('  ─────────────────────────────────────'));
 }
 
-function buildServeEnv(
-  options: ServeOptions,
-  databasePath: string,
-  frontendPort: number,
-  backendPort: number
-): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    DATABASE_PATH: databasePath,
-    FRONTEND_PORT: frontendPort.toString(),
-    BACKEND_PORT: backendPort.toString(),
-    NODE_ENV: options.dev ? 'development' : 'production',
-  };
-}
-
 program
   .name('ff')
   .description('FACTORY FACTORY - Workspace-based coding environment')
@@ -363,7 +344,7 @@ program
     const verbose = options.verbose ?? false;
     const shouldOpen = options.open !== false;
 
-    const databasePath = resolveDatabasePath(options);
+    const databasePath = resolveDatabasePath({ databasePath: options.databasePath });
 
     // Show startup banner
     console.log(chalk.cyan(`\n  🏭🏭 FACTORY ${chalk.bold('FACTORY')}\n`));
@@ -565,10 +546,7 @@ program
   .description('Run database migrations')
   .option('-d, --database-path <path>', 'SQLite database file path (or set DATABASE_PATH env)')
   .action((options: MigrateOptions) => {
-    // Database path is optional - defaults to ~/factory-factory/data.db
-    const databasePath = options.databasePath || process.env.DATABASE_PATH;
-    const defaultPath = join(homedir(), 'factory-factory', 'data.db');
-    const effectivePath = databasePath || defaultPath;
+    const effectivePath = resolveDatabasePath({ databasePath: options.databasePath });
 
     console.log(chalk.blue(`Running database migrations on ${effectivePath}...`));
 
@@ -595,10 +573,7 @@ program
   .description('Open Prisma Studio for database management')
   .option('-d, --database-path <path>', 'SQLite database file path (or set DATABASE_PATH env)')
   .action(async (options: MigrateOptions) => {
-    // Database path is optional - defaults to ~/factory-factory/data.db
-    const databasePath = options.databasePath || process.env.DATABASE_PATH;
-    const defaultPath = join(homedir(), 'factory-factory', 'data.db');
-    const effectivePath = databasePath || defaultPath;
+    const effectivePath = resolveDatabasePath({ databasePath: options.databasePath });
 
     console.log(chalk.blue(`Opening Prisma Studio for ${effectivePath}...`));
 

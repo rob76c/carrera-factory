@@ -33,9 +33,8 @@ export const prStatusSchema = z.object({
   state: z.enum(['OPEN', 'CLOSED', 'MERGED']),
   isDraft: z.boolean(),
   reviewDecision: reviewDecisionSchema,
-  mergedAt: z.string().nullable(),
-  updatedAt: z.string(),
   statusCheckRollup: z.array(statusCheckRollupItemSchema).nullable(),
+  headRefName: z.string().optional(),
 });
 
 const authorSchema = z.object({
@@ -66,8 +65,27 @@ export const prDetailsSchema = z.object({
 export const prListItemSchema = z.object({
   number: z.number(),
   url: z.string(),
-  state: z.string(),
   createdAt: z.string(),
+});
+
+export const openPullRequestSchema = prListItemSchema.extend({
+  headRefName: z.string(),
+});
+
+export const openPullRequestsGraphQLSchema = z.object({
+  data: z.object({
+    repository: z
+      .object({
+        pullRequests: z.object({
+          pageInfo: z.object({
+            hasNextPage: z.boolean(),
+            endCursor: z.string().nullable(),
+          }),
+          nodes: z.array(openPullRequestSchema),
+        }),
+      })
+      .nullable(),
+  }),
 });
 
 const fullPRCheckRunSchema = z.object({
@@ -137,7 +155,7 @@ export const fullPRDetailsSchema = z.object({
   headRefName: z.string().optional(),
   baseRefName: z.string().optional(),
   mergeStateStatus: z
-    .enum(['BEHIND', 'BLOCKED', 'CLEAN', 'DIRTY', 'HAS_HOOKS', 'UNKNOWN', 'UNSTABLE'])
+    .enum(['BEHIND', 'BLOCKED', 'CLEAN', 'DIRTY', 'DRAFT', 'HAS_HOOKS', 'UNKNOWN', 'UNSTABLE'])
     .optional(),
 });
 
@@ -150,6 +168,90 @@ export const issueSchema = z.object({
   createdAt: z.string(),
   author: authorSchema,
 });
+
+export const reviewRequestedPRGraphQLSchema = z.object({
+  data: z.object({
+    search: z.object({
+      pageInfo: z.object({
+        hasNextPage: z.boolean(),
+        endCursor: z.string().nullable(),
+      }),
+      nodes: z.array(
+        z.object({
+          number: z.number(),
+          title: z.string(),
+          url: z.string(),
+          isDraft: z.boolean(),
+          createdAt: z.string(),
+          author: z.object({ login: z.string() }).nullable(),
+          repository: z.object({ nameWithOwner: z.string() }),
+          reviewDecision: reviewDecisionSchema.optional(),
+          additions: z.number().optional(),
+          deletions: z.number().optional(),
+          changedFiles: z.number().optional(),
+        })
+      ),
+    }),
+  }),
+});
+
+const reviewThreadCommentsConnectionSchema = z.object({
+  pageInfo: z.object({
+    hasNextPage: z.boolean(),
+    endCursor: z.string().nullable(),
+  }),
+  nodes: z.array(
+    z.object({
+      fullDatabaseId: z.coerce.number().nullable(),
+    })
+  ),
+});
+
+export const resolvedReviewThreadsGraphQLSchema = z.object({
+  data: z.object({
+    repository: z
+      .object({
+        pullRequest: z
+          .object({
+            reviewThreads: z.object({
+              pageInfo: z.object({
+                hasNextPage: z.boolean(),
+                endCursor: z.string().nullable(),
+              }),
+              nodes: z.array(
+                z.object({
+                  id: z.string(),
+                  isResolved: z.boolean(),
+                  comments: reviewThreadCommentsConnectionSchema,
+                })
+              ),
+            }),
+          })
+          .nullable(),
+      })
+      .nullable(),
+  }),
+});
+
+export const reviewThreadCommentsGraphQLSchema = z.object({
+  data: z.object({
+    // `node(id:)` is typed via an inline fragment, so a non-thread node
+    // (or a deleted thread) comes back as an object without `comments`.
+    node: z
+      .object({
+        comments: reviewThreadCommentsConnectionSchema.optional(),
+      })
+      .nullable(),
+  }),
+});
+
+export type ReviewThreadCommentsConnection = z.infer<typeof reviewThreadCommentsConnectionSchema>;
+
+export type ResolvedReviewThreadsPage = NonNullable<
+  NonNullable<
+    z.infer<typeof resolvedReviewThreadsGraphQLSchema>['data']['repository']
+  >['pullRequest']
+>['reviewThreads'];
 
 export const reviewCommentSchema = z.object({
   id: z.number(),

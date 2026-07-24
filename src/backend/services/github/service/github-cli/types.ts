@@ -11,8 +11,6 @@ export interface PRStatusFromGitHub {
   state: 'OPEN' | 'CLOSED' | 'MERGED';
   isDraft: boolean;
   reviewDecision: 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED' | null;
-  mergedAt: string | null;
-  updatedAt: string;
   statusCheckRollup: Array<{
     name?: string;
     workflowName?: string;
@@ -23,12 +21,20 @@ export interface PRStatusFromGitHub {
     startedAt?: string;
     completedAt?: string;
   }> | null;
+  headRefName?: string;
 }
 
 export interface PRInfo {
   owner: string;
   repo: string;
   number: number;
+}
+
+export interface OpenPullRequest {
+  number: number;
+  url: string;
+  createdAt: string;
+  headRefName: string;
 }
 
 export interface ReviewRequestedPR {

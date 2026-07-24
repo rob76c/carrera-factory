@@ -5,15 +5,7 @@ const mockUpdate = vi.hoisted(() => vi.fn());
 const mockGetWorkspaceOrder = vi.hoisted(() => vi.fn());
 const mockUpdateWorkspaceOrder = vi.hoisted(() => vi.fn());
 const mockExecCommand = vi.hoisted(() => vi.fn());
-
-vi.mock('@/backend/services/workspace', () => ({
-  userSettingsQueryService: {
-    get: (...args: unknown[]) => mockGet(...args),
-    update: (...args: unknown[]) => mockUpdate(...args),
-    getWorkspaceOrder: (...args: unknown[]) => mockGetWorkspaceOrder(...args),
-    updateWorkspaceOrder: (...args: unknown[]) => mockUpdateWorkspaceOrder(...args),
-  },
-}));
+const mockFetchCodexModelCatalogFromAppServer = vi.hoisted(() => vi.fn());
 
 vi.mock('@/backend/lib/shell', () => ({
   execCommand: (...args: unknown[]) => mockExecCommand(...args),
@@ -22,7 +14,20 @@ vi.mock('@/backend/lib/shell', () => ({
 import { userSettingsRouter } from './user-settings.trpc';
 
 function createCaller() {
-  return userSettingsRouter.createCaller({ appContext: {} } as never);
+  return userSettingsRouter.createCaller({
+    appContext: {
+      services: {
+        fetchCodexModelCatalogFromAppServer: (...args: unknown[]) =>
+          mockFetchCodexModelCatalogFromAppServer(...args),
+        userSettingsQueryService: {
+          get: (...args: unknown[]) => mockGet(...args),
+          update: (...args: unknown[]) => mockUpdate(...args),
+          getWorkspaceOrder: (...args: unknown[]) => mockGetWorkspaceOrder(...args),
+          updateWorkspaceOrder: (...args: unknown[]) => mockUpdateWorkspaceOrder(...args),
+        },
+      },
+    },
+  } as never);
 }
 
 describe('userSettingsRouter', () => {
@@ -37,6 +42,8 @@ describe('userSettingsRouter', () => {
       ratchetReplyToPrComments: true,
       defaultClaudeModel: 'sonnet',
       defaultCodexModel: 'default',
+      defaultClaudeReasoningEffort: null,
+      defaultCodexReasoningEffort: null,
     });
     mockUpdate.mockResolvedValue({
       preferredIde: 'vscode',
@@ -44,6 +51,8 @@ describe('userSettingsRouter', () => {
       ratchetReplyToPrComments: false,
       defaultClaudeModel: 'sonnet',
       defaultCodexModel: 'default',
+      defaultClaudeReasoningEffort: null,
+      defaultCodexReasoningEffort: null,
     });
 
     const caller = createCaller();
@@ -53,6 +62,8 @@ describe('userSettingsRouter', () => {
       ratchetReplyToPrComments: true,
       defaultClaudeModel: 'sonnet',
       defaultCodexModel: 'default',
+      defaultClaudeReasoningEffort: null,
+      defaultCodexReasoningEffort: null,
     });
     await expect(
       caller.update({
@@ -66,12 +77,34 @@ describe('userSettingsRouter', () => {
       ratchetReplyToPrComments: false,
       defaultClaudeModel: 'sonnet',
       defaultCodexModel: 'default',
+      defaultClaudeReasoningEffort: null,
+      defaultCodexReasoningEffort: null,
     });
 
     expect(mockUpdate).toHaveBeenCalledWith({
       preferredIde: 'vscode',
       playSoundOnComplete: true,
       ratchetReplyToPrComments: false,
+    });
+  });
+
+  it('updates the ratchet review trigger mode', async () => {
+    mockUpdate.mockResolvedValue({
+      ratchetReviewTriggerMode: 'ALL_REVIEW_FEEDBACK',
+    });
+
+    const caller = createCaller();
+
+    await expect(
+      caller.update({
+        ratchetReviewTriggerMode: 'ALL_REVIEW_FEEDBACK',
+      })
+    ).resolves.toEqual({
+      ratchetReviewTriggerMode: 'ALL_REVIEW_FEEDBACK',
+    });
+
+    expect(mockUpdate).toHaveBeenCalledWith({
+      ratchetReviewTriggerMode: 'ALL_REVIEW_FEEDBACK',
     });
   });
 
@@ -88,6 +121,8 @@ describe('userSettingsRouter', () => {
       customIdeCommand: null,
       defaultClaudeModel: 'Opus',
       defaultCodexModel: 'gpt-5-codex',
+      defaultClaudeReasoningEffort: 'medium',
+      defaultCodexReasoningEffort: 'high',
     });
 
     const caller = createCaller();
@@ -96,17 +131,95 @@ describe('userSettingsRouter', () => {
       caller.update({
         defaultClaudeModel: 'Opus',
         defaultCodexModel: 'gpt-5-codex',
+        defaultClaudeReasoningEffort: 'medium',
+        defaultCodexReasoningEffort: 'high',
       })
     ).resolves.toEqual({
       preferredIde: 'cursor',
       customIdeCommand: null,
       defaultClaudeModel: 'Opus',
       defaultCodexModel: 'gpt-5-codex',
+      defaultClaudeReasoningEffort: 'medium',
+      defaultCodexReasoningEffort: 'high',
     });
 
     expect(mockUpdate).toHaveBeenCalledWith({
       defaultClaudeModel: 'Opus',
       defaultCodexModel: 'gpt-5-codex',
+      defaultClaudeReasoningEffort: 'medium',
+      defaultCodexReasoningEffort: 'high',
+    });
+  });
+
+  it('returns provider options from the Codex model catalog', async () => {
+    mockFetchCodexModelCatalogFromAppServer.mockResolvedValue([
+      {
+        id: 'gpt-5-codex',
+        displayName: 'GPT-5 Codex',
+        description: 'Coding model',
+        supportedReasoningEfforts: [
+          { reasoningEffort: 'low', description: 'Fast' },
+          { reasoningEffort: 'extra_high', description: 'Deep' },
+        ],
+      },
+      {
+        id: 'gpt-5-codex-mini',
+        displayName: '',
+        description: null,
+        supportedReasoningEfforts: [
+          { reasoningEffort: 'low', description: 'Duplicate' },
+          { reasoningEffort: 'medium-plus', description: null },
+        ],
+      },
+    ]);
+
+    await expect(createCaller().getProviderOptions()).resolves.toEqual({
+      CLAUDE: {
+        source: 'fallback',
+        models: [
+          { value: 'sonnet', label: 'Sonnet' },
+          { value: 'opus', label: 'Opus' },
+          { value: 'haiku', label: 'Haiku' },
+          { value: 'fable', label: 'Fable' },
+        ],
+        efforts: [
+          { value: 'low', label: 'Low' },
+          { value: 'medium', label: 'Medium' },
+          { value: 'high', label: 'High' },
+        ],
+      },
+      CODEX: {
+        source: 'cli',
+        models: [
+          { value: 'gpt-5-codex', label: 'GPT-5 Codex', description: 'Coding model' },
+          { value: 'gpt-5-codex-mini', label: 'gpt-5-codex-mini', description: null },
+        ],
+        efforts: [
+          { value: 'low', label: 'Low', description: 'Fast' },
+          { value: 'extra_high', label: 'Extra High', description: 'Deep' },
+          { value: 'medium-plus', label: 'Medium Plus' },
+        ],
+      },
+    });
+  });
+
+  it('falls back to static Codex provider options when catalog loading fails', async () => {
+    mockFetchCodexModelCatalogFromAppServer.mockRejectedValue(new Error('codex unavailable'));
+
+    await expect(createCaller().getProviderOptions()).resolves.toMatchObject({
+      CODEX: {
+        source: 'fallback',
+        error: 'codex unavailable',
+        models: [
+          { value: 'default', label: 'Default' },
+          { value: 'gpt-5-codex', label: 'GPT-5 Codex' },
+        ],
+        efforts: [
+          { value: 'low', label: 'Low' },
+          { value: 'medium', label: 'Medium' },
+          { value: 'high', label: 'High' },
+        ],
+      },
     });
   });
 

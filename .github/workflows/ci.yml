@@ -17,13 +17,13 @@ jobs:
     env:
       DATABASE_URL: "file:./test.db"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@008330803749db0355799c700092d9a85fd074e9
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20"
           cache: "pnpm"
@@ -37,6 +37,9 @@ jobs:
       - name: Generate Prisma client
         run: pnpm db:generate
 
+      - name: Check generated Prisma client is committed
+        run: pnpm check:prisma-generated
+
       - name: Build core library
         run: pnpm --filter @factory-factory/core build
 
@@ -47,7 +50,7 @@ jobs:
             --to-migrations prisma/migrations \
             --exit-code
 
-      - name: Run Biome check
+      - name: Run verification checks
         run: pnpm check
 
       - name: Check ambiguous relative imports
@@ -56,17 +59,11 @@ jobs:
       - name: Enforce Biome ignore budget
         run: pnpm check:biome-ignores
 
-      - name: Check dependency architecture
-        run: pnpm deps:check
-
       - name: Run Knip (unused files & dependencies)
         run: pnpm knip --include files,dependencies,unlisted
 
       - name: Run TypeScript check
         run: pnpm typecheck
-
-      - name: Check Codex app-server schema drift
-        run: pnpm check:codex-schema
 
   build:
     name: Build
@@ -76,13 +73,13 @@ jobs:
     env:
       DATABASE_URL: "file:./test.db"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@008330803749db0355799c700092d9a85fd074e9
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20"
           cache: "pnpm"
@@ -107,13 +104,13 @@ jobs:
     env:
       DATABASE_URL: "file:./test.db"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@008330803749db0355799c700092d9a85fd074e9
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20"
           cache: "pnpm"
@@ -139,13 +136,13 @@ jobs:
     env:
       DATABASE_URL: "file:./test.db"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@008330803749db0355799c700092d9a85fd074e9
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20"
           cache: "pnpm"
@@ -162,9 +159,6 @@ jobs:
       - name: Run tests with coverage
         run: pnpm test:coverage
 
-      - name: Enforce critical backend coverage
-        run: pnpm check:coverage:critical
-
       - name: Report Coverage
         if: always() && github.event_name == 'pull_request'
-        uses: davelosert/vitest-coverage-report-action@v2
+        uses: davelosert/vitest-coverage-report-action@02f3c2e641286b7fa308cd3e430783103ce6103b

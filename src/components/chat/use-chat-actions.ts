@@ -292,6 +292,7 @@ export function useChatActions(options: UseChatActionsOptions): UseChatActionsRe
           id,
           text: trimmedText,
           attachments: attachments.length > 0 ? attachments : undefined,
+          sessionId: dbSessionIdRef.current,
         },
       });
 
@@ -312,7 +313,7 @@ export function useChatActions(options: UseChatActionsOptions): UseChatActionsRe
       };
       send(msg);
     },
-    [send, dispatch, inputAttachmentsRef, stateRef, onClearInput]
+    [send, dispatch, dbSessionIdRef, inputAttachmentsRef, stateRef, onClearInput]
   );
 
   const queueAutomaticMessage = useCallback(
@@ -328,6 +329,7 @@ export function useChatActions(options: UseChatActionsOptions): UseChatActionsRe
         payload: {
           id,
           text: trimmedText,
+          sessionId: dbSessionIdRef.current,
         },
       });
 
@@ -342,7 +344,7 @@ export function useChatActions(options: UseChatActionsOptions): UseChatActionsRe
       };
       send(msg);
     },
-    [send, dispatch, stateRef]
+    [send, dispatch, dbSessionIdRef, stateRef]
   );
 
   const completeCodexPlanApproval = useCallback(
@@ -499,15 +501,30 @@ export function useChatActions(options: UseChatActionsOptions): UseChatActionsRe
         value,
       };
       send(msg);
+
+      // When the model is chosen through the ACP config selector, mirror it into chatSettings.
+      // Otherwise chatSettings.selectedModel keeps its stale default and the model re-applied at
+      // message dispatch (setSessionModel) clobbers the user's pick right before the turn runs.
+      const changedOption = stateRef.current.acpConfigOptions?.find(
+        (option) => option.id === configId
+      );
+      const isModelOption = configId === 'model' || changedOption?.category === 'model';
+      if (isModelOption) {
+        dispatch({ type: 'UPDATE_SETTINGS', payload: { selectedModel: value } });
+        const syncedSettings = clampChatSettingsForCapabilities(
+          { ...stateRef.current.chatSettings, selectedModel: value },
+          stateRef.current.chatCapabilities
+        );
+        persistSettings(dbSessionIdRef.current, syncedSettings);
+      }
     },
-    [send]
+    [send, dispatch, stateRef, dbSessionIdRef]
   );
 
   // Rewind files actions
-  const rewindEnabled = stateRef.current.chatCapabilities.rewind.enabled;
   const startRewindPreview = useCallback(
     (userMessageUuid: string) => {
-      if (!rewindEnabled) {
+      if (!stateRef.current.chatCapabilities.rewind.enabled) {
         return;
       }
 
@@ -531,11 +548,11 @@ export function useChatActions(options: UseChatActionsOptions): UseChatActionsRe
         payload: { error: 'Rewind is not supported in ACP runtime.', requestNonce },
       });
     },
-    [dispatch, rewindEnabled, rewindTimeoutRef]
+    [dispatch, stateRef, rewindTimeoutRef]
   );
 
   const confirmRewind = useCallback(() => {
-    if (!rewindEnabled) {
+    if (!stateRef.current.chatCapabilities.rewind.enabled) {
       return;
     }
 
@@ -560,7 +577,7 @@ export function useChatActions(options: UseChatActionsOptions): UseChatActionsRe
         requestNonce: rewindPreview.requestNonce,
       },
     });
-  }, [dispatch, rewindEnabled, stateRef, rewindTimeoutRef]);
+  }, [dispatch, stateRef, rewindTimeoutRef]);
 
   const cancelRewind = useCallback(() => {
     // Clear the timeout when canceling

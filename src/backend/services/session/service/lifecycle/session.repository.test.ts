@@ -27,12 +27,14 @@ describe('SessionRepository', () => {
     findById: vi.fn<() => Promise<AgentSessionRecord | null>>(),
     findByWorkspaceId: vi.fn<() => Promise<AgentSessionRecord[]>>(),
     update: vi.fn<() => Promise<AgentSessionRecord>>(),
+    updateIfStatus: vi.fn<() => Promise<number>>(),
     delete: vi.fn<() => Promise<AgentSessionRecord>>(),
+    recoverStaleRunning: vi.fn<() => Promise<number>>(),
   };
 
   const workspaces = {
     findById: vi.fn<() => Promise<Workspace | null>>(),
-    markHasHadSessions: vi.fn<() => Promise<void>>(),
+    recordSessionPresence: vi.fn<() => Promise<void>>(),
   };
 
   const projects = {
@@ -84,5 +86,23 @@ describe('SessionRepository', () => {
       /immutable/
     );
     expect(sessions.update).not.toHaveBeenCalled();
+  });
+
+  it('delegates stale running session recovery to the session accessor', async () => {
+    sessions.recoverStaleRunning.mockResolvedValue(3);
+
+    await expect(repository.recoverStaleRunningSessions()).resolves.toBe(3);
+
+    expect(sessions.recoverStaleRunning).toHaveBeenCalledOnce();
+  });
+
+  it('delegates conditional session updates to the session accessor', async () => {
+    sessions.updateIfStatus.mockResolvedValue(1);
+
+    await expect(
+      repository.updateSessionIfStatus('s1', { status: 'IDLE' }, ['RUNNING'])
+    ).resolves.toBe(1);
+
+    expect(sessions.updateIfStatus).toHaveBeenCalledWith('s1', { status: 'IDLE' }, ['RUNNING']);
   });
 });

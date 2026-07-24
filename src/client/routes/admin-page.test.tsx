@@ -4,7 +4,28 @@ import { createElement, type ReactNode } from 'react';
 import { flushSync } from 'react-dom';
 import { createRoot } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { SELECTED_PROJECT_KEY } from '@/client/lib/project-selection';
 import AdminDashboardPage from './admin-page';
+
+const mocks = vi.hoisted(() => ({
+  updateSettingsMutate: vi.fn(),
+  testCustomCommandMutate: vi.fn(),
+  userSettings: {
+    playSoundOnComplete: true,
+    preferredIde: 'cursor' as 'cursor' | 'vscode' | 'custom',
+    customIdeCommand: null as string | null,
+    defaultSessionProvider: 'CLAUDE',
+    defaultClaudeModel: 'sonnet',
+    defaultCodexModel: 'default',
+    defaultClaudeReasoningEffort: null,
+    defaultCodexReasoningEffort: null,
+    defaultWorkspacePermissions: 'STRICT',
+    ratchetEnabled: false,
+    ratchetReplyToPrComments: true,
+    ratchetReviewTriggerMode: 'CHANGES_REQUESTED' as 'CHANGES_REQUESTED' | 'ALL_REVIEW_FEEDBACK',
+    ratchetPermissions: 'YOLO',
+  },
+}));
 
 vi.mock('react-router', () => ({
   Link: ({ children, to }: { children: ReactNode; to: string }) =>
@@ -69,6 +90,7 @@ vi.mock('@/components/project/setup-terminal-modal', () => ({
 
 vi.mock('./admin/index', () => ({
   ApiUsageSection: () => createElement('section', null, 'API Usage'),
+  PeriodicTasksSection: () => createElement('section', null, 'Periodic Tasks'),
   ProcessesSection: () => createElement('section', null, 'Processes'),
   ProcessesSectionSkeleton: () => createElement('section', null, 'Processes Loading'),
   ProjectIssueTrackingCard: () => createElement('section', null, 'Issue Tracking Card'),
@@ -76,18 +98,6 @@ vi.mock('./admin/index', () => ({
 
 vi.mock('@/client/lib/trpc', () => {
   const mutation = { mutate: vi.fn(), isPending: false, error: null };
-  const userSettings = {
-    playSoundOnComplete: true,
-    preferredIde: 'cursor',
-    customIdeCommand: null,
-    defaultSessionProvider: 'CLAUDE',
-    defaultClaudeModel: 'sonnet',
-    defaultCodexModel: 'default',
-    defaultWorkspacePermissions: 'STRICT',
-    ratchetEnabled: false,
-    ratchetReplyToPrComments: true,
-    ratchetPermissions: 'YOLO',
-  };
   const projects = [
     {
       id: 'project-1',
@@ -118,9 +128,37 @@ vi.mock('@/client/lib/trpc', () => {
         },
       }),
       userSettings: {
-        get: { useQuery: () => ({ data: userSettings, isLoading: false }) },
-        update: { useMutation: () => mutation },
-        testCustomCommand: { useMutation: () => mutation },
+        get: { useQuery: () => ({ data: mocks.userSettings, isLoading: false }) },
+        getProviderOptions: {
+          useQuery: () => ({
+            data: {
+              CLAUDE: {
+                source: 'fallback',
+                models: [{ value: 'sonnet', label: 'Sonnet' }],
+                efforts: [{ value: 'medium', label: 'Medium' }],
+              },
+              CODEX: {
+                source: 'fallback',
+                models: [{ value: 'default', label: 'Default' }],
+                efforts: [{ value: 'medium', label: 'Medium' }],
+              },
+            },
+          }),
+        },
+        update: {
+          useMutation: () => ({
+            mutate: mocks.updateSettingsMutate,
+            isPending: false,
+            error: null,
+          }),
+        },
+        testCustomCommand: {
+          useMutation: () => ({
+            mutate: mocks.testCustomCommandMutate,
+            isPending: false,
+            error: null,
+          }),
+        },
       },
       admin: {
         getServerInfo: { useQuery: () => ({ data: { backendPort: 3001 }, isLoading: false }) },
@@ -178,6 +216,11 @@ function createStorageStub(): Storage {
 }
 
 beforeEach(() => {
+  mocks.updateSettingsMutate.mockReset();
+  mocks.testCustomCommandMutate.mockReset();
+  mocks.userSettings.preferredIde = 'cursor';
+  mocks.userSettings.customIdeCommand = null;
+  mocks.userSettings.ratchetReviewTriggerMode = 'CHANGES_REQUESTED';
   Object.defineProperty(globalThis, 'localStorage', {
     configurable: true,
     writable: true,
@@ -192,6 +235,83 @@ afterEach(() => {
 });
 
 describe('AdminDashboardPage settings tabs', () => {
+  it('updates the Ratchet review feedback trigger mode', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    flushSync(() => {
+      root.render(createElement(AdminDashboardPage));
+    });
+
+    expect(container.textContent).toContain('Review feedback trigger');
+    const trigger = container.querySelector<HTMLElement>('#ratchet-review-trigger');
+    expect(trigger?.textContent).toContain('Changes requested and unresolved threads');
+
+    flushSync(() => {
+      trigger?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
+      trigger?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    // Radix portals SelectContent into document.body, outside the render container.
+    const listbox = document.body.querySelector<HTMLElement>('[role="listbox"]');
+    const broadOption = Array.from(
+      listbox?.querySelectorAll<HTMLElement>('[role="option"]') ?? []
+    ).find((option) => option.textContent?.includes('All review feedback'));
+    expect(broadOption).toBeDefined();
+
+    flushSync(() => {
+      broadOption?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
+      broadOption?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(mocks.updateSettingsMutate).toHaveBeenCalledWith({
+      ratchetReviewTriggerMode: 'ALL_REVIEW_FEEDBACK',
+    });
+
+    root.unmount();
+  });
+
+  it('tests the current custom command before it has been saved', () => {
+    mocks.userSettings.preferredIde = 'custom';
+    mocks.userSettings.customIdeCommand = null;
+
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    flushSync(() => {
+      root.render(createElement(AdminDashboardPage));
+    });
+
+    const input = container.querySelector<HTMLInputElement>('#custom-command');
+    const testButton = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent === 'Test'
+    );
+    const setInputValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+
+    expect(input).not.toBeNull();
+    expect(testButton).toBeDefined();
+    expect(testButton?.disabled).toBe(true);
+
+    flushSync(() => {
+      setInputValue?.call(input, 'code-insiders {workspace}');
+      input?.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+
+    expect(testButton?.disabled).toBe(false);
+
+    flushSync(() => {
+      testButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(mocks.testCustomCommandMutate).toHaveBeenCalledWith({
+      customCommand: 'code-insiders {workspace}',
+    });
+
+    root.unmount();
+  });
+
   it('separates general and project settings into top tabs', () => {
     const container = document.createElement('div');
     document.body.appendChild(container);
@@ -232,7 +352,7 @@ describe('AdminDashboardPage settings tabs', () => {
   });
 
   it('renders workspaces back link for the selected project slug from storage', () => {
-    localStorage.setItem('factoryfactory_selected_project_slug', 'beta');
+    localStorage.setItem(SELECTED_PROJECT_KEY, 'beta');
     const container = document.createElement('div');
     document.body.appendChild(container);
     const root = createRoot(container);

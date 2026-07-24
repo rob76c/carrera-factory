@@ -28,6 +28,8 @@ function createServiceWithPatchedInternals() {
     getOrCreateSessionClientFromRecord: vi.fn(async () => ({ id: 'client-from-record' })),
     getSessionClient: vi.fn(() => ({ id: 'existing-client' })),
     getRuntimeSnapshot: vi.fn(() => ({ phase: 'idle' })),
+    isSessionStopping: vi.fn(() => false),
+    getStopGeneration: vi.fn(() => 0),
     getSessionOptions: vi.fn(async () => ({ workingDir: '/tmp', model: 'gpt-5' })),
     stopAllClients: vi.fn(async () => undefined),
   };
@@ -64,6 +66,16 @@ function createServiceWithPatchedInternals() {
   };
 }
 
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 describe('SessionService coverage wrappers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -95,6 +107,8 @@ describe('SessionService coverage wrappers', () => {
     await service.getChatBarCapabilities('session-1');
     await service.stopAllClients(2500);
     service.isSessionRunning('session-1');
+    service.isSessionStopping('session-1');
+    service.getStopGeneration('session-1');
     service.isSessionWorking('session-1');
     service.isAnySessionWorking(['session-1']);
 
@@ -126,6 +140,8 @@ describe('SessionService coverage wrappers', () => {
     expect(sessionConfigService.getChatBarCapabilities).toHaveBeenCalledWith('session-1');
     expect(lifecycleService.stopAllClients).toHaveBeenCalledWith(2500);
     expect(runtimeManager.isSessionRunning).toHaveBeenCalledWith('session-1');
+    expect(lifecycleService.isSessionStopping).toHaveBeenCalledWith('session-1');
+    expect(lifecycleService.getStopGeneration).toHaveBeenCalledWith('session-1');
     expect(runtimeManager.isSessionWorking).toHaveBeenCalledWith('session-1');
     expect(runtimeManager.isAnySessionWorking).toHaveBeenCalledWith(['session-1']);
   });
@@ -157,13 +173,17 @@ describe('SessionService coverage wrappers', () => {
       { type: 'unsupported' } as never,
     ] as never);
 
-    expect(sendAcpMessageSpy).toHaveBeenCalledWith('session-1', [
-      { type: 'text', text: 'hello' },
-      { type: 'text', text: 'analyzing' },
-      { type: 'image', data: 'abc', mimeType: 'image/png' },
-      { type: 'text', text: 'tool output' },
-      { type: 'text', text: '{"ok":true}' },
-    ]);
+    expect(sendAcpMessageSpy).toHaveBeenCalledWith(
+      'session-1',
+      [
+        { type: 'text', text: 'hello' },
+        { type: 'text', text: 'analyzing' },
+        { type: 'image', data: 'abc', mimeType: 'image/png' },
+        { type: 'text', text: 'tool output' },
+        { type: 'text', text: '{"ok":true}' },
+      ],
+      3_600_000
+    );
   });
 
   it('falls back to text placeholder for images when provider lacks support', async () => {
@@ -178,10 +198,14 @@ describe('SessionService coverage wrappers', () => {
       { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc' } },
     ] as never);
 
-    expect(sendAcpMessageSpy).toHaveBeenCalledWith('session-1', [
-      { type: 'text', text: 'hello' },
-      { type: 'text', text: '[Image: not supported by this provider]' },
-    ]);
+    expect(sendAcpMessageSpy).toHaveBeenCalledWith(
+      'session-1',
+      [
+        { type: 'text', text: 'hello' },
+        { type: 'text', text: '[Image: not supported by this provider]' },
+      ],
+      3_600_000
+    );
   });
 
   it('propagates sendAcpMessage errors', async () => {
@@ -190,6 +214,80 @@ describe('SessionService coverage wrappers', () => {
     vi.spyOn(service, 'sendAcpMessage').mockRejectedValue(new Error('prompt failed'));
 
     await expect(service.sendSessionMessage('session-1', 'hello')).rejects.toThrow('prompt failed');
+  });
+
+  it('serializes concurrent ACP prompts for the same session', async () => {
+    const { service, runtimeManager } = createServiceWithPatchedInternals();
+    const firstPrompt = createDeferred<{ stopReason: string }>();
+    const secondPrompt = createDeferred<{ stopReason: string }>();
+    runtimeManager.sendPrompt
+      .mockImplementationOnce(() => firstPrompt.promise)
+      .mockImplementationOnce(() => secondPrompt.promise);
+
+    const p1 = service.sendAcpMessage('session-1', [{ type: 'text', text: 'first' }]);
+    await Promise.resolve();
+    expect(runtimeManager.sendPrompt).toHaveBeenCalledTimes(1);
+
+    const p2 = service.sendAcpMessage('session-1', [{ type: 'text', text: 'second' }]);
+    await Promise.resolve();
+    expect(runtimeManager.sendPrompt).toHaveBeenCalledTimes(1);
+
+    firstPrompt.resolve({ stopReason: 'end_turn' });
+    await expect(p1).resolves.toBe('end_turn');
+    await Promise.resolve();
+
+    expect(runtimeManager.sendPrompt).toHaveBeenCalledTimes(2);
+    expect(runtimeManager.sendPrompt).toHaveBeenNthCalledWith(
+      2,
+      'session-1',
+      [{ type: 'text', text: 'second' }],
+      undefined
+    );
+
+    secondPrompt.resolve({ stopReason: 'end_turn' });
+    await expect(p2).resolves.toBe('end_turn');
+  });
+
+  it('does not serialize ACP prompts across different sessions', async () => {
+    const { service, runtimeManager } = createServiceWithPatchedInternals();
+    const firstPrompt = createDeferred<{ stopReason: string }>();
+    const secondPrompt = createDeferred<{ stopReason: string }>();
+    runtimeManager.sendPrompt
+      .mockImplementationOnce(() => firstPrompt.promise)
+      .mockImplementationOnce(() => secondPrompt.promise);
+
+    const p1 = service.sendAcpMessage('session-1', [{ type: 'text', text: 'first' }]);
+    const p2 = service.sendAcpMessage('session-2', [{ type: 'text', text: 'second' }]);
+    await Promise.resolve();
+
+    expect(runtimeManager.sendPrompt).toHaveBeenCalledTimes(2);
+
+    firstPrompt.resolve({ stopReason: 'end_turn' });
+    secondPrompt.resolve({ stopReason: 'end_turn' });
+    await expect(Promise.all([p1, p2])).resolves.toEqual(['end_turn', 'end_turn']);
+  });
+
+  it('continues same-session ACP prompt queue after a prompt fails', async () => {
+    const { service, runtimeManager } = createServiceWithPatchedInternals();
+    const firstPrompt = createDeferred<{ stopReason: string }>();
+    const secondPrompt = createDeferred<{ stopReason: string }>();
+    runtimeManager.sendPrompt
+      .mockImplementationOnce(() => firstPrompt.promise)
+      .mockImplementationOnce(() => secondPrompt.promise);
+
+    const p1 = service.sendAcpMessage('session-1', [{ type: 'text', text: 'first' }]);
+    const p2 = service.sendAcpMessage('session-1', [{ type: 'text', text: 'second' }]);
+    await Promise.resolve();
+    expect(runtimeManager.sendPrompt).toHaveBeenCalledTimes(1);
+
+    firstPrompt.reject(new Error('prompt failed'));
+    await expect(p1).rejects.toThrow('prompt failed');
+    await Promise.resolve();
+
+    expect(runtimeManager.sendPrompt).toHaveBeenCalledTimes(2);
+
+    secondPrompt.resolve({ stopReason: 'end_turn' });
+    await expect(p2).resolves.toBe('end_turn');
   });
 
   it('maps transcript entries into conversation history', () => {

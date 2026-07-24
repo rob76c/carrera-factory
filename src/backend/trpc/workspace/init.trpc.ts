@@ -2,20 +2,48 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 import { toError } from '@/backend/lib/error-utils';
 import type { WorkspaceWithProject } from '@/backend/orchestration/types';
-import { initializeWorkspaceWorktree } from '@/backend/orchestration/workspace-init.orchestrator';
-import { executeStartupScriptPipeline } from '@/backend/orchestration/workspace-init-script-pipeline';
-import { FactoryConfigService } from '@/backend/services/factory-config.service';
-import { createLogger } from '@/backend/services/logger.service';
-import { startupScriptService } from '@/backend/services/run-script';
-import {
-  getWorkspaceInitPolicy,
-  workspaceDataService,
-  workspaceStateMachine,
-  worktreeLifecycleService,
-} from '@/backend/services/workspace';
-import { publicProcedure, router } from '@/backend/trpc/trpc';
+import { getWorkspaceInitPolicy } from '@/backend/services/workspace';
+import { type Context, publicProcedure, router, trustedLocalProcedure } from '@/backend/trpc/trpc';
 
-const logger = createLogger('workspace-init-trpc');
+const getLogger = (ctx: Context) => ctx.appContext.services.createLogger('workspace-init-trpc');
+
+function maxRetriesExceededError(maxRetries: number) {
+  return new TRPCError({
+    code: 'TOO_MANY_REQUESTS',
+    message: `Maximum retry attempts (${maxRetries}) exceeded`,
+  });
+}
+
+async function retryFailedWorkspaceWithExistingWorktree(
+  ctx: Context,
+  workspace: WorkspaceWithProject,
+  maxRetries: number
+) {
+  const { initializeWorkspaceWorktree, workspaceStateMachine } = ctx.appContext.services;
+  const logger = getLogger(ctx);
+  const updatedWorkspace = await workspaceStateMachine.startProvisioning(workspace.id, {
+    maxRetries,
+  });
+  if (!updatedWorkspace) {
+    throw maxRetriesExceededError(maxRetries);
+  }
+
+  // Re-run full initialization orchestration in the background. The orchestrator
+  // reuses the existing worktree, runs the full setup/startup pipeline, and
+  // restores terminal/session state without blocking tRPC.
+  initializeWorkspaceWorktree(workspace.id, {
+    branchName: workspace.branchName ?? undefined,
+    provisioningAlreadyStarted: true,
+  }).catch((error) => {
+    logger.error(
+      'Unexpected error during background workspace initialization retry',
+      toError(error),
+      {
+        workspaceId: workspace.id,
+      }
+    );
+  });
+}
 
 // =============================================================================
 // Router
@@ -23,36 +51,49 @@ const logger = createLogger('workspace-init-trpc');
 
 export const workspaceInitRouter = router({
   // Get workspace initialization status
-  getInitStatus: publicProcedure.input(z.object({ id: z.string() })).query(async ({ input }) => {
-    const workspace = await workspaceDataService.findByIdWithProject(input.id);
-    if (!workspace) {
-      throw new TRPCError({
-        code: 'NOT_FOUND',
-        message: `Workspace not found: ${input.id}`,
-      });
-    }
+  getInitStatus: publicProcedure
+    .input(z.object({ id: z.string() }))
+    .query(async ({ ctx, input }) => {
+      const { workspaceDataService } = ctx.appContext.services;
+      const workspace = await workspaceDataService.findByIdWithProject(input.id);
+      if (!workspace) {
+        throw new TRPCError({
+          code: 'NOT_FOUND',
+          message: `Workspace not found: ${input.id}`,
+        });
+      }
 
-    const initPolicy = getWorkspaceInitPolicy(workspace);
+      const initPolicy = getWorkspaceInitPolicy(workspace);
 
-    return {
-      status: workspace.status,
-      initErrorMessage: workspace.initErrorMessage,
-      initOutput: workspace.initOutput,
-      initStartedAt: workspace.initStartedAt,
-      initCompletedAt: workspace.initCompletedAt,
-      phase: initPolicy.phase,
-      chatBanner: initPolicy.banner,
-      hasStartupScript: !!(
-        workspace.project?.startupScriptCommand || workspace.project?.startupScriptPath
-      ),
-      hasWorktreePath: !!workspace.worktreePath,
-    };
-  }),
+      return {
+        status: workspace.status,
+        initErrorMessage: workspace.initErrorMessage,
+        initOutput: workspace.initOutput,
+        initStartedAt: workspace.initStartedAt,
+        initCompletedAt: workspace.initCompletedAt,
+        phase: initPolicy.phase,
+        chatBanner: initPolicy.banner,
+        hasStartupScript: !!(
+          workspace.project?.startupScriptCommand || workspace.project?.startupScriptPath
+        ),
+        hasWorktreePath: !!workspace.worktreePath,
+      };
+    }),
 
   // Retry failed initialization
-  retryInit: publicProcedure
+  retryInit: trustedLocalProcedure
     .input(z.object({ id: z.string(), useExistingBranch: z.boolean().optional() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ ctx, input }) => {
+      const {
+        executeStartupScriptPipeline,
+        factoryConfigService,
+        initializeWorkspaceWorktree,
+        retryQueuedDispatchAfterWorkspaceReady,
+        workspaceDataService,
+        workspaceStateMachine,
+        worktreeLifecycleService,
+      } = ctx.appContext.services;
+      const logger = getLogger(ctx);
       const workspace = await workspaceDataService.findByIdWithProject(input.id);
       if (!workspace?.project) {
         throw new TRPCError({
@@ -79,10 +120,7 @@ export const workspaceInitRouter = router({
         // Reset to NEW state so initializeWorkspaceWorktree can transition properly
         const resetResult = await workspaceStateMachine.resetToNew(workspace.id, maxRetries);
         if (!resetResult) {
-          throw new TRPCError({
-            code: 'TOO_MANY_REQUESTS',
-            message: `Maximum retry attempts (${maxRetries}) exceeded`,
-          });
+          throw maxRetriesExceededError(maxRetries);
         }
         const resumeMode =
           input.useExistingBranch ?? (await worktreeLifecycleService.getInitMode(workspace.id));
@@ -111,17 +149,14 @@ export const workspaceInitRouter = router({
         // Read config before state transition so a readConfig failure
         // doesn't leave the workspace stuck in PROVISIONING.
         const worktreePath = workspace.worktreePath;
-        const factoryConfig = await FactoryConfigService.readConfig(worktreePath);
+        const factoryConfig = await factoryConfigService.readConfig(worktreePath);
 
         const updatedWorkspace = await workspaceStateMachine.startProvisioningFromReady(
           workspace.id,
           maxRetries
         );
         if (!updatedWorkspace) {
-          throw new TRPCError({
-            code: 'TOO_MANY_REQUESTS',
-            message: `Maximum retry attempts (${maxRetries}) exceeded`,
-          });
+          throw maxRetriesExceededError(maxRetries);
         }
 
         await executeStartupScriptPipeline({
@@ -131,25 +166,12 @@ export const workspaceInitRouter = router({
           factoryConfig,
         });
 
+        await retryQueuedDispatchAfterWorkspaceReady(workspace.id, null);
+
         return workspaceDataService.findById(input.id);
       }
 
-      // FAILED+worktree: legacy path — re-run startup script only.
-      const updatedWorkspace = await workspaceStateMachine.startProvisioning(input.id, {
-        maxRetries,
-      });
-      if (!updatedWorkspace) {
-        throw new TRPCError({
-          code: 'TOO_MANY_REQUESTS',
-          message: `Maximum retry attempts (${maxRetries}) exceeded`,
-        });
-      }
-
-      // Run script with the updated workspace (retry count already incremented)
-      await startupScriptService.runStartupScript(
-        { ...workspace, ...updatedWorkspace },
-        workspace.project
-      );
+      await retryFailedWorkspaceWithExistingWorktree(ctx, workspace, maxRetries);
 
       return workspaceDataService.findById(input.id);
     }),

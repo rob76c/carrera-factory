@@ -1,4 +1,11 @@
-import { Archive, Camera, FileCode, FileDiff, Plus, RefreshCw } from 'lucide-react';
+import {
+  ArchiveIcon,
+  ArrowsClockwiseIcon,
+  CameraIcon,
+  FileCodeIcon,
+  GitDiffIcon,
+  PlusIcon,
+} from '@phosphor-icons/react';
 import type { Dispatch, SetStateAction } from 'react';
 import { Select, SelectContent, SelectItem, SelectTrigger } from '@/components/ui/select';
 import { TabButton } from '@/components/ui/tab-button';
@@ -13,6 +20,7 @@ import type { SessionStatus as DbSessionStatus } from '@/shared/core';
 import { ClosedSessionsDropdown } from './closed-sessions-dropdown';
 import { QuickActionsMenu } from './quick-actions-menu';
 import { RatchetWrenchIcon } from './ratchet-wrench-icon';
+import { isWorkspaceSessionLimitReached } from './session-limit';
 import {
   deriveSessionTabRuntime,
   type WorkspaceSessionRuntimeSummary,
@@ -40,13 +48,13 @@ function getTabIcon(type: MainViewTab['type']) {
   switch (type) {
     case 'chat':
     case 'file':
-      return FileCode;
+      return FileCodeIcon;
     case 'diff':
-      return FileDiff;
+      return GitDiffIcon;
     case 'screenshot':
-      return Camera;
+      return CameraIcon;
     case 'closed-session':
-      return Archive;
+      return ArchiveIcon;
   }
 }
 
@@ -222,9 +230,8 @@ export function MainViewTabBar({
   // Filter out the default 'chat' tab since we're showing sessions instead
   const nonChatTabs = tabs.filter((tab) => tab.type !== 'chat');
 
-  // Check if session limit is reached
-  const sessionCount = sessions?.length ?? 0;
-  const isAtLimit = maxSessions !== undefined && sessionCount >= maxSessions;
+  // Check if active session limit is reached
+  const isAtLimit = isWorkspaceSessionLimitReached(sessions, maxSessions);
   const isButtonDisabled = disabled || isAtLimit;
   const providerTriggerLabel = getSessionProviderLabel(selectedProvider);
 
@@ -295,7 +302,7 @@ export function MainViewTabBar({
                   )}
                   aria-label={`New ${providerTriggerLabel} session`}
                 >
-                  <Plus className="h-3.5 w-3.5" />
+                  <PlusIcon className="h-3.5 w-3.5" />
                 </button>
               </TooltipTrigger>
               <TooltipContent>
@@ -361,7 +368,7 @@ export function MainViewTabBar({
                 )}
                 aria-label="Restart agent"
               >
-                <RefreshCw className="h-3.5 w-3.5" />
+                <ArrowsClockwiseIcon className="h-3.5 w-3.5" />
                 Restart
               </button>
             </TooltipTrigger>

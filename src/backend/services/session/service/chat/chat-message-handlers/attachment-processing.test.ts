@@ -10,8 +10,10 @@ import {
   buildCombinedTextContent,
   buildContentArray,
   categorizeAttachments,
+  PermanentAttachmentError,
   processAttachmentsAndBuildContent,
   sanitizeAttachmentName,
+  UnsupportedImageTypeError,
   validateAttachment,
 } from './attachment-processing';
 
@@ -63,6 +65,7 @@ describe('validateAttachment', () => {
     expect(() => validateAttachment(attachment)).toThrow(
       'Attachment "Pasted text" is missing data'
     );
+    expect(() => validateAttachment(attachment)).toThrow(PermanentAttachmentError);
   });
 
   it('should throw error if image attachment has invalid base64 data', () => {
@@ -72,6 +75,7 @@ describe('validateAttachment', () => {
     expect(() => validateAttachment(attachment)).toThrow(
       'Attachment "screenshot.png" has invalid image data'
     );
+    expect(() => validateAttachment(attachment)).toThrow(PermanentAttachmentError);
   });
 
   it('should throw error if image attachment has special characters', () => {
@@ -81,6 +85,7 @@ describe('validateAttachment', () => {
     expect(() => validateAttachment(attachment)).toThrow(
       'Attachment "screenshot.png" has invalid image data'
     );
+    expect(() => validateAttachment(attachment)).toThrow(PermanentAttachmentError);
   });
 
   it('should accept image attachment with valid base64 characters', () => {
@@ -88,6 +93,19 @@ describe('validateAttachment', () => {
       data: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=',
     });
     expect(() => validateAttachment(attachment)).not.toThrow();
+  });
+
+  it('should accept image attachment with line-wrapped base64 data', () => {
+    const attachment = createImageAttachment({
+      data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ\r\nAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\n',
+    });
+    expect(() => validateAttachment(attachment)).not.toThrow();
+  });
+
+  it('should throw a permanent error for unsupported image media types', () => {
+    const attachment = createImageAttachment({ type: 'image/bmp' });
+    expect(() => validateAttachment(attachment)).toThrow(UnsupportedImageTypeError);
+    expect(() => validateAttachment(attachment)).toThrow(PermanentAttachmentError);
   });
 
   it('should not validate base64 for text attachments', () => {
@@ -299,6 +317,21 @@ describe('buildContentArray', () => {
     });
     expect(result[2]).toMatchObject({
       source: { media_type: 'image/webp' },
+    });
+  });
+
+  it('should strip base64 line endings from image content data', () => {
+    const imageAttachments = [
+      createImageAttachment({
+        data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ\r\nAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\n',
+      }),
+    ];
+    const result = buildContentArray('', imageAttachments);
+
+    expect(result[0]).toMatchObject({
+      source: {
+        data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+      },
     });
   });
 });

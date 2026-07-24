@@ -1,13 +1,47 @@
-import type { Prisma, Workspace, WorkspaceProviderSelection } from '@prisma-gen/client';
+import type {
+  Prisma,
+  RatchetDispatchOutcome,
+  Workspace,
+  WorkspaceProviderSelection,
+} from '@prisma-gen/client';
 import { prisma } from '@/backend/db';
 import type {
+  PRDiscoveryClaim,
+  PRSnapshotFields,
+  WorkspaceFixerContext,
+  WorkspacePRContext,
+  WorkspaceProviderSelectionSnapshot,
+  WorkspaceStatusSnapshot,
+} from '@/backend/services/workspace/types';
+import type {
+  AutoIterationStatus,
   CIStatus,
-  KanbanColumn,
   PRState,
   RatchetState,
   RunScriptStatus,
   WorkspaceStatus,
 } from '@/shared/core';
+import { KanbanColumn } from '@/shared/core';
+
+const autoIterationExecutionContextSelect = {
+  worktreePath: true,
+  autoIterationSessionId: true,
+} satisfies Prisma.WorkspaceSelect;
+
+const runScriptExecutionStateSelect = {
+  runScriptStatus: true,
+  runScriptPid: true,
+  runScriptPort: true,
+  runScriptStartedAt: true,
+} satisfies Prisma.WorkspaceSelect;
+
+export type AutoIterationExecutionContext = Prisma.WorkspaceGetPayload<{
+  select: typeof autoIterationExecutionContextSelect;
+}>;
+
+export type RunScriptExecutionState = Prisma.WorkspaceGetPayload<{
+  select: typeof runScriptExecutionStateSelect;
+}>;
 
 /**
  * Threshold for considering a PROVISIONING workspace as stale.
@@ -15,6 +49,13 @@ import type {
  * stuck (e.g., due to server crash) and will be recovered by reconciliation.
  */
 const STALE_PROVISIONING_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Threshold for considering an ARCHIVING workspace as stale.
+ * ARCHIVING is a persisted transient state; after this threshold, no
+ * in-flight archive from the current process should still be active.
+ */
+const STALE_ARCHIVING_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
 
 interface CreateWorkspaceInput {
   projectId: string;
@@ -30,10 +71,18 @@ interface CreateWorkspaceInput {
   ratchetEnabled?: boolean;
   defaultSessionProvider?: Prisma.WorkspaceCreateInput['defaultSessionProvider'];
   ratchetSessionProvider?: Prisma.WorkspaceCreateInput['ratchetSessionProvider'];
-  creationSource?: 'MANUAL' | 'RESUME_BRANCH' | 'GITHUB_ISSUE' | 'LINEAR_ISSUE';
+  creationSource?:
+    | 'MANUAL'
+    | 'RESUME_BRANCH'
+    | 'GITHUB_ISSUE'
+    | 'LINEAR_ISSUE'
+    | 'PERIODIC_TASK'
+    | 'CHILD_WORKSPACE';
   creationMetadata?: Prisma.InputJsonValue;
   mode?: 'STANDARD' | 'AUTO_ITERATION';
   autoIterationConfig?: Prisma.InputJsonValue;
+  periodicTaskId?: string;
+  parentWorkspaceId?: string;
 }
 
 interface UpdateWorkspaceInput {
@@ -52,6 +101,9 @@ interface UpdateWorkspaceInput {
   prReviewState?: string | null;
   prCiStatus?: CIStatus;
   prUpdatedAt?: Date | null;
+  prDiscoveryLastCheckedAt?: Date | null;
+  prDiscoveryRetryCount?: number;
+  prDiscoveryNextCheckAt?: Date | null;
   // CI failure tracking
   prCiFailedAt?: Date | null;
   prCiLastNotifiedAt?: Date | null;
@@ -66,6 +118,8 @@ interface UpdateWorkspaceInput {
   ratchetLastCheckedAt?: Date | null;
   ratchetActiveSessionId?: string | null;
   ratchetLastCiRunId?: string | null;
+  ratchetDispatchOutcome?: RatchetDispatchOutcome | null;
+  ratchetDispatchRetryCount?: number;
   // Activity tracking
   hasHadSessions?: boolean;
   // Cached kanban column
@@ -85,6 +139,54 @@ interface UpdateWorkspaceInput {
   autoIterationProgress?: Prisma.NullableJsonNullValueInput | Prisma.InputJsonValue;
   autoIterationSessionId?: string | null;
 }
+
+export interface PrSnapshotPersistenceInput {
+  prUrl?: string | null;
+  prNumber: number;
+  prState: PRState;
+  prReviewState: string | null;
+  prCiStatus: CIStatus;
+  prUpdatedAt: Date;
+  branchName?: string;
+}
+
+export interface CIObservationPersistenceInput {
+  prCiStatus: CIStatus;
+  prUpdatedAt: Date;
+  prCiFailedAt?: Date | null;
+}
+
+export interface PrAggregatePersistenceResult {
+  applied: boolean;
+  dispatchReset: boolean;
+}
+
+type PrAggregatePersistenceInput = Partial<
+  Pick<
+    UpdateWorkspaceInput,
+    | 'prUrl'
+    | 'prNumber'
+    | 'prState'
+    | 'prReviewState'
+    | 'prCiStatus'
+    | 'prCiFailedAt'
+    | 'branchName'
+  >
+> & { prUpdatedAt: Date };
+
+export type KanbanOwnershipTuple = Pick<
+  Workspace,
+  | 'status'
+  | 'prUrl'
+  | 'prState'
+  | 'prCiStatus'
+  | 'prUpdatedAt'
+  | 'ratchetEnabled'
+  | 'ratchetState'
+  | 'ratchetDispatchOutcome'
+  | 'ratchetDispatchRetryCount'
+  | 'cachedKanbanColumn'
+>;
 
 interface FindByProjectIdFilters {
   status?: WorkspaceStatus;
@@ -110,6 +212,8 @@ type WorkspaceForRatchet = {
   ratchetState: RatchetState;
   ratchetActiveSessionId: string | null;
   ratchetLastCiRunId: string | null;
+  ratchetDispatchOutcome: RatchetDispatchOutcome | null;
+  ratchetDispatchRetryCount: number;
   prReviewLastCheckedAt: Date | null;
 };
 
@@ -148,6 +252,8 @@ class WorkspaceAccessor {
         creationMetadata: data.creationMetadata,
         mode: data.mode,
         autoIterationConfig: data.autoIterationConfig,
+        periodicTaskId: data.periodicTaskId,
+        parentWorkspaceId: data.parentWorkspaceId,
       },
     });
   }
@@ -172,6 +278,56 @@ class WorkspaceAccessor {
     });
   }
 
+  async exists(id: string): Promise<boolean> {
+    const workspace = await prisma.workspace.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+    return workspace !== null;
+  }
+
+  findProviderSelection(id: string): Promise<WorkspaceProviderSelectionSnapshot | null> {
+    return prisma.workspace.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        defaultSessionProvider: true,
+        ratchetSessionProvider: true,
+      },
+    });
+  }
+
+  findFixerContext(id: string): Promise<WorkspaceFixerContext | null> {
+    return prisma.workspace.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        worktreePath: true,
+        defaultSessionProvider: true,
+        ratchetSessionProvider: true,
+      },
+    });
+  }
+
+  findStatusSnapshot(id: string): Promise<WorkspaceStatusSnapshot | null> {
+    return prisma.workspace.findUnique({
+      where: { id },
+      select: {
+        status: true,
+        prUrl: true,
+        prNumber: true,
+        initCompletedAt: true,
+      },
+    });
+  }
+
+  findPRContext(id: string): Promise<WorkspacePRContext | null> {
+    return prisma.workspace.findUnique({
+      where: { id },
+      select: { branchName: true, prUrl: true },
+    });
+  }
+
   /**
    * Find a workspace without relation includes and throw if missing.
    * Used by state machines after compare-and-swap updates.
@@ -179,6 +335,27 @@ class WorkspaceAccessor {
   findRawByIdOrThrow(id: string): Promise<Workspace> {
     return prisma.workspace.findUniqueOrThrow({
       where: { id },
+    });
+  }
+
+  findAutoIterationExecutionContext(id: string): Promise<AutoIterationExecutionContext | null> {
+    return prisma.workspace.findUnique({
+      where: { id },
+      select: autoIterationExecutionContextSelect,
+    });
+  }
+
+  findRunScriptExecutionState(id: string): Promise<RunScriptExecutionState | null> {
+    return prisma.workspace.findUnique({
+      where: { id },
+      select: runScriptExecutionStateSelect,
+    });
+  }
+
+  findRunScriptExecutionStateOrThrow(id: string): Promise<RunScriptExecutionState> {
+    return prisma.workspace.findUniqueOrThrow({
+      where: { id },
+      select: runScriptExecutionStateSelect,
     });
   }
 
@@ -264,6 +441,30 @@ class WorkspaceAccessor {
     });
   }
 
+  async updateCachedKanbanColumnIfOwnershipMatches(
+    id: string,
+    expected: KanbanOwnershipTuple,
+    data: Pick<UpdateWorkspaceInput, 'cachedKanbanColumn' | 'stateComputedAt'>
+  ): Promise<boolean> {
+    const result = await prisma.workspace.updateMany({
+      where: {
+        id,
+        status: expected.status,
+        prUrl: expected.prUrl,
+        prState: expected.prState,
+        prCiStatus: expected.prCiStatus,
+        prUpdatedAt: expected.prUpdatedAt,
+        ratchetEnabled: expected.ratchetEnabled,
+        ratchetState: expected.ratchetState,
+        ratchetDispatchOutcome: expected.ratchetDispatchOutcome,
+        ratchetDispatchRetryCount: expected.ratchetDispatchRetryCount,
+        cachedKanbanColumn: expected.cachedKanbanColumn,
+      },
+      data,
+    });
+    return result.count === 1;
+  }
+
   /**
    * Atomic compare-and-swap transition for workspace status.
    * Returns count=1 only when current status matches fromStatus.
@@ -293,6 +494,29 @@ class WorkspaceAccessor {
       where: { id, runScriptStatus: currentStatus },
       data,
     });
+  }
+
+  async finishAutoIterationIfSessionMatches(
+    id: string,
+    sessionId: string,
+    status: AutoIterationStatus
+  ): Promise<boolean> {
+    const result = await prisma.workspace.updateMany({
+      where: { id, autoIterationSessionId: sessionId },
+      data: {
+        autoIterationStatus: status,
+        autoIterationSessionId: null,
+      },
+    });
+    return result.count === 1;
+  }
+
+  async clearAutoIterationSessionIfMatches(id: string, sessionId: string): Promise<boolean> {
+    const result = await prisma.workspace.updateMany({
+      where: { id, autoIterationSessionId: sessionId },
+      data: { autoIterationSessionId: null },
+    });
+    return result.count === 1;
   }
 
   /**
@@ -371,9 +595,12 @@ class WorkspaceAccessor {
       },
       data: {
         status: 'PROVISIONING',
+        cachedKanbanColumn: KanbanColumn.WORKING,
+        stateComputedAt: new Date(),
         initRetryCount: { increment: 1 },
         initStartedAt: new Date(),
         initErrorMessage: null,
+        initScriptPid: null,
       },
     });
   }
@@ -392,9 +619,12 @@ class WorkspaceAccessor {
       },
       data: {
         status: 'PROVISIONING',
+        cachedKanbanColumn: KanbanColumn.WORKING,
+        stateComputedAt: new Date(),
         initRetryCount: { increment: 1 },
         initStartedAt: new Date(),
         initErrorMessage: null,
+        initScriptPid: null,
       },
     });
   }
@@ -412,10 +642,13 @@ class WorkspaceAccessor {
       },
       data: {
         status: 'NEW',
+        cachedKanbanColumn: KanbanColumn.WORKING,
+        stateComputedAt: new Date(),
         initRetryCount: { increment: 1 },
         initStartedAt: null,
         initCompletedAt: null,
         initErrorMessage: null,
+        initScriptPid: null,
       },
     });
   }
@@ -458,6 +691,25 @@ class WorkspaceAccessor {
   }
 
   /**
+   * Find ARCHIVING workspaces that have been stuck long enough to recover.
+   * Includes project data so the archive workflow can safely clean up worktrees.
+   */
+  findStaleArchivingWithProject(): Promise<WorkspaceWithProject[]> {
+    const staleThreshold = new Date(Date.now() - STALE_ARCHIVING_THRESHOLD_MS);
+
+    return prisma.workspace.findMany({
+      where: {
+        status: 'ARCHIVING',
+        updatedAt: { lt: staleThreshold },
+      },
+      include: {
+        project: true,
+      },
+      orderBy: { updatedAt: 'asc' },
+    });
+  }
+
+  /**
    * Find workspace by ID with project included.
    * Used when project info is needed (e.g., for worktree creation).
    */
@@ -494,18 +746,122 @@ class WorkspaceAccessor {
    * Find READY workspaces without PR URLs that have a branch name.
    * Used for detecting newly created PRs.
    */
-  findNeedingPRDiscovery(): Promise<WorkspaceWithProject[]> {
+  findNeedingPRDiscovery(limit: number, dueAt = new Date()): Promise<WorkspaceWithProject[]> {
     return prisma.workspace.findMany({
       where: {
         status: 'READY',
         prUrl: null,
         branchName: { not: null },
+        project: {
+          githubOwner: { not: null },
+          githubRepo: { not: null },
+        },
+        OR: [{ prDiscoveryNextCheckAt: null }, { prDiscoveryNextCheckAt: { lte: dueAt } }],
       },
       include: {
         project: true,
       },
-      orderBy: { updatedAt: 'desc' },
+      orderBy: [{ prDiscoveryNextCheckAt: 'asc' }, { updatedAt: 'desc' }],
+      take: limit,
     });
+  }
+
+  /**
+   * Claim a due PR discovery candidate using the values observed by the caller.
+   * Concurrent activity or eligibility changes win by making this update a no-op.
+   */
+  async claimPRDiscoveryAttempt(
+    id: string,
+    attempt: {
+      branchName: string;
+      expectedUpdatedAt: Date;
+      expectedRetryCount: number;
+      expectedNextCheckAt: Date | null;
+      checkedAt: Date;
+      nextCheckAt: Date;
+    }
+  ): Promise<boolean> {
+    const result = await prisma.workspace.updateMany({
+      where: {
+        id,
+        status: 'READY',
+        prUrl: null,
+        branchName: attempt.branchName,
+        updatedAt: attempt.expectedUpdatedAt,
+        prDiscoveryRetryCount: attempt.expectedRetryCount,
+        prDiscoveryNextCheckAt: attempt.expectedNextCheckAt,
+      },
+      data: {
+        prDiscoveryLastCheckedAt: attempt.checkedAt,
+        prDiscoveryRetryCount: { increment: 1 },
+        prDiscoveryNextCheckAt: attempt.nextCheckAt,
+      },
+    });
+    return result.count > 0;
+  }
+
+  /**
+   * Atomically attach a discovered PR only while the claim that produced it is
+   * still current. A concurrent reset, branch rename, status change, or PR
+   * attachment makes this update a no-op.
+   */
+  async attachDiscoveredPRIfClaimMatches(
+    id: string,
+    prUrl: string,
+    claim: PRDiscoveryClaim,
+    prUpdatedAt: Date
+  ): Promise<boolean> {
+    const result = await prisma.workspace.updateMany({
+      where: {
+        id,
+        status: 'READY',
+        prUrl: null,
+        branchName: claim.branchName,
+        prDiscoveryLastCheckedAt: claim.checkedAt,
+        prDiscoveryRetryCount: claim.retryCount,
+        prDiscoveryNextCheckAt: claim.nextCheckAt,
+      },
+      data: {
+        prUrl,
+        prUpdatedAt,
+      },
+    });
+    return result.count > 0;
+  }
+
+  /** Atomically update snapshot fields only while the expected PR remains attached. */
+  async updatePRSnapshotIfUrlMatches(
+    id: string,
+    prUrl: string,
+    snapshot: PRSnapshotFields,
+    prUpdatedAt: Date
+  ): Promise<boolean> {
+    const result = await prisma.workspace.updateMany({
+      where: { id, prUrl },
+      data: {
+        ...snapshot,
+        prUpdatedAt,
+      },
+    });
+    return result.count > 0;
+  }
+
+  /** Make an eligible workspace immediately due for PR discovery again. */
+  async resetPRDiscoveryBackoff(id: string): Promise<boolean> {
+    const result = await prisma.workspace.updateMany({
+      where: {
+        id,
+        status: 'READY',
+        prUrl: null,
+        branchName: { not: null },
+      },
+      data: {
+        prDiscoveryLastCheckedAt: null,
+        prDiscoveryRetryCount: 0,
+        prDiscoveryNextCheckAt: null,
+      },
+    });
+    return result.count > 0;
   }
 
   /**
@@ -520,14 +876,205 @@ class WorkspaceAccessor {
   }
 
   /**
-   * Clear ratchetActiveSessionId if it still points to the given session.
-   * Called on session exit to eagerly clean up stale fixer references.
+   * Settle the ratchet dispatch record when a fixer session ends. Conditional
+   * on the pointer still naming this session, so whichever of the session-end
+   * paths (lifecycle exit hook, deliberate stop, poll-check fallback) gets
+   * here first wins and the others no-op — a check racing a normal exit can
+   * never overwrite a COMPLETED outcome with DIED.
    */
-  async clearRatchetActiveSession(workspaceId: string, sessionId: string): Promise<void> {
-    await prisma.workspace.updateMany({
+  async recordRatchetSessionEnd(
+    workspaceId: string,
+    sessionId: string,
+    outcome: Exclude<RatchetDispatchOutcome, 'RUNNING'>
+  ): Promise<boolean> {
+    const result = await prisma.workspace.updateMany({
       where: { id: workspaceId, ratchetActiveSessionId: sessionId },
-      data: { ratchetActiveSessionId: null },
+      data: { ratchetActiveSessionId: null, ratchetDispatchOutcome: outcome },
     });
+    return result.count > 0;
+  }
+
+  /**
+   * Persist a PR aggregate and clear ownership from a settled dispatch when
+   * the newly fetched aggregate changed. The conditional update writes the
+   * aggregate and reset atomically. The reset compares all dispatch metadata
+   * read in the transaction; if a newer dispatch wins that race, only the PR
+   * aggregate is written and its ownership is preserved. Identical periodic
+   * refreshes use the plain snapshot update and leave settled metadata
+   * untouched; RUNNING ownership is never eligible for the reset.
+   * ratchetLastCiRunId deliberately remains the richer dispatch snapshot key;
+   * the Ratchet still uses it to decide whether the changed aggregate warrants
+   * another fixer.
+   */
+  applyPrSnapshotWithDispatchReset(
+    workspaceId: string,
+    observation: PrSnapshotPersistenceInput
+  ): Promise<PrAggregatePersistenceResult> {
+    return this.applyPrAggregateUpdateWithDispatchReset(workspaceId, observation);
+  }
+
+  applyCIObservationWithDispatchReset(
+    workspaceId: string,
+    observation: CIObservationPersistenceInput
+  ): Promise<PrAggregatePersistenceResult> {
+    return this.applyPrAggregateUpdateWithDispatchReset(workspaceId, observation);
+  }
+
+  private async applyPrAggregateUpdateWithDispatchReset(
+    workspaceId: string,
+    observation: PrAggregatePersistenceInput
+  ): Promise<PrAggregatePersistenceResult> {
+    const snapshotData: UpdateWorkspaceInput = {
+      ...(observation.prUrl !== undefined ? { prUrl: observation.prUrl } : {}),
+      ...(observation.prNumber !== undefined ? { prNumber: observation.prNumber } : {}),
+      ...(observation.prState !== undefined ? { prState: observation.prState } : {}),
+      ...(observation.prReviewState !== undefined
+        ? { prReviewState: observation.prReviewState }
+        : {}),
+      ...(observation.prCiStatus !== undefined ? { prCiStatus: observation.prCiStatus } : {}),
+      ...(observation.prCiFailedAt !== undefined ? { prCiFailedAt: observation.prCiFailedAt } : {}),
+      prUpdatedAt: observation.prUpdatedAt,
+      ...(observation.branchName !== undefined ? { branchName: observation.branchName } : {}),
+    };
+    return await prisma.$transaction(async (transaction) => {
+      const current = await transaction.workspace.findUniqueOrThrow({
+        where: { id: workspaceId },
+        select: {
+          prUrl: true,
+          prNumber: true,
+          prState: true,
+          prReviewState: true,
+          prCiStatus: true,
+          prUpdatedAt: true,
+          ratchetActiveSessionId: true,
+          ratchetLastCiRunId: true,
+          ratchetDispatchOutcome: true,
+          ratchetDispatchRetryCount: true,
+        },
+      });
+      const aggregateChanged =
+        (observation.prNumber !== undefined && current.prNumber !== observation.prNumber) ||
+        (observation.prState !== undefined && current.prState !== observation.prState) ||
+        (observation.prReviewState !== undefined &&
+          current.prReviewState !== observation.prReviewState) ||
+        (observation.prCiStatus !== undefined && current.prCiStatus !== observation.prCiStatus) ||
+        (observation.prUrl !== undefined && current.prUrl !== observation.prUrl);
+      const shouldReset =
+        aggregateChanged &&
+        (current.ratchetDispatchOutcome === 'COMPLETED' ||
+          current.ratchetDispatchOutcome === 'DIED');
+      const aggregateGuard = {
+        prUrl: current.prUrl,
+        prNumber: current.prNumber,
+        prState: current.prState,
+        prReviewState: current.prReviewState,
+        prCiStatus: current.prCiStatus,
+        prUpdatedAt: current.prUpdatedAt,
+      };
+
+      if (shouldReset) {
+        const reset = await transaction.workspace.updateMany({
+          where: {
+            id: workspaceId,
+            ...aggregateGuard,
+            ratchetActiveSessionId: current.ratchetActiveSessionId,
+            ratchetLastCiRunId: current.ratchetLastCiRunId,
+            ratchetDispatchOutcome: current.ratchetDispatchOutcome,
+            ratchetDispatchRetryCount: current.ratchetDispatchRetryCount,
+          },
+          data: {
+            ...snapshotData,
+            ratchetDispatchOutcome: null,
+            ratchetDispatchRetryCount: 0,
+          },
+        });
+        if (reset.count > 0) {
+          return { applied: true, dispatchReset: true };
+        }
+      }
+
+      const fallback = await transaction.workspace.updateMany({
+        where: { id: workspaceId, ...aggregateGuard },
+        data: snapshotData,
+      });
+      return { applied: fallback.count > 0, dispatchReset: false };
+    });
+  }
+
+  /**
+   * Record a ratchet fixer dispatch (session pointer, snapshot key, RUNNING
+   * outcome, retry count) atomically, only while ratcheting is still enabled.
+   * The conditional update closes the disable-vs-dispatch race where an
+   * in-flight ratchet check could repopulate the active session after disable.
+   */
+  async recordRatchetDispatchIfEnabled(
+    workspaceId: string,
+    dispatch: { sessionId: string; snapshotKey: string; retryCount: number }
+  ): Promise<boolean> {
+    const result = await prisma.workspace.updateMany({
+      where: { id: workspaceId, ratchetEnabled: true },
+      data: {
+        ratchetActiveSessionId: dispatch.sessionId,
+        ratchetLastCiRunId: dispatch.snapshotKey,
+        ratchetDispatchOutcome: 'RUNNING',
+        ratchetDispatchRetryCount: dispatch.retryCount,
+      },
+    });
+    return result.count > 0;
+  }
+
+  /**
+   * Adopt an already-running fixer session as the active ratchet session
+   * without recording a new dispatch (the snapshot key and retry count are
+   * left untouched, since no prompt was sent for the current PR state).
+   */
+  async adoptRatchetActiveSessionIfEnabled(
+    workspaceId: string,
+    sessionId: string
+  ): Promise<boolean> {
+    const result = await prisma.workspace.updateMany({
+      where: { id: workspaceId, ratchetEnabled: true },
+      data: { ratchetActiveSessionId: sessionId, ratchetDispatchOutcome: 'RUNNING' },
+    });
+    return result.count > 0;
+  }
+
+  /**
+   * Compare-and-swap ratchet state transition, mirroring transitionWithCas.
+   * Persists only while ratcheting remains enabled AND the state still matches
+   * the fromState the caller observed, so stale in-flight checks can neither
+   * overwrite the disabled state nor a concurrent transition, and emitted
+   * fromState values are accurate by construction. Transition validity is
+   * checked by the caller against RATCHET_VALID_TRANSITIONS (see
+   * ratchet-state-machine.ts).
+   */
+  async transitionRatchetStateIfEnabled(
+    workspaceId: string,
+    fromState: RatchetState,
+    data: Pick<UpdateWorkspaceInput, 'ratchetState' | 'ratchetLastCheckedAt'>
+  ): Promise<boolean> {
+    const result = await prisma.workspace.updateMany({
+      where: { id: workspaceId, ratchetEnabled: true, ratchetState: fromState },
+      data,
+    });
+    return result.count > 0;
+  }
+
+  /**
+   * Settle ratchet state to IDLE for a workspace whose ratcheting is disabled,
+   * CAS on the fromState the caller observed. The disabled condition keeps
+   * this write from clobbering a concurrent re-enable, and the fromState
+   * condition keeps the emitted transition accurate.
+   */
+  async settleRatchetIdleWhileDisabled(
+    workspaceId: string,
+    fromState: RatchetState
+  ): Promise<boolean> {
+    const result = await prisma.workspace.updateMany({
+      where: { id: workspaceId, ratchetEnabled: false, ratchetState: fromState },
+      data: { ratchetState: 'IDLE', ratchetLastCheckedAt: new Date() },
+    });
+    return result.count > 0;
   }
 
   /**
@@ -563,6 +1110,26 @@ class WorkspaceAccessor {
         throw new Error(`Workspace not found: ${id}`);
       }
     }
+  }
+
+  /**
+   * Track the currently running startup/setup script process for provisioning recovery.
+   */
+  async setInitScriptPid(id: string, pid: number): Promise<void> {
+    await prisma.workspace.updateMany({
+      where: { id, status: 'PROVISIONING' },
+      data: { initScriptPid: pid },
+    });
+  }
+
+  /**
+   * Clear startup/setup script process tracking if it still points to the given process.
+   */
+  async clearInitScriptPid(id: string, pid: number): Promise<void> {
+    await prisma.workspace.updateMany({
+      where: { id, initScriptPid: pid },
+      data: { initScriptPid: null },
+    });
   }
 
   /**
@@ -617,9 +1184,12 @@ class WorkspaceAccessor {
       where: {
         status: 'READY',
         prUrl: { not: null },
-        // Skip disabled and terminal workspaces to avoid unnecessary GitHub API calls
+        // Skip disabled and terminal workspaces to avoid unnecessary GitHub API calls.
+        // Closed PRs are excluded via the cached prState (kept fresh by the scheduler
+        // PR sync, which also flips it back to OPEN if the PR is reopened).
         ratchetEnabled: true,
         ratchetState: { not: 'MERGED' },
+        prState: { not: 'CLOSED' },
       },
       select: {
         id: true,
@@ -633,6 +1203,8 @@ class WorkspaceAccessor {
         ratchetState: true,
         ratchetActiveSessionId: true,
         ratchetLastCiRunId: true,
+        ratchetDispatchOutcome: true,
+        ratchetDispatchRetryCount: true,
         prReviewLastCheckedAt: true,
       },
       orderBy: { ratchetLastCheckedAt: 'asc' }, // Check oldest first
@@ -661,9 +1233,49 @@ class WorkspaceAccessor {
         ratchetState: true,
         ratchetActiveSessionId: true,
         ratchetLastCiRunId: true,
+        ratchetDispatchOutcome: true,
+        ratchetDispatchRetryCount: true,
         prReviewLastCheckedAt: true,
       },
     }) as Promise<WorkspaceForRatchet | null>;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Parent / child workspace hierarchy
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Find non-archived child workspaces for a given parent.
+   */
+  findChildrenByParentId(parentId: string): Promise<Workspace[]> {
+    return prisma.workspace.findMany({
+      where: { parentWorkspaceId: parentId, status: { not: 'ARCHIVED' } },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  /**
+   * Find child workspaces with session counts included, for status summaries.
+   */
+  findChildrenWithStatus(
+    parentId: string
+  ): Promise<Prisma.WorkspaceGetPayload<{ include: { agentSessions: true; project: true } }>[]> {
+    return prisma.workspace.findMany({
+      where: { parentWorkspaceId: parentId, status: { not: 'ARCHIVED' } },
+      include: { agentSessions: true, project: true },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  /**
+   * Find the parent workspace summary for a given child workspace id.
+   * Returns the parent with project included for cross-project navigation.
+   */
+  findParentWorkspace(childId: string): Promise<WorkspaceWithProject | null> {
+    return prisma.workspace.findFirst({
+      where: { childWorkspaces: { some: { id: childId } } },
+      include: { project: true },
+    });
   }
 }
 

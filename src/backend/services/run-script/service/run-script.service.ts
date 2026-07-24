@@ -1,48 +1,39 @@
 import { type ChildProcess, spawn } from 'node:child_process';
-import treeKill from 'tree-kill';
 import { toError } from '@/backend/lib/error-utils';
-import { FactoryConfigService } from '@/backend/services/factory-config.service';
 import { createLogger } from '@/backend/services/logger.service';
-import { PortAllocationService } from '@/backend/services/port-allocation.service';
+import { workspaceDataService } from '@/backend/services/workspace';
+import { FactoryConfigService } from './factory-config.service';
+import { PortAllocationService } from './port-allocation.service';
 import {
   type RunScriptCommandCache,
   runScriptConfigPersistenceService,
-} from '@/backend/services/run-script-config-persistence.service';
-import { runScriptProxyService } from '@/backend/services/run-script-proxy.service';
-import { workspaceAccessor } from '@/backend/services/workspace';
-import { runScriptStateMachine } from './run-script-state-machine.service';
+} from './run-script-config-persistence.service';
+import { RunScriptOutputBuffer } from './run-script-output-buffer';
+import {
+  runCleanupScriptProcess,
+  shouldRejectStopWithoutProcess,
+  treeKillProcess,
+  waitForChildProcessExit,
+} from './run-script-process-utils';
+import { runScriptProxyService } from './run-script-proxy.service';
+import {
+  RunScriptStateMachineError,
+  runScriptStateMachine,
+} from './run-script-state-machine.service';
 
 const logger = createLogger('run-script-service');
 
-// Max output buffer size per run script (500KB)
 const MAX_OUTPUT_BUFFER_SIZE = 500 * 1024;
+const RUN_SCRIPT_EXIT_STATE_MAX_ATTEMPTS = 3;
 
-/**
- * Service for managing run script execution from factory-factory.json
- */
 export class RunScriptService {
-  // Track running processes by workspace ID
   private readonly runningProcesses = new Map<string, ChildProcess>();
-
-  // Track postRun sidecar processes by workspace ID
   private readonly postRunProcesses = new Map<string, ChildProcess>();
 
-  // Output buffers by workspace ID (persists even after process stops)
-  private readonly outputBuffers = new Map<string, string>();
+  private readonly runOutput = new RunScriptOutputBuffer(MAX_OUTPUT_BUFFER_SIZE);
+  private readonly postRunOutput = new RunScriptOutputBuffer(MAX_OUTPUT_BUFFER_SIZE);
 
-  // Output listeners by workspace ID
-  private readonly outputListeners = new Map<string, Set<(data: string) => void>>();
-
-  // PostRun output buffers (separate from main dev logs)
-  private readonly postRunOutputBuffers = new Map<string, string>();
-
-  // PostRun output listeners (separate from main dev logs)
-  private readonly postRunOutputListeners = new Map<string, Set<(data: string) => void>>();
-
-  // Track whether we're shutting down to prevent double cleanup
   private isShuttingDown = false;
-
-  // Guard against duplicate handler registration on module reload
   private shutdownHandlersRegistered = false;
 
   /**
@@ -58,7 +49,7 @@ export class RunScriptService {
     error?: string;
   }> {
     try {
-      const workspace = await workspaceAccessor.findById(workspaceId);
+      const workspace = await workspaceDataService.findById(workspaceId);
       if (!workspace) {
         throw new Error('Workspace not found');
       }
@@ -78,7 +69,7 @@ export class RunScriptService {
       const started = await runScriptStateMachine.start(workspaceId);
       if (!started) {
         // Re-read workspace for current pid/port after verify
-        const fresh = await workspaceAccessor.findById(workspaceId);
+        const fresh = await workspaceDataService.findById(workspaceId);
         return {
           success: false,
           error: 'Run script is already running',
@@ -123,8 +114,8 @@ export class RunScriptService {
 
       // Clear and initialize output buffers for new run
       const startMessage = `\x1b[36m[Factory Factory]\x1b[0m Starting ${command}\n\n`;
-      this.outputBuffers.set(workspaceId, startMessage);
-      this.postRunOutputBuffers.delete(workspaceId);
+      this.runOutput.set(workspaceId, startMessage);
+      this.postRunOutput.clearBuffer(workspaceId);
 
       // Register event handlers BEFORE async state transition to avoid missing events
       this.registerProcessHandlers(workspaceId, childProcess, pid);
@@ -193,6 +184,14 @@ export class RunScriptService {
 
     // Handle spawn errors
     childProcess.on('error', async (error) => {
+      if (this.runningProcesses.get(workspaceId) !== childProcess) {
+        logger.info('Ignoring stale run script error from non-active process', {
+          workspaceId,
+          erroredPid: pid,
+          activePid: this.runningProcesses.get(workspaceId)?.pid,
+        });
+        return;
+      }
       logger.error('Run script spawn error', error, { workspaceId, pid });
       this.runningProcesses.delete(workspaceId);
       try {
@@ -216,99 +215,149 @@ export class RunScriptService {
     logger.info('Run script exited', { workspaceId, pid, code, signal });
 
     const trackedProcess = this.runningProcesses.get(workspaceId);
-    if (trackedProcess && trackedProcess !== childProcess) {
-      logger.info('Ignoring stale run script exit from non-active process', {
+    if (trackedProcess !== childProcess) {
+      logger.info('Ignoring stale or untracked run script exit', {
         workspaceId,
         exitingPid: pid,
-        activePid: trackedProcess.pid,
+        activePid: trackedProcess?.pid,
+      });
+      return;
+    }
+
+    await this.persistProcessExitState(workspaceId, childProcess, code);
+
+    let currentProcess = this.runningProcesses.get(workspaceId);
+    if (currentProcess !== childProcess) {
+      logger.info('Skipping stale run script cleanup because a newer process is active', {
+        workspaceId,
+        exitingPid: pid,
+        activePid: currentProcess?.pid,
+      });
+      return;
+    }
+
+    await this.killPostRunProcess(workspaceId);
+
+    currentProcess = this.runningProcesses.get(workspaceId);
+    if (currentProcess !== childProcess) {
+      logger.info('Skipping stale run script tunnel cleanup because ownership changed', {
+        workspaceId,
+        exitingPid: pid,
+        activePid: currentProcess?.pid,
       });
       return;
     }
 
     this.runningProcesses.delete(workspaceId);
-    this.outputListeners.delete(workspaceId);
-    await this.killPostRunProcess(workspaceId);
+    this.runOutput.clearListeners(workspaceId);
     await runScriptProxyService.stopTunnel(workspaceId);
+  }
 
-    // Check current state:
-    // - STOPPING: best-effort STOPPING -> IDLE completion (stop flow may have failed mid-cleanup)
-    // - IDLE/COMPLETED/FAILED: already terminal, skip
-    // - otherwise: transition to COMPLETED or FAILED based on exit code
-    try {
-      const ws = await workspaceAccessor.findById(workspaceId);
-      const status = ws?.runScriptStatus;
+  private async persistProcessExitState(
+    workspaceId: string,
+    childProcess: ChildProcess,
+    code: number | null
+  ): Promise<void> {
+    let lastError: unknown;
 
-      if (status === 'STOPPING') {
-        try {
-          await runScriptStateMachine.completeStopping(workspaceId);
-        } catch (error) {
-          logger.warn(
-            'Failed to complete STOPPING after process exit (likely already transitioned)',
-            {
-              workspaceId,
-              error,
-            }
-          );
-        }
-        return;
-      }
-
-      if (status === 'IDLE' || status === 'COMPLETED' || status === 'FAILED') {
-        logger.debug(`Process exited while in ${status} state, skipping exit transition`, {
+    for (let attempt = 1; attempt <= RUN_SCRIPT_EXIT_STATE_MAX_ATTEMPTS; attempt += 1) {
+      if (this.runningProcesses.get(workspaceId) !== childProcess) {
+        logger.info('Stopping run script exit persistence after ownership changed', {
           workspaceId,
+          exitingPid: childProcess.pid,
+          attempt,
         });
         return;
       }
 
-      // Normal exit from RUNNING (or STARTING if the process exits very fast)
-      if (code === 0) {
-        await runScriptStateMachine.markCompleted(workspaceId);
-      } else {
-        await runScriptStateMachine.markFailed(workspaceId);
+      try {
+        await this.transitionProcessExitState(workspaceId, code);
+        return;
+      } catch (error) {
+        const reconciliation = await this.reconcileProcessExitTransitionError(workspaceId, error);
+        if (reconciliation.isConsistent) {
+          return;
+        }
+        lastError = reconciliation.error;
+
+        if (attempt < RUN_SCRIPT_EXIT_STATE_MAX_ATTEMPTS) {
+          logger.warn('Failed to persist run script exit state; retrying', {
+            workspaceId,
+            attempt,
+            maxAttempts: RUN_SCRIPT_EXIT_STATE_MAX_ATTEMPTS,
+            error: toError(lastError).message,
+          });
+        }
       }
-    } catch (error) {
-      // Swallow state machine errors -- the state was likely already transitioned
-      logger.warn('Exit handler state transition failed (likely already transitioned)', {
+    }
+
+    const error = toError(lastError);
+    logger.error('Failed to persist run script exit state after retries', error, {
+      workspaceId,
+      maxAttempts: RUN_SCRIPT_EXIT_STATE_MAX_ATTEMPTS,
+    });
+    throw error;
+  }
+
+  private async reconcileProcessExitTransitionError(
+    workspaceId: string,
+    error: unknown
+  ): Promise<{ isConsistent: boolean; error: unknown }> {
+    if (!(error instanceof RunScriptStateMachineError)) {
+      return { isConsistent: false, error };
+    }
+
+    try {
+      const refreshed = await workspaceDataService.findById(workspaceId);
+      const status = refreshed?.runScriptStatus;
+      const isConsistent = status === 'IDLE' || status === 'COMPLETED' || status === 'FAILED';
+      if (isConsistent) {
+        logger.debug('Run script exit transition raced with a consistent state', {
+          workspaceId,
+          status,
+        });
+      }
+      return { isConsistent, error };
+    } catch (refreshError) {
+      return { isConsistent: false, error: refreshError };
+    }
+  }
+
+  private async transitionProcessExitState(
+    workspaceId: string,
+    code: number | null
+  ): Promise<void> {
+    const workspace = await workspaceDataService.findById(workspaceId);
+    if (!workspace) {
+      throw new Error(`Workspace not found while persisting run script exit: ${workspaceId}`);
+    }
+
+    const status = workspace.runScriptStatus;
+    if (status === 'STOPPING') {
+      await runScriptStateMachine.completeStopping(workspaceId);
+      return;
+    }
+
+    if (status === 'IDLE' || status === 'COMPLETED' || status === 'FAILED') {
+      logger.debug(`Process exited while in ${status} state, skipping exit transition`, {
         workspaceId,
-        error,
       });
+      return;
+    }
+
+    if (code === 0) {
+      await runScriptStateMachine.markCompleted(workspaceId);
+    } else {
+      await runScriptStateMachine.markFailed(workspaceId);
     }
   }
 
   private appendOutput(workspaceId: string, output: string): void {
-    const currentBuffer = this.outputBuffers.get(workspaceId) ?? '';
-    let newBuffer = currentBuffer + output;
-
-    if (newBuffer.length > MAX_OUTPUT_BUFFER_SIZE) {
-      newBuffer = newBuffer.slice(-MAX_OUTPUT_BUFFER_SIZE);
-    }
-
-    this.outputBuffers.set(workspaceId, newBuffer);
-
-    const listeners = this.outputListeners.get(workspaceId);
-    if (listeners) {
-      for (const listener of listeners) {
-        listener(output);
-      }
-    }
+    this.runOutput.append(workspaceId, output);
   }
 
   private appendPostRunOutput(workspaceId: string, output: string): void {
-    const currentBuffer = this.postRunOutputBuffers.get(workspaceId) ?? '';
-    let newBuffer = currentBuffer + output;
-
-    if (newBuffer.length > MAX_OUTPUT_BUFFER_SIZE) {
-      newBuffer = newBuffer.slice(-MAX_OUTPUT_BUFFER_SIZE);
-    }
-
-    this.postRunOutputBuffers.set(workspaceId, newBuffer);
-
-    const listeners = this.postRunOutputListeners.get(workspaceId);
-    if (listeners) {
-      for (const listener of listeners) {
-        listener(output);
-      }
-    }
+    this.postRunOutput.append(workspaceId, output);
   }
 
   private async transitionToRunning(
@@ -382,7 +431,7 @@ export class RunScriptService {
     markRunningError: unknown
   ): Promise<{ success: boolean; port?: number; pid?: number; proxyUrl?: string; error?: string }> {
     // Check if the process already exited and the exit handler transitioned the state
-    const ws = await workspaceAccessor.findById(workspaceId);
+    const ws = await workspaceDataService.findById(workspaceId);
     const currentStatus = ws?.runScriptStatus;
     if (currentStatus === 'COMPLETED' || currentStatus === 'FAILED') {
       logger.info('Process exited before markRunning -- exit handler already transitioned state', {
@@ -421,7 +470,7 @@ export class RunScriptService {
     // If the error is a state machine error (e.g., concurrent start), don't mark as FAILED
     if (error.name !== 'RunScriptStateMachineError') {
       try {
-        const workspace = await workspaceAccessor.findById(workspaceId);
+        const workspace = await workspaceDataService.findById(workspaceId);
         if (workspace?.runScriptStatus === 'STARTING') {
           await runScriptStateMachine.markFailed(workspaceId);
         }
@@ -445,7 +494,7 @@ export class RunScriptService {
     error?: string;
   }> {
     try {
-      const workspace = await workspaceAccessor.findById(workspaceId);
+      const workspace = await workspaceDataService.findById(workspaceId);
       if (!workspace) {
         throw new Error('Workspace not found');
       }
@@ -469,7 +518,7 @@ export class RunScriptService {
           await this.waitForProcessExit(workspaceId, childProcess, pid);
         }
         await this.completeStoppingAfterStop(workspaceId);
-        await runScriptProxyService.stopTunnel(workspaceId);
+        await this.finishStoppedProcessCleanup(workspaceId, childProcess);
         return { success: true };
       }
 
@@ -480,8 +529,9 @@ export class RunScriptService {
         return result;
       }
 
-      // STARTING or RUNNING -- attempt STOPPING transition
-      if (!(childProcess || pid)) {
+      // STARTING or RUNNING -- attempt STOPPING transition.
+      // STARTING may not have spawned a process yet, but it is still cancellable.
+      if (shouldRejectStopWithoutProcess(status, childProcess, pid)) {
         return { success: false, error: 'No run script is running' };
       }
 
@@ -519,7 +569,7 @@ export class RunScriptService {
 
       // Transition to IDLE state via state machine (completes stopping)
       await this.completeStoppingAfterStop(workspaceId);
-      await runScriptProxyService.stopTunnel(workspaceId);
+      await this.finishStoppedProcessCleanup(workspaceId, childProcess);
 
       return { success: true };
     } catch (error) {
@@ -559,7 +609,7 @@ export class RunScriptService {
       return false; // No race -- continue with stop flow
     } catch (error) {
       // Race: state moved to a terminal state between our read and the CAS write.
-      const fresh = await workspaceAccessor.findById(workspaceId);
+      const fresh = await workspaceDataService.findById(workspaceId);
       const freshStatus = fresh?.runScriptStatus;
       if (
         freshStatus === 'COMPLETED' ||
@@ -582,7 +632,7 @@ export class RunScriptService {
       await runScriptStateMachine.completeStopping(workspaceId);
     } catch (error) {
       // Exit handler may have raced and already completed STOPPING -> IDLE.
-      const fresh = await workspaceAccessor.findById(workspaceId);
+      const fresh = await workspaceDataService.findById(workspaceId);
       if (fresh?.runScriptStatus === 'IDLE') {
         logger.debug('completeStopping raced with exit handler, already IDLE', {
           workspaceId,
@@ -601,54 +651,7 @@ export class RunScriptService {
       runScriptPort: number | null;
     }
   ): Promise<void> {
-    logger.info('Running cleanup script before stopping', {
-      workspaceId,
-      cleanupCommand: workspace.runScriptCleanupCommand,
-    });
-
-    try {
-      const cleanupCommand = workspace.runScriptPort
-        ? FactoryConfigService.substitutePort(
-            workspace.runScriptCleanupCommand,
-            workspace.runScriptPort
-          )
-        : workspace.runScriptCleanupCommand;
-
-      const cleanupProcess = spawn('bash', ['-c', cleanupCommand], {
-        cwd: workspace.worktreePath,
-        detached: false,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      cleanupProcess.stdout?.on('error', (error) => {
-        logger.warn('Cleanup script stdout stream error', { workspaceId, error });
-      });
-      cleanupProcess.stderr?.on('error', (error) => {
-        logger.warn('Cleanup script stderr stream error', { workspaceId, error });
-      });
-
-      await new Promise<void>((resolve) => {
-        const timeout = setTimeout(() => {
-          logger.warn('Cleanup script timed out, proceeding anyway', { workspaceId });
-          cleanupProcess.kill('SIGTERM');
-          resolve();
-        }, 5000);
-
-        cleanupProcess.on('exit', (code) => {
-          clearTimeout(timeout);
-          logger.info('Cleanup script completed', { workspaceId, exitCode: code });
-          resolve();
-        });
-
-        cleanupProcess.on('error', (error) => {
-          clearTimeout(timeout);
-          logger.error('Cleanup script error', error, { workspaceId });
-          resolve();
-        });
-      });
-    } catch (error) {
-      logger.error('Failed to run cleanup script', toError(error), { workspaceId });
-    }
+    await runCleanupScriptProcess(workspaceId, workspace, logger);
   }
 
   private async spawnPostRunScript(
@@ -704,12 +707,16 @@ export class RunScriptService {
         code,
         signal,
       });
-      this.postRunProcesses.delete(workspaceId);
+      if (this.postRunProcesses.get(workspaceId) === postRunProcess) {
+        this.postRunProcesses.delete(workspaceId);
+      }
     });
 
     postRunProcess.on('error', (error) => {
       logger.error('PostRun spawn error', error, { workspaceId });
-      this.postRunProcesses.delete(workspaceId);
+      if (this.postRunProcesses.get(workspaceId) === postRunProcess) {
+        this.postRunProcesses.delete(workspaceId);
+      }
     });
   }
 
@@ -727,23 +734,24 @@ export class RunScriptService {
 
     logger.info('Stopping postRun process', { workspaceId, pid: postRunPid });
 
-    await new Promise<void>((resolve) => {
-      treeKill(postRunPid, 'SIGTERM', (err) => {
-        if (err) {
-          const errorCode = (err as NodeJS.ErrnoException).code;
-          const message = err.message;
-          if (errorCode !== 'ESRCH' && !message.includes('No such process')) {
-            logger.warn('Failed to tree-kill postRun process', {
-              workspaceId,
-              pid: postRunPid,
-              error: message,
-            });
-          }
+    await treeKillProcess(
+      postRunPid,
+      'SIGTERM',
+      (message, errorCode) => {
+        if (errorCode !== 'ESRCH' && !message.includes('No such process')) {
+          logger.warn('Failed to tree-kill postRun process', {
+            workspaceId,
+            pid: postRunPid,
+            error: message,
+          });
         }
-        this.postRunProcesses.delete(workspaceId);
-        resolve();
-      });
-    });
+      },
+      () => {
+        if (this.postRunProcesses.get(workspaceId) === postRunProcess) {
+          this.postRunProcesses.delete(workspaceId);
+        }
+      }
+    );
   }
 
   private async killProcessTree(
@@ -759,29 +767,49 @@ export class RunScriptService {
     const source = childProcess?.pid ? 'stored process' : 'PID';
     logger.info(`Stopping run script via ${source}`, { workspaceId, pid: targetPid });
 
-    await new Promise<void>((resolve) => {
-      treeKill(targetPid, 'SIGTERM', (err) => {
-        if (err) {
-          const errorCode = (err as NodeJS.ErrnoException).code;
-          const message = err.message;
-          if (errorCode === 'ESRCH' || message.includes('No such process')) {
-            logger.debug('Run script process already exited before tree-kill', {
-              workspaceId,
-              pid: targetPid,
-              error: message,
-            });
-          } else {
-            logger.warn('Failed to tree-kill run script process', {
-              workspaceId,
-              pid: targetPid,
-              error: message,
-            });
-          }
+    await treeKillProcess(
+      targetPid,
+      'SIGTERM',
+      (message, errorCode) => {
+        if (errorCode === 'ESRCH' || message.includes('No such process')) {
+          logger.debug('Run script process already exited before tree-kill', {
+            workspaceId,
+            pid: targetPid,
+            error: message,
+          });
+          return;
         }
-        this.runningProcesses.delete(workspaceId);
-        resolve();
-      });
-    });
+        logger.warn('Failed to tree-kill run script process', {
+          workspaceId,
+          pid: targetPid,
+          error: message,
+        });
+      },
+      () => undefined
+    );
+  }
+
+  private releaseStoppedProcess(
+    workspaceId: string,
+    childProcess: ChildProcess | undefined
+  ): boolean {
+    if (!childProcess || this.runningProcesses.get(workspaceId) !== childProcess) {
+      return false;
+    }
+
+    this.runningProcesses.delete(workspaceId);
+    this.runOutput.clearListeners(workspaceId);
+    return true;
+  }
+
+  private async finishStoppedProcessCleanup(
+    workspaceId: string,
+    childProcess: ChildProcess | undefined
+  ): Promise<void> {
+    const released = this.releaseStoppedProcess(workspaceId, childProcess);
+    if (released || !this.runningProcesses.has(workspaceId)) {
+      await runScriptProxyService.stopTunnel(workspaceId);
+    }
   }
 
   private async waitForProcessExit(
@@ -789,65 +817,14 @@ export class RunScriptService {
     childProcess: ChildProcess | undefined,
     pid: number | null
   ): Promise<void> {
-    if (!childProcess) {
-      return;
-    }
-
-    if (childProcess.exitCode !== null) {
-      return;
-    }
-
-    if (typeof childProcess.once !== 'function' || typeof childProcess.off !== 'function') {
-      return;
-    }
-
-    const waitPid = childProcess.pid ?? pid ?? undefined;
-    await new Promise<void>((resolve) => {
-      const timeout = setTimeout(() => {
-        cleanup();
-        logger.warn('Timed out waiting for run script process exit after stop', {
-          workspaceId,
-          pid: waitPid,
-        });
-        resolve();
-      }, 10_000);
-
-      const cleanup = () => {
-        clearTimeout(timeout);
-        childProcess.off('exit', onExit);
-        childProcess.off('error', onError);
-      };
-
-      const onExit = () => {
-        cleanup();
-        resolve();
-      };
-
-      const onError = (error: Error) => {
-        cleanup();
-        logger.warn('Run script process emitted error while waiting for exit', {
-          workspaceId,
-          pid: waitPid,
-          error,
-        });
-        resolve();
-      };
-
-      childProcess.once('exit', onExit);
-      childProcess.once('error', onError);
-
-      if (childProcess.exitCode !== null) {
-        cleanup();
-        resolve();
-      }
-    });
+    await waitForChildProcessExit({ workspaceId, childProcess, pid, logger });
   }
 
   /**
    * Get the status of the run script for a workspace
    */
   async getRunScriptStatus(workspaceId: string) {
-    const workspace = await workspaceAccessor.findById(workspaceId);
+    const workspace = await workspaceDataService.findById(workspaceId);
     if (!workspace) {
       throw new Error('Workspace not found');
     }
@@ -856,7 +833,7 @@ export class RunScriptService {
     const status = await runScriptStateMachine.verifyRunning(workspaceId);
 
     // Refetch workspace to get fresh data after potential state transition
-    const freshWorkspace = await workspaceAccessor.findById(workspaceId);
+    const freshWorkspace = await workspaceDataService.findById(workspaceId);
     if (!freshWorkspace) {
       throw new Error('Workspace not found');
     }
@@ -878,7 +855,7 @@ export class RunScriptService {
    * Get the output buffer for a workspace's run script
    */
   getOutputBuffer(workspaceId: string): string {
-    return this.outputBuffers.get(workspaceId) ?? '';
+    return this.runOutput.get(workspaceId);
   }
 
   /**
@@ -886,10 +863,8 @@ export class RunScriptService {
    * Called when a workspace lifecycle reaches ARCHIVED.
    */
   evictWorkspaceBuffers(workspaceId: string): void {
-    this.outputBuffers.delete(workspaceId);
-    this.outputListeners.delete(workspaceId);
-    this.postRunOutputBuffers.delete(workspaceId);
-    this.postRunOutputListeners.delete(workspaceId);
+    this.runOutput.evict(workspaceId);
+    this.postRunOutput.evict(workspaceId);
   }
 
   /**
@@ -897,30 +872,14 @@ export class RunScriptService {
    * @returns Unsubscribe function
    */
   subscribeToOutput(workspaceId: string, listener: (data: string) => void): () => void {
-    let listeners = this.outputListeners.get(workspaceId);
-    if (!listeners) {
-      listeners = new Set();
-      this.outputListeners.set(workspaceId, listeners);
-    }
-    listeners.add(listener);
-
-    // Return unsubscribe function
-    return () => {
-      const listeners = this.outputListeners.get(workspaceId);
-      if (listeners) {
-        listeners.delete(listener);
-        if (listeners.size === 0) {
-          this.outputListeners.delete(workspaceId);
-        }
-      }
-    };
+    return this.runOutput.subscribe(workspaceId, listener);
   }
 
   /**
    * Get the output buffer for a workspace's postRun script
    */
   getPostRunOutputBuffer(workspaceId: string): string {
-    return this.postRunOutputBuffers.get(workspaceId) ?? '';
+    return this.postRunOutput.get(workspaceId);
   }
 
   /**
@@ -928,22 +887,7 @@ export class RunScriptService {
    * @returns Unsubscribe function
    */
   subscribeToPostRunOutput(workspaceId: string, listener: (data: string) => void): () => void {
-    let listeners = this.postRunOutputListeners.get(workspaceId);
-    if (!listeners) {
-      listeners = new Set();
-      this.postRunOutputListeners.set(workspaceId, listeners);
-    }
-    listeners.add(listener);
-
-    return () => {
-      const listeners = this.postRunOutputListeners.get(workspaceId);
-      if (listeners) {
-        listeners.delete(listener);
-        if (listeners.size === 0) {
-          this.postRunOutputListeners.delete(workspaceId);
-        }
-      }
-    };
+    return this.postRunOutput.subscribe(workspaceId, listener);
   }
 
   /**
@@ -1014,10 +958,8 @@ export class RunScriptService {
     }
     this.postRunProcesses.clear();
     runScriptProxyService.cleanupSync();
-    this.outputBuffers.clear();
-    this.outputListeners.clear();
-    this.postRunOutputBuffers.clear();
-    this.postRunOutputListeners.clear();
+    this.runOutput.clear();
+    this.postRunOutput.clear();
   }
 
   /**

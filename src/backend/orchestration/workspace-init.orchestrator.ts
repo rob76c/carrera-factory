@@ -1,73 +1,54 @@
-import { FACTORY_SIGNATURE } from '@/backend/lib/constants';
 import { toError } from '@/backend/lib/error-utils';
-import type { AutoIterationConfig } from '@/backend/services/auto-iteration';
 import { autoIterationService } from '@/backend/services/auto-iteration';
-import { SERVICE_CACHE_TTL_MS } from '@/backend/services/constants';
-import { FactoryConfigService } from '@/backend/services/factory-config.service';
-import { gitOpsService } from '@/backend/services/git-ops.service';
 import { githubCLIService } from '@/backend/services/github';
-import { linearClientService, linearStateSyncService } from '@/backend/services/linear';
+import { linearStateSyncService } from '@/backend/services/linear';
 import { createLogger } from '@/backend/services/logger.service';
-import { runScriptConfigPersistenceService } from '@/backend/services/run-script-config-persistence.service';
 import {
-  agentSessionAccessor,
+  FactoryConfigService,
+  runScriptConfigPersistenceService,
+} from '@/backend/services/run-script';
+import {
+  buildChildWorkspaceContext,
   chatMessageHandlerService,
   sessionDataService,
   sessionDomainService,
   sessionService,
 } from '@/backend/services/session';
-import { terminalService } from '@/backend/services/terminal';
+import { terminalService, terminalSessionService } from '@/backend/services/terminal';
 import {
-  workspaceAccessor,
+  assertWorktreePathSafe,
+  gitOpsService,
+  workspaceDataService,
+  workspaceRelationshipsService,
+  workspaceRunScriptService,
   workspaceStateMachine,
   worktreeLifecycleService,
 } from '@/backend/services/workspace';
 import { type MessageAttachment, MessageState, resolveSelectedModel } from '@/shared/acp-protocol';
 import { SessionStatus, WorkspaceMode } from '@/shared/core';
+import { autoIterationConfigSchema } from '@/shared/schemas/auto-iteration.schema';
 import { AttachmentSchema } from '@/shared/websocket';
-import { getDecryptedLinearConfig, getWorkspaceLinearContext } from './linear-config.helper';
+import { getWorkspaceLinearContext } from './linear-config.helper';
 import type { WorkspaceWithProject } from './types';
+import { GitHubUsernameCache } from './workspace-init-github-username-cache';
+import {
+  buildInitialPromptFromGitHubIssue,
+  buildInitialPromptFromLinearIssue,
+} from './workspace-init-issue-prompts';
 import { executeStartupScriptPipeline } from './workspace-init-script-pipeline';
 
 const logger = createLogger('workspace-init-orchestrator');
 const initialAttachmentsSchema = AttachmentSchema.array();
 
-type CachedGitHubUsernameEntry = {
-  value: string | null;
-  fetchedAtMs: number;
-  expiresAtMs: number;
+type CreatedWorktreeInfo = {
+  worktreePath: string;
+  branchName: string;
 };
 
-class GitHubUsernameCache {
-  private cachedEntry: CachedGitHubUsernameEntry | null = null;
-
-  constructor(
-    private readonly githubService: Pick<typeof githubCLIService, 'getAuthenticatedUsername'>
-  ) {}
-
-  async getCachedUsername(): Promise<string | null> {
-    const nowMs = Date.now();
-    if (
-      this.cachedEntry &&
-      nowMs >= this.cachedEntry.fetchedAtMs &&
-      nowMs < this.cachedEntry.expiresAtMs
-    ) {
-      return this.cachedEntry.value;
-    }
-
-    const value = await this.githubService.getAuthenticatedUsername();
-    this.cachedEntry = {
-      value: value ?? null,
-      fetchedAtMs: nowMs,
-      expiresAtMs: nowMs + SERVICE_CACHE_TTL_MS.ratchetAuthenticatedUsername,
-    };
-    return this.cachedEntry.value;
-  }
-
-  clear(): void {
-    this.cachedEntry = null;
-  }
-}
+type UnregisteredWorktreeCleanupCandidate = {
+  project: WorkspaceWithProject['project'];
+  worktreeInfo: CreatedWorktreeInfo;
+};
 
 const gitHubUsernameCache = new GitHubUsernameCache(githubCLIService);
 
@@ -94,7 +75,7 @@ async function startProvisioningOrLog(workspaceId: string): Promise<boolean> {
 }
 
 async function getWorkspaceWithProjectOrThrow(workspaceId: string): Promise<WorkspaceWithProject> {
-  const workspaceWithProject = await workspaceAccessor.findByIdWithProject(workspaceId);
+  const workspaceWithProject = await workspaceDataService.findByIdWithProject(workspaceId);
   if (!workspaceWithProject?.project) {
     throw new Error('Workspace project not found');
   }
@@ -127,10 +108,17 @@ async function readFactoryConfigSafe(
 async function handleWorkspaceInitFailure(
   workspaceId: string,
   error: Error,
-  autoCreatedTerminalId?: string
+  autoCreatedTerminalId?: string,
+  unregisteredWorktreeCleanupCandidate?: UnregisteredWorktreeCleanupCandidate
 ): Promise<void> {
   logger.error('Failed to initialize workspace worktree', error, { workspaceId });
   await workspaceStateMachine.markFailed(workspaceId, error.message);
+  if (unregisteredWorktreeCleanupCandidate) {
+    await cleanupUnregisteredWorktreeAfterInitFailure(
+      workspaceId,
+      unregisteredWorktreeCleanupCandidate
+    );
+  }
   if (autoCreatedTerminalId) {
     try {
       terminalService.destroyTerminal(workspaceId, autoCreatedTerminalId);
@@ -142,7 +130,7 @@ async function handleWorkspaceInitFailure(
       });
     }
     try {
-      await sessionDataService.clearTerminalPid(autoCreatedTerminalId);
+      await terminalSessionService.releaseSessionPid(workspaceId, autoCreatedTerminalId);
     } catch (clearPidError) {
       logger.warn('Failed to clear default terminal PID after init failure', {
         workspaceId,
@@ -161,431 +149,40 @@ async function handleWorkspaceInitFailure(
   }
 }
 
-async function buildInitialPromptFromGitHubIssue(workspaceId: string): Promise<string> {
+async function cleanupUnregisteredWorktreeAfterInitFailure(
+  workspaceId: string,
+  candidate: UnregisteredWorktreeCleanupCandidate
+): Promise<void> {
+  const { project, worktreeInfo } = candidate;
+
   try {
-    const workspace = await workspaceAccessor.findByIdWithProject(workspaceId);
-    if (!workspace?.githubIssueNumber) {
-      return '';
+    const workspace = await workspaceDataService.findById(workspaceId);
+    if (workspace?.worktreePath === worktreeInfo.worktreePath) {
+      return;
     }
 
-    const project = workspace.project;
-    if (!(project?.githubOwner && project?.githubRepo)) {
-      return '';
-    }
-
-    const issue = await githubCLIService.getIssue(
-      project.githubOwner,
-      project.githubRepo,
-      workspace.githubIssueNumber
-    );
-
-    if (!issue) {
-      logger.warn('Failed to fetch GitHub issue for initial prompt', {
+    if (workspace?.worktreePath) {
+      logger.warn('Skipping unregistered worktree cleanup because workspace has another path', {
         workspaceId,
-        issueNumber: workspace.githubIssueNumber,
+        createdWorktreePath: worktreeInfo.worktreePath,
+        persistedWorktreePath: workspace.worktreePath,
       });
-      return '';
+      return;
     }
 
-    logger.info('Built initial prompt from GitHub issue', {
+    await assertWorktreePathSafe(worktreeInfo.worktreePath, project.worktreeBasePath);
+    await gitOpsService.removeWorktree(worktreeInfo.worktreePath, project);
+    logger.info('Removed unregistered worktree after init failure', {
       workspaceId,
-      issueNumber: issue.number,
-      issueTitle: issue.title,
+      worktreePath: worktreeInfo.worktreePath,
+      branchName: worktreeInfo.branchName,
     });
-
-    return `# GitHub Issue #${issue.number}: ${issue.title}
-
-${issue.body || '(No description provided)'}
-
-**Issue URL**: ${issue.url}
-
----
-
-## Your Task
-
-Implement this issue following the 6-phase workflow below. Work autonomously—only ask questions if requirements are contradictory or fundamentally unclear.
-
-**Protect your context by delegating to specialized agents:**
-- Exploring unfamiliar code or architecture? Use: "Please use the Explore agent to understand [specific area]"
-- Significant changes to review/simplify? Use: "Please use the code-simplifier agent to review recent changes"
-- Targeted searches only? Use Grep/Glob directly
-
----
-
-## Phase 1: Context Gathering
-
-Before beginning, read \`CLAUDE.md\` in the root of the repository to familiarize yourself with:
-- **Agent Instructions**
-- **Repository Structure & Repository Overview**
-- **General Operating Principles**
-- **Codebase Patterns**
-
-## Phase 2: Planning
-
-1. **Understand requirements and find relevant code**
-   - Read issue description and any linked resources
-   - Search for affected files (delegate to Explore agent for broad architecture questions)
-   - Identify which files need changes
-
-2. **Create task list with TodoWrite**
-   Create specific tasks for:
-   - Code changes (which files and what changes?)
-   - Tests to add (which test files?)
-   - Verification commands (typecheck, test, build)
-   - PR creation
-
-   Update status as you work: pending → in_progress → completed
-
-3. **Identify edge cases**
-   - What could go wrong?
-   - What scenarios need tests?
-   - What existing patterns should you follow?
-
-## Phase 3: Implementation
-
-1. **Work through your TodoWrite tasks systematically**
-   - Follow existing code patterns and conventions
-   - Add type definitions and error handling
-   - Keep commits atomic and focused
-   - Update TodoWrite as you discover additional work
-
-2. **Write tests**
-   - Test new functionality and edge cases
-   - Follow existing test patterns in the codebase
-   - Ensure tests are focused and maintainable
-
-3. **Commit frequently**
-   - Atomic commits as you complete logical units
-   - Follow project style: short, imperative, descriptive (<72 chars)
-   - Reference issue number when relevant
-   - Example: "Add session error handling (#${issue.number})"
-
-## Phase 4: Verification
-
-**Read \`CLAUDE.md\` in the root of the repository to find the specific commands for building, typechecking, linting, and testing the project.**
-
-Run all quality checks as specified in \`CLAUDE.md\`.
-
-Fix any failures:
-- **Type errors**: Resolve without type casts when possible
-- **Lint errors**: Review \`pnpm check:fix\` changes
-- **Test failures**: Debug and fix before proceeding
-- **Build failures**: Check for syntax errors or missing dependencies
-
-Update TodoWrite with any additional fix tasks discovered.
-
-## Phase 5: Final Review
-
-1. **Review your changes**
-   \`\`\`bash
-   git diff origin/main
-   \`\`\`
-
-   Look for:
-   - Debug logs or commented code to remove
-   - Unclear variable names to improve
-   - Unnecessary complexity to simplify
-
-2. **Optional: Delegate to code-simplifier for large changes**
-   If you've changed many files (8+) or added complex logic:
-   - Use: "Please use the code-simplifier agent to review recent changes"
-   - Re-run tests after any changes: \`pnpm test\`
-
-3. **Ensure everything is committed**
-   \`\`\`bash
-   git status  # should show clean working directory
-   \`\`\`
-
-## Phase 5.5: Capture UI Screenshots (if applicable)
-
-If your changes affect the UI:
-
-1. Read \`factory-factory.json\` for the \`scripts.run\` command, pick a free port, replace \`{port}\`, and start it in the background.
-2. Use \`browser_navigate\` to visit the dev server URL
-3. Determine the most relevant screen showing your changes and capture a screenshot
-4. Save screenshots:
-   \`\`\`bash
-   mkdir -p .factory-factory/screenshots
-   \`\`\`
-   Save with descriptive names (e.g., \`dashboard-new-widget.png\`)
-5. Commit the screenshots with your changes
-6. Reference them in the PR body using raw GitHub URLs:
-   \`![Description](https://raw.githubusercontent.com/${project.githubOwner}/${project.githubRepo}/\${branch}/.factory-factory/screenshots/filename.png)\`
-
-## Phase 6: Create Pull Request [REQUIRED - DO NOT SKIP]
-
-**Pre-flight checklist before creating PR:**
-- [ ] All TodoWrite tasks marked completed
-- [ ] \`pnpm test\` passes
-- [ ] \`pnpm typecheck\` passes
-- [ ] \`pnpm build\` succeeds
-- [ ] Working directory clean (\`git status\`)
-- [ ] All commits have descriptive messages
-
-**Now create the PR:**
-
-1. **Push your branch:**
-   \`\`\`bash
-   git push -u origin HEAD
-   \`\`\`
-
-2. **Write PR body to /tmp/pr-body.md:**
-   \`\`\`markdown
-   ## Summary
-   [1-3 bullets describing what this PR accomplishes]
-
-   ## Changes
-   - **[Component/Area]**: [What changed and why]
-   - [Add more lines as needed]
-
-   ## Testing
-   - [x] Tests pass (\`pnpm test\`)
-   - [x] Types pass (\`pnpm typecheck\`)
-   - [x] Build succeeds (\`pnpm build\`)
-   - [ ] Manual testing: [How to verify this change works]
-
-   Closes #${issue.number}
-   \`\`\`
-
-3. **IMPORTANT**: Always append the following signature as the very last lines of the PR body, after a horizontal rule:
-   \`\`\`
-   ---
-   ${FACTORY_SIGNATURE}
-   \`\`\`
-
-4. **Create the PR:**
-   \`\`\`bash
-   gh pr create --title "Fix #${issue.number}: [concise description]" --body-file /tmp/pr-body.md
-   \`\`\`
-
-4. **Verify PR created successfully:**
-   \`\`\`bash
-   gh pr view --web
-   \`\`\`
-
----
-
-**You have completed this issue successfully when the PR is created and the URL is shown above.**
-
-Start with Phase 1: Context Gathering.`;
-  } catch (error) {
-    logger.warn('Error building initial prompt from GitHub issue', {
+  } catch (cleanupError) {
+    logger.warn('Failed to remove unregistered worktree after init failure', {
       workspaceId,
-      error: error instanceof Error ? error.message : String(error),
+      worktreePath: worktreeInfo.worktreePath,
+      error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
     });
-    return '';
-  }
-}
-
-async function buildInitialPromptFromLinearIssue(workspaceId: string): Promise<string> {
-  try {
-    const workspace = await workspaceAccessor.findByIdWithProject(workspaceId);
-    if (!workspace?.linearIssueId) {
-      return '';
-    }
-
-    const project = workspace.project;
-    const linearConfig = getDecryptedLinearConfig(project.issueTrackerConfig);
-    if (!linearConfig) {
-      return '';
-    }
-
-    const issue = await linearClientService.getIssue(linearConfig.apiKey, workspace.linearIssueId);
-    if (!issue) {
-      logger.warn('Failed to fetch Linear issue for initial prompt', {
-        workspaceId,
-        linearIssueId: workspace.linearIssueId,
-      });
-      return '';
-    }
-
-    logger.info('Built initial prompt from Linear issue', {
-      workspaceId,
-      issueIdentifier: issue.identifier,
-      issueTitle: issue.title,
-    });
-
-    return `# Linear Issue ${issue.identifier}: ${issue.title}
-
-${issue.description || '(No description provided)'}
-
-**Issue URL**: ${issue.url}
-
----
-
-## Your Task
-
-Implement this issue following the 6-phase workflow below. Work autonomously—only ask questions if requirements are contradictory or fundamentally unclear.
-
-**Protect your context by delegating to specialized agents:**
-- Exploring unfamiliar code or architecture? Use: "Please use the Explore agent to understand [specific area]"
-- Significant changes to review/simplify? Use: "Please use the code-simplifier agent to review recent changes"
-- Targeted searches only? Use Grep/Glob directly
-
----
-
-## Phase 1: Context Gathering
-
-Before beginning, read \`CLAUDE.md\` in the root of the repository to familiarize yourself with:
-- **Agent Instructions**
-- **Repository Structure & Repository Overview**
-- **General Operating Principles**
-- **Codebase Patterns**
-
-## Phase 2: Planning
-
-1. **Understand requirements and find relevant code**
-   - Read issue description and any linked resources
-   - Search for affected files (delegate to Explore agent for broad architecture questions)
-   - Identify which files need changes
-
-2. **Create task list with TodoWrite**
-   Create specific tasks for:
-   - Code changes (which files and what changes?)
-   - Tests to add (which test files?)
-   - Verification commands (typecheck, test, build)
-   - PR creation
-
-   Update status as you work: pending → in_progress → completed
-
-3. **Identify edge cases**
-   - What could go wrong?
-   - What scenarios need tests?
-   - What existing patterns should you follow?
-
-## Phase 3: Implementation
-
-1. **Work through your TodoWrite tasks systematically**
-   - Follow existing code patterns and conventions
-   - Add type definitions and error handling
-   - Keep commits atomic and focused
-   - Update TodoWrite as you discover additional work
-
-2. **Write tests**
-   - Test new functionality and edge cases
-   - Follow existing test patterns in the codebase
-   - Ensure tests are focused and maintainable
-
-3. **Commit frequently**
-   - Atomic commits as you complete logical units
-   - Follow project style: short, imperative, descriptive (<72 chars)
-   - Reference issue number when relevant
-   - Example: "Add session error handling (${issue.identifier})"
-
-## Phase 4: Verification
-
-**Read \`CLAUDE.md\` in the root of the repository to find the specific commands for building, typechecking, linting, and testing the project.**
-
-Run all quality checks as specified in \`CLAUDE.md\`.
-
-Fix any failures:
-- **Type errors**: Resolve without type casts when possible
-- **Lint errors**: Review \`pnpm check:fix\` changes
-- **Test failures**: Debug and fix before proceeding
-- **Build failures**: Check for syntax errors or missing dependencies
-
-Update TodoWrite with any additional fix tasks discovered.
-
-## Phase 5: Final Review
-
-1. **Review your changes**
-   \`\`\`bash
-   git diff origin/main
-   \`\`\`
-
-   Look for:
-   - Debug logs or commented code to remove
-   - Unclear variable names to improve
-   - Unnecessary complexity to simplify
-
-2. **Optional: Delegate to code-simplifier for large changes**
-   If you've changed many files (8+) or added complex logic:
-   - Use: "Please use the code-simplifier agent to review recent changes"
-   - Re-run tests after any changes: \`pnpm test\`
-
-3. **Ensure everything is committed**
-   \`\`\`bash
-   git status  # should show clean working directory
-   \`\`\`
-
-## Phase 5.5: Capture UI Screenshots (if applicable)
-
-If your changes affect the UI:
-
-1. Read \`factory-factory.json\` for the \`scripts.run\` command, pick a free port, replace \`{port}\`, and start it in the background.
-2. Use \`browser_navigate\` to visit the dev server URL
-3. Determine the most relevant screen showing your changes and capture a screenshot
-4. Save screenshots:
-   \`\`\`bash
-   mkdir -p .factory-factory/screenshots
-   \`\`\`
-   Save with descriptive names (e.g., \`dashboard-new-widget.png\`)
-5. Commit the screenshots with your changes
-6. Reference them in the PR body using raw GitHub URLs:
-   \`![Description](https://raw.githubusercontent.com/${project.githubOwner}/${project.githubRepo}/\${branch}/.factory-factory/screenshots/filename.png)\`
-
-## Phase 6: Create Pull Request [REQUIRED - DO NOT SKIP]
-
-**Pre-flight checklist before creating PR:**
-- [ ] All TodoWrite tasks marked completed
-- [ ] \`pnpm test\` passes
-- [ ] \`pnpm typecheck\` passes
-- [ ] \`pnpm build\` succeeds
-- [ ] Working directory clean (\`git status\`)
-- [ ] All commits have descriptive messages
-
-**Now create the PR:**
-
-1. **Push your branch:**
-   \`\`\`bash
-   git push -u origin HEAD
-   \`\`\`
-
-2. **Write PR body to /tmp/pr-body.md:**
-   \`\`\`markdown
-   ## Summary
-   [1-3 bullets describing what this PR accomplishes]
-
-   ## Changes
-   - **[Component/Area]**: [What changed and why]
-   - [Add more lines as needed]
-
-   ## Testing
-   - [x] Tests pass (\`pnpm test\`)
-   - [x] Types pass (\`pnpm typecheck\`)
-   - [x] Build succeeds (\`pnpm build\`)
-   - [ ] Manual testing: [How to verify this change works]
-
-   Closes ${issue.identifier}
-   \`\`\`
-
-3. **IMPORTANT**: Always append the following signature as the very last lines of the PR body, after a horizontal rule:
-   \`\`\`
-   ---
-   ${FACTORY_SIGNATURE}
-   \`\`\`
-
-4. **Create the PR:**
-   \`\`\`bash
-   gh pr create --title "Fix ${issue.identifier}: [concise description]" --body-file /tmp/pr-body.md
-   \`\`\`
-
-4. **Verify PR created successfully:**
-   \`\`\`bash
-   gh pr view --web
-   \`\`\`
-
----
-
-**You have completed this issue successfully when the PR is created and the URL is shown above.**
-
-Start with Phase 1: Context Gathering.`;
-  } catch (error) {
-    logger.warn('Error building initial prompt from Linear issue', {
-      workspaceId,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return '';
   }
 }
 
@@ -705,38 +302,58 @@ function readStartupModePresetFromMetadata(
   return 'non_interactive';
 }
 
+function readInitialPromptFromMetadata(
+  metadata: Record<string, unknown> | null,
+  workspaceId: string
+): { provided: boolean; text: string } {
+  if (!(metadata && Object.hasOwn(metadata, 'initialPrompt'))) {
+    return { provided: false, text: '' };
+  }
+
+  if (typeof metadata.initialPrompt === 'string') {
+    return { provided: true, text: metadata.initialPrompt.replaceAll('</', '<\\/') };
+  }
+
+  logger.warn('Invalid initial prompt in workspace creation metadata', {
+    workspaceId,
+  });
+  return { provided: false, text: '' };
+}
+
 async function resolveInitialAutoMessageContent(
   workspaceId: string,
   creationMetadata: Record<string, unknown> | null
 ): Promise<InitialAutoMessageContent | null> {
+  const metadataPrompt = readInitialPromptFromMetadata(creationMetadata, workspaceId);
+  const metadataAttachments = readInitialAttachmentsFromMetadata(creationMetadata, workspaceId);
+
+  const hasAttachments = metadataAttachments !== undefined && metadataAttachments.length > 0;
+  if (metadataPrompt.provided || hasAttachments) {
+    // A provided-but-blank prompt means the user cleared it: send nothing rather
+    // than enqueueing an empty message the agent adapter would reject (#1689),
+    // and don't fall through to rebuilding the issue prompt.
+    if (!(metadataPrompt.text.trim() || hasAttachments)) {
+      return null;
+    }
+    return {
+      text: metadataPrompt.text,
+      ...(hasAttachments ? { attachments: metadataAttachments } : {}),
+    };
+  }
+
   const issuePromptText =
-    (await buildInitialPromptFromGitHubIssue(workspaceId)) ||
-    (await buildInitialPromptFromLinearIssue(workspaceId));
+    (await buildInitialPromptFromGitHubIssue(workspaceId, logger)) ||
+    (await buildInitialPromptFromLinearIssue(workspaceId, logger));
   if (issuePromptText) {
     return { text: issuePromptText };
   }
 
-  const metadataPromptText =
-    creationMetadata?.initialPrompt && typeof creationMetadata.initialPrompt === 'string'
-      ? creationMetadata.initialPrompt
-      : '';
-  const metadataAttachments = readInitialAttachmentsFromMetadata(creationMetadata, workspaceId);
-
-  if (!metadataPromptText && (!metadataAttachments || metadataAttachments.length === 0)) {
-    return null;
-  }
-
-  return {
-    text: metadataPromptText,
-    ...(metadataAttachments && metadataAttachments.length > 0
-      ? { attachments: metadataAttachments }
-      : {}),
-  };
+  return null;
 }
 
 async function startDefaultAgentSession(workspaceId: string): Promise<string | null> {
   try {
-    const sessions = await agentSessionAccessor.findByWorkspaceId(workspaceId, {
+    const sessions = await sessionDataService.findAgentSessionsByWorkspaceId(workspaceId, {
       status: SessionStatus.IDLE,
       limit: 1,
     });
@@ -745,12 +362,29 @@ async function startDefaultAgentSession(workspaceId: string): Promise<string | n
       return null;
     }
 
-    const workspace = await workspaceAccessor.findById(workspaceId);
+    const workspace = await workspaceDataService.findById(workspaceId);
     const metadata = workspace?.creationMetadata as Record<string, unknown> | null;
     const startupModePreset = readStartupModePresetFromMetadata(metadata, workspaceId);
 
     // Build the initial prompt from linked issue data, or fallback to creation metadata.
     const initialMessage = await resolveInitialAutoMessageContent(workspaceId, metadata);
+    const parent = workspace?.parentWorkspaceId
+      ? await workspaceRelationshipsService.findParent(workspaceId)
+      : null;
+    const childContext = workspace?.parentWorkspaceId
+      ? buildChildWorkspaceContext({
+          parentWorkspaceName: parent?.name,
+          parentProjectName: parent?.project.name,
+          reportBackOn:
+            typeof metadata?.reportBackOn === 'string' ? metadata.reportBackOn : undefined,
+        })
+      : undefined;
+    const messageToEnqueue = childContext
+      ? {
+          text: `${childContext}\n${initialMessage?.text ?? ''}`.trimEnd(),
+          attachments: initialMessage?.attachments,
+        }
+      : initialMessage;
 
     // Start the session - pass empty string to start without any initial prompt
     // (undefined would default to 'Continue with the task.')
@@ -760,13 +394,13 @@ async function startDefaultAgentSession(workspaceId: string): Promise<string | n
     });
 
     // Route the initial prompt through the queue pipeline so runtime and replay remain consistent.
-    if (initialMessage) {
+    if (messageToEnqueue) {
       enqueueAutoMessage(
         session.id,
         workspaceId,
-        initialMessage.text,
+        messageToEnqueue.text,
         session.model,
-        initialMessage.attachments
+        messageToEnqueue.attachments
       );
     }
 
@@ -790,7 +424,7 @@ async function startDefaultAgentSession(workspaceId: string): Promise<string | n
   }
 }
 
-async function retryQueuedDispatchAfterWorkspaceReady(
+export async function retryQueuedDispatchAfterWorkspaceReady(
   workspaceId: string,
   startedSessionId: string | null
 ): Promise<void> {
@@ -801,7 +435,7 @@ async function retryQueuedDispatchAfterWorkspaceReady(
       return;
     }
 
-    const runningSessions = await agentSessionAccessor.findByWorkspaceId(workspaceId, {
+    const runningSessions = await sessionDataService.findAgentSessionsByWorkspaceId(workspaceId, {
       status: SessionStatus.RUNNING,
       limit: 1,
     });
@@ -811,7 +445,7 @@ async function retryQueuedDispatchAfterWorkspaceReady(
       return;
     }
 
-    const idleSessions = await agentSessionAccessor.findByWorkspaceId(workspaceId, {
+    const idleSessions = await sessionDataService.findAgentSessionsByWorkspaceId(workspaceId, {
       status: SessionStatus.IDLE,
       limit: 1,
     });
@@ -853,7 +487,7 @@ async function startDefaultTerminal(
     let terminalSessionPersisted = false;
     const clearPersistedTerminalPid = async () => {
       try {
-        await sessionDataService.clearTerminalPid(terminalId);
+        await terminalSessionService.releaseSessionPid(workspaceId, terminalId);
       } catch (error) {
         logger.warn('Failed to clear terminal PID after default terminal exit', {
           workspaceId,
@@ -875,7 +509,7 @@ async function startDefaultTerminal(
     });
 
     try {
-      await sessionDataService.createTerminalSession({
+      await terminalSessionService.registerSession({
         workspaceId,
         name: terminalId,
         pid,
@@ -937,6 +571,62 @@ async function createWorktreeForWorkspace(
   });
 }
 
+async function resolveWorkspaceWorktree(input: {
+  workspaceWithProject: WorkspaceWithProject;
+  worktreeName: string;
+  baseBranch: string;
+  useExistingBranch: boolean;
+}): Promise<{
+  worktreePath: string;
+  branchName: string | null;
+  created: boolean;
+}> {
+  const workspace = input.workspaceWithProject;
+  if (workspace.worktreePath) {
+    logger.info('Reusing existing workspace worktree for initialization', {
+      workspaceId: workspace.id,
+      worktreePath: workspace.worktreePath,
+    });
+    return {
+      worktreePath: workspace.worktreePath,
+      branchName: workspace.branchName ?? null,
+      created: false,
+    };
+  }
+
+  await gitOpsService.ensureBaseBranchExists(
+    workspace.project,
+    input.baseBranch,
+    workspace.project.defaultBranch
+  );
+
+  const worktreeInfo = await createWorktreeForWorkspace(
+    workspace.project,
+    input.worktreeName,
+    input.baseBranch,
+    input.useExistingBranch,
+    workspace.name
+  );
+
+  return {
+    ...worktreeInfo,
+    created: true,
+  };
+}
+
+function getCreatedWorktreeCleanupCandidate(
+  worktreeInfo: Awaited<ReturnType<typeof resolveWorkspaceWorktree>>,
+  baseBranch: string
+): CreatedWorktreeInfo | undefined {
+  if (!worktreeInfo.created) {
+    return undefined;
+  }
+  return {
+    worktreePath: worktreeInfo.worktreePath,
+    branchName: worktreeInfo.branchName ?? baseBranch,
+  };
+}
+
 async function awaitSessionAndDispatchIfSuccess(
   workspaceId: string,
   agentSessionPromise: Promise<string | null>,
@@ -954,7 +644,7 @@ async function awaitSessionAndDispatchIfSuccess(
  */
 async function maybeStartAutoIteration(workspaceId: string): Promise<boolean> {
   try {
-    const workspace = await workspaceAccessor.findById(workspaceId);
+    const workspace = await workspaceDataService.findById(workspaceId);
     if (!workspace || workspace.mode !== WorkspaceMode.AUTO_ITERATION) {
       return false;
     }
@@ -963,7 +653,15 @@ async function maybeStartAutoIteration(workspaceId: string): Promise<boolean> {
       return false;
     }
 
-    const config = workspace.autoIterationConfig as unknown as AutoIterationConfig;
+    const configParsed = autoIterationConfigSchema.safeParse(workspace.autoIterationConfig);
+    if (!configParsed.success) {
+      logger.error('Auto-iteration workspace has invalid config, skipping auto-start', {
+        workspaceId,
+        error: configParsed.error.message,
+      });
+      return false;
+    }
+    const config = configParsed.data;
     logger.info('Starting auto-iteration loop for workspace', { workspaceId, config });
     await autoIterationService.start(workspaceId, config);
     return true;
@@ -997,15 +695,23 @@ async function handlePostInitSessionStart(
 
 export async function initializeWorkspaceWorktree(
   workspaceId: string,
-  options?: { branchName?: string; useExistingBranch?: boolean }
+  options?: {
+    branchName?: string;
+    useExistingBranch?: boolean;
+    provisioningAlreadyStarted?: boolean;
+  }
 ): Promise<void> {
-  const startedProvisioning = await startProvisioningOrLog(workspaceId);
-  if (!startedProvisioning) {
-    return;
+  if (!options?.provisioningAlreadyStarted) {
+    const startedProvisioning = await startProvisioningOrLog(workspaceId);
+    if (!startedProvisioning) {
+      return;
+    }
   }
 
   let project: WorkspaceWithProject['project'] | undefined;
   let worktreeCreated = false;
+  let worktreeRegistered = false;
+  let createdWorktreeInfo: CreatedWorktreeInfo | undefined;
   let agentSessionPromise: Promise<string | null> = Promise.resolve(null);
   let autoCreatedTerminalId: string | undefined;
 
@@ -1020,32 +726,40 @@ export async function initializeWorkspaceWorktree(
       (await worktreeLifecycleService.getInitMode(workspaceId)) ??
       false;
 
-    await gitOpsService.ensureBaseBranchExists(project, baseBranch, project.defaultBranch);
-
-    const worktreeInfo = await createWorktreeForWorkspace(
-      project,
+    const worktreeInfo = await resolveWorkspaceWorktree({
+      workspaceWithProject,
       worktreeName,
       baseBranch,
       useExistingBranch,
-      workspaceWithProject.name
-    );
-    worktreeCreated = true;
+    });
+    worktreeCreated = worktreeInfo.created;
+    createdWorktreeInfo = getCreatedWorktreeCleanupCandidate(worktreeInfo, baseBranch);
 
     const factoryConfig = await readFactoryConfigSafe(worktreeInfo.worktreePath, workspaceId);
 
     await runScriptConfigPersistenceService.syncWorkspaceCommandsFromFactoryConfig({
       workspaceId,
       factoryConfig,
-      persistWorkspaceCommands: (id, commands) =>
-        workspaceAccessor.update(id, {
-          worktreePath: worktreeInfo.worktreePath,
-          branchName: worktreeInfo.branchName,
-          isAutoGeneratedBranch: !useExistingBranch,
+      persistWorkspaceCommands: (id, commands) => {
+        if (worktreeInfo.created) {
+          return workspaceRunScriptService.registerInitializedWorktree(id, {
+            worktreePath: worktreeInfo.worktreePath,
+            branchName: worktreeInfo.branchName,
+            isAutoGeneratedBranch: !useExistingBranch,
+            runScriptCommand: commands.runScriptCommand,
+            runScriptPostRunCommand: commands.runScriptPostRunCommand,
+            runScriptCleanupCommand: commands.runScriptCleanupCommand,
+          });
+        }
+
+        return workspaceRunScriptService.setCommands(id, {
           runScriptCommand: commands.runScriptCommand,
           runScriptPostRunCommand: commands.runScriptPostRunCommand,
           runScriptCleanupCommand: commands.runScriptCleanupCommand,
-        }),
+        });
+      },
     });
+    worktreeRegistered = true;
 
     const defaultTerminal = await startDefaultTerminal(workspaceId, worktreeInfo.worktreePath);
     if (defaultTerminal?.autoCreated) {
@@ -1094,7 +808,14 @@ export async function initializeWorkspaceWorktree(
     // Ensure any eager session start attempt has settled before cleanup so we
     // do not race stopWorkspaceSessions() with a late startSession() call.
     await agentSessionPromise;
-    await handleWorkspaceInitFailure(workspaceId, toError(error), autoCreatedTerminalId);
+    await handleWorkspaceInitFailure(
+      workspaceId,
+      toError(error),
+      autoCreatedTerminalId,
+      project && createdWorktreeInfo && !worktreeRegistered
+        ? { project, worktreeInfo: createdWorktreeInfo }
+        : undefined
+    );
   } finally {
     if (worktreeCreated) {
       await worktreeLifecycleService.clearInitMode(workspaceId);

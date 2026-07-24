@@ -1,6 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const mockRunStartupScript = vi.hoisted(() => vi.fn());
 const mockFindByIdWithProject = vi.hoisted(() => vi.fn());
 const mockFindById = vi.hoisted(() => vi.fn());
 const mockResetToNew = vi.hoisted(() => vi.fn());
@@ -10,66 +9,62 @@ const mockGetInitMode = vi.hoisted(() => vi.fn());
 const mockSetInitMode = vi.hoisted(() => vi.fn());
 const mockGetWorkspaceInitPolicy = vi.hoisted(() => vi.fn());
 const mockInitializeWorkspaceWorktree = vi.hoisted(() => vi.fn());
+const mockRetryQueuedDispatchAfterWorkspaceReady = vi.hoisted(() => vi.fn());
 const mockExecuteStartupScriptPipeline = vi.hoisted(() => vi.fn());
 const mockReadConfig = vi.hoisted(() => vi.fn());
 
-vi.mock('@/backend/services/run-script', () => ({
-  startupScriptService: {
-    runStartupScript: (...args: unknown[]) => mockRunStartupScript(...args),
-  },
-}));
-
 vi.mock('@/backend/services/workspace', () => ({
-  workspaceDataService: {
-    findByIdWithProject: (...args: unknown[]) => mockFindByIdWithProject(...args),
-    findById: (...args: unknown[]) => mockFindById(...args),
-  },
-  workspaceStateMachine: {
-    resetToNew: (...args: unknown[]) => mockResetToNew(...args),
-    startProvisioning: (...args: unknown[]) => mockStartProvisioning(...args),
-    startProvisioningFromReady: (...args: unknown[]) => mockStartProvisioningFromReady(...args),
-  },
-  worktreeLifecycleService: {
-    getInitMode: (...args: unknown[]) => mockGetInitMode(...args),
-    setInitMode: (...args: unknown[]) => mockSetInitMode(...args),
-  },
   getWorkspaceInitPolicy: (...args: unknown[]) => mockGetWorkspaceInitPolicy(...args),
-}));
-
-vi.mock('@/backend/orchestration/workspace-init.orchestrator', () => ({
-  initializeWorkspaceWorktree: (...args: unknown[]) => mockInitializeWorkspaceWorktree(...args),
-}));
-
-vi.mock('@/backend/orchestration/workspace-init-script-pipeline', () => ({
-  executeStartupScriptPipeline: (...args: unknown[]) => mockExecuteStartupScriptPipeline(...args),
-}));
-
-vi.mock('@/backend/services/factory-config.service', () => ({
-  FactoryConfigService: {
-    readConfig: (...args: unknown[]) => mockReadConfig(...args),
-  },
-}));
-
-vi.mock('@/backend/services/logger.service', () => ({
-  createLogger: () => ({
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  }),
 }));
 
 import { workspaceInitRouter } from './init.trpc';
 
-function createCaller() {
-  return workspaceInitRouter.createCaller({ appContext: {} } as never);
+function createCaller(requestTrust?: {
+  remoteAddress?: string;
+  origin?: string;
+  isLocal: boolean;
+}) {
+  return workspaceInitRouter.createCaller({
+    requestTrust,
+    appContext: {
+      services: {
+        configService: {
+          getCorsConfig: () => ({
+            allowedOrigins: ['http://localhost:3000', 'http://localhost:3001'],
+          }),
+        },
+        createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+        workspaceDataService: {
+          findByIdWithProject: (...args: unknown[]) => mockFindByIdWithProject(...args),
+          findById: (...args: unknown[]) => mockFindById(...args),
+        },
+        workspaceStateMachine: {
+          resetToNew: (...args: unknown[]) => mockResetToNew(...args),
+          startProvisioning: (...args: unknown[]) => mockStartProvisioning(...args),
+          startProvisioningFromReady: (...args: unknown[]) =>
+            mockStartProvisioningFromReady(...args),
+        },
+        worktreeLifecycleService: {
+          getInitMode: (...args: unknown[]) => mockGetInitMode(...args),
+          setInitMode: (...args: unknown[]) => mockSetInitMode(...args),
+        },
+        initializeWorkspaceWorktree: (...args: unknown[]) =>
+          mockInitializeWorkspaceWorktree(...args),
+        retryQueuedDispatchAfterWorkspaceReady: (...args: unknown[]) =>
+          mockRetryQueuedDispatchAfterWorkspaceReady(...args),
+        executeStartupScriptPipeline: (...args: unknown[]) =>
+          mockExecuteStartupScriptPipeline(...args),
+        factoryConfigService: { readConfig: (...args: unknown[]) => mockReadConfig(...args) },
+      },
+    },
+  } as never);
 }
 
 describe('workspaceInitRouter', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockInitializeWorkspaceWorktree.mockResolvedValue(undefined);
-    mockRunStartupScript.mockResolvedValue({ success: true });
+    mockRetryQueuedDispatchAfterWorkspaceReady.mockResolvedValue(undefined);
   });
 
   it('returns initialization status with policy fields', async () => {
@@ -124,25 +119,38 @@ describe('workspaceInitRouter', () => {
     });
   });
 
-  it('retries startup script when worktree exists', async () => {
+  it('retries failed initialization with existing worktree in the background', async () => {
+    const deferredInit = createDeferredPromise<void>();
     const workspace = {
       id: 'w2',
       status: 'FAILED',
       worktreePath: '/tmp/w2',
+      branchName: 'feature/w2',
       project: { id: 'p1' },
     };
+    let initFinished = false;
     mockFindByIdWithProject.mockResolvedValue(workspace);
     mockStartProvisioning.mockResolvedValue({ status: 'PROVISIONING' });
-    mockFindById.mockResolvedValue({ id: 'w2', status: 'READY' });
+    mockInitializeWorkspaceWorktree.mockImplementation(async () => {
+      await deferredInit.promise;
+      initFinished = true;
+    });
+    mockFindById.mockResolvedValue({ id: 'w2', status: 'PROVISIONING' });
 
     const caller = createCaller();
-    await expect(caller.retryInit({ id: 'w2' })).resolves.toEqual({ id: 'w2', status: 'READY' });
+    await expect(caller.retryInit({ id: 'w2' })).resolves.toEqual({
+      id: 'w2',
+      status: 'PROVISIONING',
+    });
 
+    expect(initFinished).toBe(false);
     expect(mockStartProvisioning).toHaveBeenCalledWith('w2', { maxRetries: 3 });
-    expect(mockRunStartupScript).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'w2', status: 'PROVISIONING' }),
-      workspace.project
-    );
+    expect(mockInitializeWorkspaceWorktree).toHaveBeenCalledWith('w2', {
+      branchName: 'feature/w2',
+      provisioningAlreadyStarted: true,
+    });
+    deferredInit.resolve();
+    await deferredInit.promise;
   });
 
   it('validates retry preconditions', async () => {
@@ -169,6 +177,37 @@ describe('workspaceInitRouter', () => {
     await expect(caller.retryInit({ id: 'w1' })).rejects.toMatchObject({
       code: 'TOO_MANY_REQUESTS',
     });
+  });
+
+  it('rejects retry initialization from untrusted requests', async () => {
+    const caller = createCaller({
+      remoteAddress: '203.0.113.10',
+      origin: 'https://attacker.example',
+      isLocal: false,
+    });
+
+    await expect(caller.retryInit({ id: 'w1' })).rejects.toThrow(
+      'trusted local Factory Factory client'
+    );
+    expect(mockFindByIdWithProject).not.toHaveBeenCalled();
+    expect(mockInitializeWorkspaceWorktree).not.toHaveBeenCalled();
+    expect(mockExecuteStartupScriptPipeline).not.toHaveBeenCalled();
+  });
+
+  it('throws TOO_MANY_REQUESTS when failed existing-worktree retry exceeds max retries', async () => {
+    mockFindByIdWithProject.mockResolvedValue({
+      id: 'w2',
+      status: 'FAILED',
+      project: { worktreeBasePath: '/tmp' },
+      worktreePath: '/tmp/w2',
+    });
+    mockStartProvisioning.mockResolvedValue(null);
+
+    const caller = createCaller();
+    await expect(caller.retryInit({ id: 'w2' })).rejects.toMatchObject({
+      code: 'TOO_MANY_REQUESTS',
+    });
+    expect(mockInitializeWorkspaceWorktree).not.toHaveBeenCalled();
   });
 
   it('throws NOT_FOUND when getInitStatus workspace is missing', async () => {
@@ -204,6 +243,14 @@ describe('workspaceInitRouter', () => {
         worktreePath: '/tmp/w3',
       })
     );
+    expect(mockRetryQueuedDispatchAfterWorkspaceReady).toHaveBeenCalledWith('w3', null);
+    const pipelineCallOrder = mockExecuteStartupScriptPipeline.mock.invocationCallOrder[0];
+    const retryDispatchCallOrder =
+      mockRetryQueuedDispatchAfterWorkspaceReady.mock.invocationCallOrder[0];
+    if (pipelineCallOrder === undefined || retryDispatchCallOrder === undefined) {
+      throw new Error('Expected startup pipeline and queued dispatch to be called');
+    }
+    expect(pipelineCallOrder).toBeLessThan(retryDispatchCallOrder);
   });
 
   it('throws TOO_MANY_REQUESTS when READY+warning retry exceeds max retries', async () => {
@@ -222,3 +269,13 @@ describe('workspaceInitRouter', () => {
     });
   });
 });
+
+function createDeferredPromise<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}

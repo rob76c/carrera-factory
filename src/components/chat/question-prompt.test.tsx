@@ -5,6 +5,7 @@ import { flushSync } from 'react-dom';
 import { createRoot } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { UserQuestionRequest } from '@/lib/chat-protocol';
+import { unsafeCoerce } from '@/test-utils/unsafe-coerce';
 import { QuestionPrompt } from './question-prompt';
 
 afterEach(() => {
@@ -66,9 +67,38 @@ describe('QuestionPrompt', () => {
     const optionContainer = optionLabel?.closest('label');
     expect(optionContainer?.className).toContain('p-1.5');
 
-    const iconWrapper = container.querySelector('svg.lucide-circle-question-mark')?.parentElement;
+    const iconWrapper = container.querySelector('[data-slot="question-prompt-icon"]');
     expect(iconWrapper?.className).toContain('hidden');
     expect(iconWrapper?.className).toContain('sm:block');
+
+    root.unmount();
+  });
+
+  it('renders free-form questions with null options without crashing', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const onAnswer = vi.fn();
+
+    const question = unsafeCoerce<UserQuestionRequest>({
+      requestId: 'question-freeform-1',
+      timestamp: '2026-04-28T00:00:00.000Z',
+      questions: [
+        {
+          header: 'Clarify',
+          question: 'What should the agent do next?',
+          options: null,
+        },
+      ],
+    });
+
+    expect(() => {
+      flushSync(() => {
+        root.render(createElement(QuestionPrompt, { question, onAnswer }));
+      });
+    }).not.toThrow();
+
+    expect(container.querySelector('textarea[aria-label="Other response"]')).not.toBeNull();
 
     root.unmount();
   });

@@ -3,21 +3,23 @@ import {
   type AcpProcessHandle,
   fetchCodexModelCatalogFromAppServer,
 } from '@/backend/services/session/service/acp';
-import { userSettingsAccessor } from '@/backend/services/settings';
+import { userSettingsService } from '@/backend/services/settings';
 import { unsafeCoerce } from '@/test-utils/unsafe-coerce';
 import { SessionConfigService } from './session.config.service';
 
+const mockLogger = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
 vi.mock('@/backend/services/logger.service', () => ({
-  createLogger: () => ({
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  }),
+  createLogger: () => mockLogger,
 }));
 
 vi.mock('@/backend/services/settings', () => ({
-  userSettingsAccessor: {
+  userSettingsService: {
     get: vi.fn(),
   },
 }));
@@ -514,6 +516,76 @@ describe('SessionConfigService', () => {
     expect(runtimeManager.setSessionModel).not.toHaveBeenCalled();
   });
 
+  it('skips thinking budget when token count is not in ACP thought-level options', async () => {
+    const configOptions = [
+      {
+        id: 'effort',
+        name: 'Effort',
+        type: 'select',
+        category: 'thought_level',
+        currentValue: 'default',
+        options: [
+          { value: 'default', name: 'Default' },
+          { value: 'low', name: 'Low' },
+          { value: 'medium', name: 'Medium' },
+          { value: 'high', name: 'High' },
+        ],
+      },
+    ];
+    runtimeManager.getClient.mockReturnValue(
+      unsafeCoerce({
+        provider: 'CLAUDE',
+        providerSessionId: 'provider-session-1',
+        configOptions,
+      })
+    );
+
+    await service.setSessionThinkingBudget('session-1', 10_000);
+
+    expect(runtimeManager.setConfigOption).not.toHaveBeenCalled();
+    expect(mockLogger.debug).toHaveBeenCalledWith(
+      'Skipping unsupported thinking budget for ACP session',
+      expect.objectContaining({
+        sessionId: 'session-1',
+        provider: 'CLAUDE',
+        maxTokens: 10_000,
+        availableValues: ['default', 'low', 'medium', 'high'],
+      })
+    );
+  });
+
+  it('sets thinking budget when token count is in ACP thought-level options', async () => {
+    const configOptions = [
+      {
+        id: 'thinking_budget',
+        name: 'Thinking Budget',
+        type: 'select',
+        category: 'thought_level',
+        currentValue: '5000',
+        options: [
+          { value: '5000', name: '5,000 tokens' },
+          { value: '10000', name: '10,000 tokens' },
+        ],
+      },
+    ];
+    runtimeManager.getClient.mockReturnValue(
+      unsafeCoerce({
+        provider: 'CLAUDE',
+        providerSessionId: 'provider-session-1',
+        configOptions,
+      })
+    );
+    runtimeManager.setConfigOption.mockResolvedValue(configOptions);
+
+    await service.setSessionThinkingBudget('session-1', 10_000);
+
+    expect(runtimeManager.setConfigOption).toHaveBeenCalledWith(
+      'session-1',
+      'thinking_budget',
+      '10000'
+    );
+  });
+
   it('routes model config updates through ACP setSessionModel', async () => {
     runtimeManager.getClient.mockReturnValue(
       unsafeCoerce({
@@ -592,6 +664,86 @@ describe('SessionConfigService', () => {
 
     expect(runtimeManager.setSessionMode).toHaveBeenCalledWith('session-1', 'acceptEdits');
     expect(runtimeManager.setConfigOption).not.toHaveBeenCalled();
+  });
+
+  it('tracks whitespace-only reasoning effort fallback as settings sourced', async () => {
+    vi.mocked(userSettingsService.get).mockResolvedValue(
+      unsafeCoerce({
+        defaultCodexReasoningEffort: 'high',
+      })
+    );
+    runtimeManager.getClient.mockReturnValue(
+      unsafeCoerce({
+        provider: 'CODEX',
+        providerSessionId: 'provider-codex-1',
+        configOptions: [
+          {
+            id: 'reasoning_effort',
+            name: 'Reasoning Effort',
+            type: 'select',
+            category: 'thought_level',
+            currentValue: 'low',
+            options: [{ value: 'low', name: 'Low' }],
+          },
+        ],
+      })
+    );
+
+    await service.setSessionReasoningEffort('session-1', '   ');
+
+    expect(runtimeManager.setConfigOption).not.toHaveBeenCalled();
+    expect(mockLogger.debug).toHaveBeenCalledWith(
+      'Skipping unsupported reasoning effort for ACP session',
+      expect.objectContaining({
+        reasoningEffort: 'high',
+        source: 'settings',
+      })
+    );
+  });
+
+  it('applies configured reasoning effort to a new ACP handle without immediate emit when requested', async () => {
+    vi.mocked(userSettingsService.get).mockResolvedValue(
+      unsafeCoerce({
+        defaultCodexReasoningEffort: 'high',
+      })
+    );
+    const handle = unsafeCoerce<AcpProcessHandle>({
+      provider: 'CODEX',
+      providerSessionId: 'provider-codex-1',
+      configOptions: [
+        {
+          id: 'reasoning_effort',
+          name: 'Reasoning Effort',
+          type: 'select',
+          category: 'thought_level',
+          currentValue: 'medium',
+          options: [
+            { value: 'medium', name: 'Medium' },
+            { value: 'high', name: 'High' },
+          ],
+        },
+      ],
+    });
+    runtimeManager.setConfigOption.mockResolvedValue([
+      {
+        ...handle.configOptions[0],
+        currentValue: 'high',
+      },
+    ]);
+
+    await service.applyConfiguredReasoningEffort('session-1', handle, {
+      persistSnapshot: false,
+      emitUpdates: false,
+    });
+
+    expect(runtimeManager.setConfigOption).toHaveBeenCalledWith(
+      'session-1',
+      'reasoning_effort',
+      'high'
+    );
+    expect(handle.configOptions[0]?.currentValue).toBe('high');
+    expect(repository.updateSession).not.toHaveBeenCalled();
+    expect(sessionDomain.emitDelta).not.toHaveBeenCalled();
   });
 
   it('updates cached config snapshot when setting config on inactive session', async () => {
@@ -730,7 +882,7 @@ describe('SessionConfigService', () => {
   });
 
   it('applies configured permission preset for CODEX sessions from user settings', async () => {
-    vi.mocked(userSettingsAccessor.get).mockResolvedValue(
+    vi.mocked(userSettingsService.get).mockResolvedValue(
       unsafeCoerce({
         ratchetPermissions: 'YOLO',
         defaultWorkspacePermissions: 'RELAXED',
@@ -798,7 +950,7 @@ describe('SessionConfigService', () => {
   });
 
   it('applies configured permission preset for CLAUDE sessions that expose permission config', async () => {
-    vi.mocked(userSettingsAccessor.get).mockResolvedValue(
+    vi.mocked(userSettingsService.get).mockResolvedValue(
       unsafeCoerce({
         ratchetPermissions: 'YOLO',
         defaultWorkspacePermissions: 'YOLO',

@@ -35,16 +35,26 @@ let tempRootDir: string;
 
 let createTerminalUpgradeHandler: typeof import('./terminal.handler').createTerminalUpgradeHandler;
 let createDevLogsUpgradeHandler: typeof import('./dev-logs.handler').createDevLogsUpgradeHandler;
+let createPostRunLogsUpgradeHandler: typeof import('./post-run-logs.handler').createPostRunLogsUpgradeHandler;
 let createSnapshotsUpgradeHandler: typeof import('./snapshots.handler').createSnapshotsUpgradeHandler;
 let createChatUpgradeHandler: typeof import('./chat.handler').createChatUpgradeHandler;
 
 let terminalConnections: typeof import('./terminal.handler').terminalConnections;
-let snapshotConnections: typeof import('./snapshots.handler').snapshotConnections;
-let workspaceSnapshotStore: typeof import('@/backend/services/workspace-snapshot-store.service').workspaceSnapshotStore;
+let disposeSnapshotsHandlerState: typeof import('./snapshots.handler').disposeSnapshotsHandlerState;
+let disposeChatTransportForApplication: typeof import('./chat-connection-registry').disposeChatTransportForApplication;
+let workspaceSnapshotStore: typeof import('@/backend/services/workspace').workspaceSnapshotStore;
+let workspaceQueryService: typeof import('@/backend/services/workspace').workspaceQueryService;
+let workspaceDataService: typeof import('@/backend/services/workspace').workspaceDataService;
+let sessionDataService: typeof import('@/backend/services/session').sessionDataService;
+let terminalSessionService: typeof import('@/backend/services/terminal').terminalSessionService;
+let sessionEventBus: typeof import('@/backend/services/session').sessionEventBus;
+let snapshotReconciliationService: typeof import('@/backend/orchestration/snapshot-reconciliation.orchestrator').snapshotReconciliationService;
 
 let counter = 0;
+const allowedOrigin = 'http://localhost:3000';
 const openServers = new Set<WebSocketTestServer>();
 const openSockets = new Set<WebSocket>();
+const transportApplications = new Set<AppContext>();
 
 beforeAll(async () => {
   db = await createIntegrationDatabase();
@@ -55,14 +65,28 @@ beforeAll(async () => {
     await vi.importActual<typeof import('./terminal.handler')>('./terminal.handler'));
   ({ createDevLogsUpgradeHandler } =
     await vi.importActual<typeof import('./dev-logs.handler')>('./dev-logs.handler'));
-  ({ createSnapshotsUpgradeHandler, snapshotConnections } =
+  ({ createPostRunLogsUpgradeHandler } =
+    await vi.importActual<typeof import('./post-run-logs.handler')>('./post-run-logs.handler'));
+  ({ createSnapshotsUpgradeHandler, disposeSnapshotsHandlerState } =
     await vi.importActual<typeof import('./snapshots.handler')>('./snapshots.handler'));
   ({ createChatUpgradeHandler } =
     await vi.importActual<typeof import('./chat.handler')>('./chat.handler'));
-  ({ workspaceSnapshotStore } = await vi.importActual<
-    typeof import('@/backend/services/workspace-snapshot-store.service')
-  >('@/backend/services/workspace-snapshot-store.service'));
-});
+  ({ disposeChatTransportForApplication } = await vi.importActual<
+    typeof import('./chat-connection-registry')
+  >('./chat-connection-registry'));
+  ({ workspaceDataService, workspaceQueryService, workspaceSnapshotStore } = await vi.importActual<
+    typeof import('@/backend/services/workspace')
+  >('@/backend/services/workspace'));
+  ({ sessionDataService, sessionEventBus } = await vi.importActual<
+    typeof import('@/backend/services/session')
+  >('@/backend/services/session'));
+  ({ terminalSessionService } = await vi.importActual<typeof import('@/backend/services/terminal')>(
+    '@/backend/services/terminal'
+  ));
+  ({ snapshotReconciliationService } = await vi.importActual<
+    typeof import('@/backend/orchestration/snapshot-reconciliation.orchestrator')
+  >('@/backend/orchestration/snapshot-reconciliation.orchestrator'));
+}, 30_000);
 
 afterEach(async () => {
   for (const ws of openSockets) {
@@ -76,7 +100,11 @@ afterEach(async () => {
   }
 
   terminalConnections.clear();
-  snapshotConnections.clear();
+  for (const application of transportApplications) {
+    disposeChatTransportForApplication(application);
+    disposeSnapshotsHandlerState(application);
+  }
+  transportApplications.clear();
   workspaceSnapshotStore.clear();
 
   await clearIntegrationDatabase(prisma);
@@ -126,6 +154,7 @@ class FakeTerminalService {
   );
 
   destroyTerminal = vi.fn();
+  getTerminal = vi.fn(() => null as { outputBuffer: string } | null);
   getTerminalsForWorkspace = vi.fn(
     () => [] as Array<{ id: string; createdAt: Date; outputBuffer: string }>
   );
@@ -188,27 +217,20 @@ function createLogger() {
   };
 }
 
-function createChatAppContext(worktreeBaseDir: string) {
-  const connections = new Map<
-    string,
-    { dbSessionId: string | null; workingDir: string | null; ws: WebSocket }
-  >();
+function createConfigService() {
+  return {
+    getCorsConfig: () => ({ allowedOrigins: [allowedOrigin] }),
+  };
+}
 
+function trackTransportApplication(application: AppContext): AppContext {
+  transportApplications.add(application);
+  return application;
+}
+
+function createChatAppContext(worktreeBaseDir: string) {
   const appContext = unsafeCoerce<AppContext>({
     services: {
-      chatConnectionService: {
-        values: () => connections.values(),
-        get: (connectionId: string) => connections.get(connectionId),
-        register: (
-          connectionId: string,
-          connectionInfo: { ws: WebSocket; dbSessionId: string | null; workingDir: string | null }
-        ) => {
-          connections.set(connectionId, connectionInfo);
-        },
-        unregister: (connectionId: string) => {
-          connections.delete(connectionId);
-        },
-      },
       chatEventForwarderService: {
         setupClientEvents: vi.fn(),
         setupWorkspaceNotifications: vi.fn(),
@@ -219,6 +241,7 @@ function createChatAppContext(worktreeBaseDir: string) {
         tryDispatchNextMessage: vi.fn(),
       },
       configService: {
+        ...createConfigService(),
         getDebugConfig: () => ({ chatWebSocket: false }),
         getWorktreeBaseDir: () => worktreeBaseDir,
       },
@@ -228,6 +251,7 @@ function createChatAppContext(worktreeBaseDir: string) {
         initSession: vi.fn(),
         log: vi.fn(),
       },
+      sessionEventBus,
       sessionService: {
         getOrCreateClient: vi.fn(),
         getOrCreateSessionClient: vi.fn(),
@@ -237,6 +261,8 @@ function createChatAppContext(worktreeBaseDir: string) {
       },
     },
   });
+
+  trackTransportApplication(appContext);
 
   return appContext;
 }
@@ -252,7 +278,7 @@ async function connectAndCaptureMessages(url: string): Promise<{
   ws: WebSocket;
 }> {
   const messages: unknown[] = [];
-  const ws = new WebSocket(url);
+  const ws = new WebSocket(url, { headers: { Origin: allowedOrigin } });
   ws.on('message', (data) => {
     const payload = Buffer.isBuffer(data) ? data.toString() : String(data);
     messages.push(JSON.parse(payload));
@@ -267,6 +293,96 @@ async function connectAndCaptureMessages(url: string): Promise<{
 }
 
 describe('websocket integration', () => {
+  it.each([
+    {
+      name: 'terminal',
+      path: '/terminal',
+      url: '/terminal?workspaceId=workspace-1',
+      createHandler: () =>
+        createTerminalUpgradeHandler(
+          unsafeCoerce<AppContext>({
+            services: {
+              configService: createConfigService(),
+              createLogger: () => createLogger(),
+              sessionDataService,
+              terminalSessionService,
+              terminalService: new FakeTerminalService(),
+              workspaceDataService,
+            },
+          })
+        ),
+    },
+    {
+      name: 'chat',
+      path: '/chat',
+      url: '/chat',
+      createHandler: () => createChatUpgradeHandler(createChatAppContext(tempRootDir)),
+    },
+    {
+      name: 'dev logs',
+      path: '/dev-logs',
+      url: '/dev-logs?workspaceId=workspace-1',
+      createHandler: () =>
+        createDevLogsUpgradeHandler(
+          unsafeCoerce<AppContext>({
+            services: {
+              configService: createConfigService(),
+              createLogger: () => createLogger(),
+              runScriptService: new FakeRunScriptService(),
+            },
+          })
+        ),
+    },
+    {
+      name: 'post-run logs',
+      path: '/post-run-logs',
+      url: '/post-run-logs?workspaceId=workspace-1',
+      createHandler: () =>
+        createPostRunLogsUpgradeHandler(
+          unsafeCoerce<AppContext>({
+            services: {
+              configService: createConfigService(),
+              createLogger: () => createLogger(),
+              runScriptService: new FakeRunScriptService(),
+            },
+          })
+        ),
+    },
+    {
+      name: 'snapshots',
+      path: '/snapshots',
+      url: '/snapshots?projectId=project-1',
+      createHandler: () =>
+        createSnapshotsUpgradeHandler(
+          trackTransportApplication(
+            unsafeCoerce<AppContext>({
+              services: {
+                configService: createConfigService(),
+                createLogger: () => createLogger(),
+                workspaceQueryService,
+                workspaceSnapshotStore,
+              },
+              lifecycle: { snapshotReconciliation: snapshotReconciliationService },
+            })
+          )
+        ),
+    },
+  ])('rejects unauthorized Origin for $name websocket upgrades', async ({
+    createHandler,
+    path,
+    url,
+  }) => {
+    const server = await createWebSocketTestServer(createHandler(), path);
+    openServers.add(server);
+
+    const ws = new WebSocket(`ws://127.0.0.1:${server.port}${url}`, {
+      headers: { Origin: 'https://attacker.example' },
+    });
+    const error = await waitForSocketError(ws);
+
+    expect(error.message).toContain('Unexpected server response: 400');
+  });
+
   it('terminal handler supports create + output flow over a real websocket upgrade', async () => {
     const project = await createProjectFixture();
     const worktreePath = join(tempRootDir, nextId('worktree'));
@@ -277,8 +393,12 @@ describe('websocket integration', () => {
 
     const appContext = unsafeCoerce<AppContext>({
       services: {
+        configService: createConfigService(),
         createLogger: () => createLogger(),
+        sessionDataService,
+        terminalSessionService,
         terminalService: fakeTerminalService,
+        workspaceDataService,
       },
     });
 
@@ -287,7 +407,8 @@ describe('websocket integration', () => {
     openServers.add(server);
 
     const ws = await connectWebSocket(
-      `ws://127.0.0.1:${server.port}/terminal?workspaceId=${workspace.id}`
+      `ws://127.0.0.1:${server.port}/terminal?workspaceId=${workspace.id}`,
+      { headers: { Origin: allowedOrigin } }
     );
     openSockets.add(ws);
 
@@ -326,8 +447,12 @@ describe('websocket integration', () => {
     const fakeTerminalService = new FakeTerminalService();
     const appContext = unsafeCoerce<AppContext>({
       services: {
+        configService: createConfigService(),
         createLogger: () => createLogger(),
+        sessionDataService,
+        terminalSessionService,
         terminalService: fakeTerminalService,
+        workspaceDataService,
       },
     });
 
@@ -335,7 +460,9 @@ describe('websocket integration', () => {
     const server = await createWebSocketTestServer(handler, '/terminal');
     openServers.add(server);
 
-    const ws = new WebSocket(`ws://127.0.0.1:${server.port}/terminal`);
+    const ws = new WebSocket(`ws://127.0.0.1:${server.port}/terminal`, {
+      headers: { Origin: allowedOrigin },
+    });
     const error = await waitForSocketError(ws);
 
     expect(error.message).toContain('Unexpected server response: 400');
@@ -349,6 +476,7 @@ describe('websocket integration', () => {
 
     const appContext = unsafeCoerce<AppContext>({
       services: {
+        configService: createConfigService(),
         createLogger: () => createLogger(),
         runScriptService,
       },
@@ -420,9 +548,14 @@ describe('websocket integration', () => {
 
     const appContext = unsafeCoerce<AppContext>({
       services: {
+        configService: createConfigService(),
         createLogger: () => createLogger(),
+        workspaceQueryService,
+        workspaceSnapshotStore,
       },
+      lifecycle: { snapshotReconciliation: snapshotReconciliationService },
     });
+    trackTransportApplication(appContext);
 
     const handler = createSnapshotsUpgradeHandler(appContext);
     const server = await createWebSocketTestServer(handler, '/snapshots');
@@ -434,11 +567,13 @@ describe('websocket integration', () => {
     openSockets.add(ws);
 
     await vi.waitFor(() => {
-      expect(messages).toContainEqual({
-        type: 'snapshot_full',
-        projectId,
-        entries: expect.arrayContaining([expect.objectContaining({ workspaceId })]),
-      });
+      expect(messages).toContainEqual(
+        expect.objectContaining({
+          type: 'snapshot_full',
+          projectId,
+          entries: expect.arrayContaining([expect.objectContaining({ workspaceId })]),
+        })
+      );
     });
 
     workspaceSnapshotStore.upsert(
@@ -453,19 +588,23 @@ describe('websocket integration', () => {
     );
 
     await vi.waitFor(() => {
-      expect(messages).toContainEqual({
-        type: 'snapshot_changed',
-        workspaceId,
-        entry: expect.objectContaining({
-          prUrl: 'https://github.com/acme/repo/pull/123',
-        }),
-      });
+      expect(messages).toContainEqual(
+        expect.objectContaining({
+          type: 'snapshot_changed',
+          workspaceId,
+          entry: expect.objectContaining({
+            prUrl: 'https://github.com/acme/repo/pull/123',
+          }),
+        })
+      );
     });
 
     workspaceSnapshotStore.remove(workspaceId);
 
     await vi.waitFor(() => {
-      expect(messages).toContainEqual({ type: 'snapshot_removed', workspaceId });
+      expect(messages).toContainEqual(
+        expect.objectContaining({ type: 'snapshot_removed', workspaceId })
+      );
     });
   });
 
@@ -479,7 +618,9 @@ describe('websocket integration', () => {
     const server = await createWebSocketTestServer(handler, '/chat');
     openServers.add(server);
 
-    const ws = await connectWebSocket(`ws://127.0.0.1:${server.port}/chat`);
+    const ws = await connectWebSocket(`ws://127.0.0.1:${server.port}/chat`, {
+      headers: { Origin: allowedOrigin },
+    });
     openSockets.add(ws);
 
     ws.send('{invalid-json');
@@ -500,7 +641,9 @@ describe('websocket integration', () => {
     const server = await createWebSocketTestServer(handler, '/chat');
     openServers.add(server);
 
-    const ws = new WebSocket(`ws://127.0.0.1:${server.port}/chat?workingDir=../outside`);
+    const ws = new WebSocket(`ws://127.0.0.1:${server.port}/chat?workingDir=../outside`, {
+      headers: { Origin: allowedOrigin },
+    });
     const error = await waitForSocketError(ws);
 
     expect(error.message).toContain('Unexpected server response: 400');
@@ -519,7 +662,8 @@ describe('websocket integration', () => {
     openServers.add(server);
 
     const ws = await connectWebSocket(
-      `ws://127.0.0.1:${server.port}/chat?workingDir=${encodeURIComponent(validWorkingDir)}`
+      `ws://127.0.0.1:${server.port}/chat?workingDir=${encodeURIComponent(validWorkingDir)}`,
+      { headers: { Origin: allowedOrigin } }
     );
     openSockets.add(ws);
 
@@ -544,8 +688,12 @@ describe('websocket integration', () => {
     const fakeTerminalService = new FakeTerminalService();
     const appContext = unsafeCoerce<AppContext>({
       services: {
+        configService: createConfigService(),
         createLogger: () => createLogger(),
+        sessionDataService,
+        terminalSessionService,
         terminalService: fakeTerminalService,
+        workspaceDataService,
       },
     });
 
@@ -554,7 +702,8 @@ describe('websocket integration', () => {
     openServers.add(server);
 
     const ws = await connectWebSocket(
-      `ws://127.0.0.1:${server.port}/terminal?workspaceId=${workspace.id}`
+      `ws://127.0.0.1:${server.port}/terminal?workspaceId=${workspace.id}`,
+      { headers: { Origin: allowedOrigin } }
     );
     openSockets.add(ws);
 

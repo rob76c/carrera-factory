@@ -53,6 +53,10 @@ class MockWebSocket {
     this.onopen?.({ type: 'open' });
   }
 
+  simulateMessage(data: unknown) {
+    this.onmessage?.({ type: 'message', data: JSON.stringify(data) });
+  }
+
   failNextSends(count: number) {
     this.failSendCount = count;
   }
@@ -71,12 +75,14 @@ function getLastSocket(): MockWebSocket {
 interface TransportHarnessProps {
   url: string | null;
   onConnected?: () => void;
+  onMessage?: (message: unknown) => void;
   transportRef: { current: UseWebSocketTransportReturn | null };
 }
 
-function TransportHarness({ url, onConnected, transportRef }: TransportHarnessProps) {
+function TransportHarness({ url, onConnected, onMessage, transportRef }: TransportHarnessProps) {
   const transport = useWebSocketTransport({
     url,
+    onMessage,
     onConnected,
     queuePolicy: 'replay',
   });
@@ -84,24 +90,39 @@ function TransportHarness({ url, onConnected, transportRef }: TransportHarnessPr
   return null;
 }
 
-function createHarness(options: { onConnected?: () => void } = {}) {
+function createHarness(
+  options: {
+    initialUrl?: string | null;
+    onConnected?: () => void;
+    onMessage?: (message: unknown) => void;
+  } = {}
+) {
   const container = document.createElement('div');
   document.body.appendChild(container);
   const root = createRoot(container);
   const transportRef = { current: null as UseWebSocketTransportReturn | null };
-
-  flushSync(() => {
+  const render = (url: string | null) => {
     root.render(
       createElement(TransportHarness, {
-        url: 'ws://localhost:3000/chat',
+        url,
         onConnected: options.onConnected,
+        onMessage: options.onMessage,
         transportRef,
       })
     );
+  };
+
+  flushSync(() => {
+    render(options.initialUrl ?? 'ws://localhost:3000/chat');
   });
 
   return {
     transportRef,
+    rerenderUrl: (url: string | null) => {
+      flushSync(() => {
+        render(url);
+      });
+    },
     cleanup: () => {
       flushSync(() => {
         root.unmount();
@@ -273,6 +294,174 @@ describe('useWebSocketTransport replay queue', () => {
 
     expect(transport.send({ type: 'stop', id: 'fresh-stop' })).toBe(false);
     expect(extractMessageIds(socket)).toEqual(['queued-first', 'fresh-stop']);
+
+    harness.cleanup();
+  });
+
+  it('drops messages from sockets superseded by a URL change', async () => {
+    const receivedMessages: unknown[] = [];
+    const harness = createHarness({
+      initialUrl: 'ws://localhost:3000/chat?sessionId=one',
+      onMessage: (message) => {
+        receivedMessages.push(message);
+      },
+    });
+    await flushEffects();
+
+    const firstSocket = getLastSocket();
+    flushSync(() => {
+      firstSocket.simulateOpen();
+    });
+
+    harness.rerenderUrl('ws://localhost:3000/chat?sessionId=two');
+    await flushEffects();
+
+    const secondSocket = getLastSocket();
+    expect(secondSocket).not.toBe(firstSocket);
+
+    flushSync(() => {
+      firstSocket.simulateMessage({ type: 'session_snapshot', session: 'old' });
+      secondSocket.simulateOpen();
+      secondSocket.simulateMessage({ type: 'session_snapshot', session: 'new' });
+    });
+
+    expect(receivedMessages).toEqual([{ type: 'session_snapshot', session: 'new' }]);
+
+    harness.cleanup();
+  });
+
+  it('reports disconnected while a URL-change replacement socket is still connecting', async () => {
+    const harness = createHarness({ initialUrl: 'ws://localhost:3000/chat?sessionId=one' });
+    await flushEffects();
+
+    const firstSocket = getLastSocket();
+    flushSync(() => {
+      firstSocket.simulateOpen();
+    });
+    expect(harness.transportRef.current?.connected).toBe(true);
+
+    harness.rerenderUrl('ws://localhost:3000/chat?sessionId=two');
+    await flushEffects();
+
+    // The old socket is closed and the new one has not opened yet. The state
+    // update from the effect cleanup lands on the next scheduler tick.
+    await vi.waitFor(() => {
+      expect(harness.transportRef.current?.connected).toBe(false);
+    });
+
+    const secondSocket = getLastSocket();
+    expect(secondSocket).not.toBe(firstSocket);
+    flushSync(() => {
+      secondSocket.simulateOpen();
+    });
+    expect(harness.transportRef.current?.connected).toBe(true);
+
+    harness.cleanup();
+  });
+
+  it('exposes gaveUp after exhausting reconnect attempts and resets on manual reconnect', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+
+    const harness = createHarness();
+    await flushEffects();
+
+    flushSync(() => {
+      getLastSocket().simulateOpen();
+    });
+    expect(harness.transportRef.current?.gaveUp).toBe(false);
+
+    // Each close schedules one reconnect until the attempt budget is spent.
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      flushSync(() => {
+        getLastSocket().close();
+      });
+      expect(harness.transportRef.current?.gaveUp).toBe(false);
+      await vi.advanceTimersByTimeAsync(40_000);
+      await flushEffects();
+    }
+
+    // The budget is exhausted, so this close must surface the give-up state.
+    flushSync(() => {
+      getLastSocket().close();
+    });
+    expect(harness.transportRef.current?.gaveUp).toBe(true);
+
+    flushSync(() => {
+      harness.transportRef.current?.reconnect();
+    });
+    expect(harness.transportRef.current?.gaveUp).toBe(false);
+
+    harness.cleanup();
+  });
+
+  it('resets gaveUp when the url becomes null so consumers never see stale give-up state', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+
+    const harness = createHarness();
+    await flushEffects();
+
+    flushSync(() => {
+      getLastSocket().simulateOpen();
+    });
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      flushSync(() => {
+        getLastSocket().close();
+      });
+      await vi.advanceTimersByTimeAsync(40_000);
+      await flushEffects();
+    }
+    flushSync(() => {
+      getLastSocket().close();
+    });
+    expect(harness.transportRef.current?.gaveUp).toBe(true);
+
+    // Dropping the URL means no connection is desired, so there is nothing
+    // to have given up on; a later reconnect starts a fresh attempt budget.
+    harness.rerenderUrl(null);
+    await vi.advanceTimersByTimeAsync(0);
+    await flushEffects();
+    expect(harness.transportRef.current?.gaveUp).toBe(false);
+
+    // Restoring the URL must grant a fresh attempt budget: the first failure
+    // schedules a retry instead of immediately giving up again.
+    harness.rerenderUrl('ws://localhost:3000/chat');
+    await vi.advanceTimersByTimeAsync(0);
+    await flushEffects();
+    flushSync(() => {
+      getLastSocket().close();
+    });
+    expect(harness.transportRef.current?.gaveUp).toBe(false);
+
+    harness.cleanup();
+  });
+
+  it('ignores open events from sockets superseded by a URL change', async () => {
+    let connectedCount = 0;
+    const harness = createHarness({
+      initialUrl: 'ws://localhost:3000/chat?sessionId=one',
+      onConnected: () => {
+        connectedCount += 1;
+      },
+    });
+    await flushEffects();
+
+    const firstSocket = getLastSocket();
+
+    harness.rerenderUrl('ws://localhost:3000/chat?sessionId=two');
+    await flushEffects();
+
+    const secondSocket = getLastSocket();
+    expect(secondSocket).not.toBe(firstSocket);
+
+    flushSync(() => {
+      firstSocket.simulateOpen();
+      secondSocket.simulateOpen();
+    });
+
+    expect(connectedCount).toBe(1);
 
     harness.cleanup();
   });

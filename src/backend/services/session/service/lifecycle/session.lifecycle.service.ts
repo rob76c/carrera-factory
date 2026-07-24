@@ -1,5 +1,5 @@
 import { ClaudeMdService } from '@/backend/services/claude-md.service';
-import { githubCLIService, prSnapshotService } from '@/backend/services/github';
+import { configService } from '@/backend/services/config.service';
 import { createLogger } from '@/backend/services/logger.service';
 import type { AgentSessionRecord } from '@/backend/services/session/resources/agent-session.accessor';
 import type {
@@ -9,22 +9,30 @@ import type {
   AcpRuntimeManager,
   PermissionPreset,
 } from '@/backend/services/session/service/acp';
+import { getChildWorkspaceMcpServerConfig } from '@/backend/services/session/service/acp/child-workspace-mcp-server';
 import type {
+  RatchetSessionEndOutcome,
   SessionAutoIterationExitBridge,
+  SessionLifecycleMessageQueueBridge,
   SessionLifecycleWorkspaceBridge,
 } from '@/backend/services/session/service/bridges';
-import { chatConnectionService } from '@/backend/services/session/service/chat/chat-connection.service';
 import { acpTraceLogger } from '@/backend/services/session/service/logging/acp-trace-logger.service';
 import type { SessionDomainService } from '@/backend/services/session/service/session-domain.service';
-import { userSettingsAccessor } from '@/backend/services/settings';
-import { workspaceAccessor } from '@/backend/services/workspace';
-import type { SessionDeltaEvent } from '@/shared/acp-protocol';
+import { sessionEventBus } from '@/backend/services/session/service/session-event-bus';
+import { userSettingsService } from '@/backend/services/settings';
+import { workspaceDataService, workspaceNotificationService } from '@/backend/services/workspace';
+import type { AgentMessage, QueuedMessage, SessionDeltaEvent } from '@/shared/acp-protocol';
 import type { ChatBarCapabilities } from '@/shared/chat-capabilities';
-import { SessionStatus } from '@/shared/core';
+import { SessionStatus, type WorkspaceStatus } from '@/shared/core';
 import {
   createInitialSessionRuntimeState,
   type SessionRuntimeState,
 } from '@/shared/session-runtime';
+import {
+  buildWorkspaceNotificationMessageText,
+  WORKSPACE_NOTIFICATION_MESSAGE_ID_PREFIX,
+  workspaceNotificationMessageId,
+} from '@/shared/workspace-notifications';
 import type { AcpEventProcessor } from './acp-event-processor';
 import { closedSessionPersistenceService } from './closed-session-persistence.service';
 import type {
@@ -37,9 +45,14 @@ import type { SessionPromptBuilder } from './session.prompt-builder';
 import type { SessionPromptTurnCompletionService } from './session.prompt-turn-completion.service';
 import type { SessionRepository } from './session.repository';
 import type { SessionRetryService } from './session.retry.service';
+import { maybeDiscoverPROnSessionEnd as maybeDiscoverPROnSessionEndHelper } from './session-pr-discovery.service';
+import { isStaleLoadingRuntime } from './session-runtime-state.helpers';
 
 const logger = createLogger('session');
-const STALE_LOADING_RUNTIME_MAX_AGE_MS = 30_000;
+
+function getPersistedStatusForExitCode(exitCode: number | null): SessionStatus {
+  return exitCode === 0 ? SessionStatus.COMPLETED : SessionStatus.FAILED;
+}
 
 type SessionStartupModePreset = 'non_interactive' | 'plan';
 
@@ -49,6 +62,8 @@ type SessionContext = {
   systemPrompt: string | undefined;
   model: string;
   workspaceId: string;
+  workspaceStatus: WorkspaceStatus;
+  parentWorkspaceId?: string | null;
 };
 
 type GetOrCreateSessionClientOptions = {
@@ -59,6 +74,7 @@ type GetOrCreateSessionClientOptions = {
 
 type StartSessionOptions = {
   initialPrompt?: string;
+  initialPromptIsDefault?: boolean;
   startupModePreset?: SessionStartupModePreset;
 };
 
@@ -78,6 +94,8 @@ export type SessionLifecycleServiceDependencies = {
   acpEventProcessor: AcpEventProcessor;
   promptTurnCompletionService: SessionPromptTurnCompletionService;
   retryService: SessionRetryService;
+  onBeforeStopSession?: (sessionId: string) => void;
+  onSessionExit?: (sessionId: string) => void;
 };
 
 export class SessionLifecycleService {
@@ -90,7 +108,13 @@ export class SessionLifecycleService {
   private readonly acpEventProcessor: AcpEventProcessor;
   private readonly promptTurnCompletionService: SessionPromptTurnCompletionService;
   private readonly retryService: SessionRetryService;
+  private readonly onBeforeStopSession?: (sessionId: string) => void;
+  private readonly onSessionExit?: (sessionId: string) => void;
+  private readonly stoppingSessions = new Set<string>();
+  private readonly stopGenerations = new Map<string, number>();
+  private readonly clientCreationOperations = new Map<string, Set<Promise<AcpProcessHandle>>>();
   private workspaceBridge: SessionLifecycleWorkspaceBridge | null = null;
+  private messageQueueBridge: SessionLifecycleMessageQueueBridge | null = null;
   private autoIterationExitBridge: SessionAutoIterationExitBridge | null = null;
 
   constructor(options: SessionLifecycleServiceDependencies) {
@@ -103,13 +127,17 @@ export class SessionLifecycleService {
     this.acpEventProcessor = options.acpEventProcessor;
     this.promptTurnCompletionService = options.promptTurnCompletionService;
     this.retryService = options.retryService;
+    this.onBeforeStopSession = options.onBeforeStopSession;
+    this.onSessionExit = options.onSessionExit;
   }
 
   configure(bridges: {
     workspace: SessionLifecycleWorkspaceBridge;
+    messageQueue?: SessionLifecycleMessageQueueBridge;
     autoIterationExit?: SessionAutoIterationExitBridge;
   }): void {
     this.workspaceBridge = bridges.workspace;
+    this.messageQueueBridge = bridges.messageQueue ?? null;
     this.autoIterationExitBridge = bridges.autoIterationExit ?? null;
   }
 
@@ -118,14 +146,13 @@ export class SessionLifecycleService {
     sendSessionMessage: SendSessionMessage,
     options?: StartSessionOptions
   ): Promise<void> {
+    const stopGeneration = this.getStopGeneration(sessionId);
     const session = await this.repository.getSessionById(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
     }
 
-    if (this.runtimeManager.isStopInProgress(sessionId)) {
-      throw new Error('Session is currently being stopped');
-    }
+    this.assertStartupAllowed(sessionId, stopGeneration);
 
     const existingClient = this.runtimeManager.getClient(sessionId);
     if (existingClient) {
@@ -134,23 +161,32 @@ export class SessionLifecycleService {
 
     const startupModePreset = options?.startupModePreset;
 
-    const { handle, resolvedPreset } = await this.getOrCreateAcpSessionClient(
-      sessionId,
-      {},
-      session
-    );
+    const { handle, resolvedPreset, dispatchableNotificationCount } =
+      await this.getOrCreateAcpSessionClient(sessionId, {}, session, stopGeneration);
+    this.assertStartupAllowed(sessionId, stopGeneration);
     await this.applyStartupModePreset(sessionId, handle, startupModePreset, session.workflow);
+    this.assertStartupAllowed(sessionId, stopGeneration);
     await this.applyConfiguredPermissionPreset(sessionId, session, handle, resolvedPreset);
+    this.assertStartupAllowed(sessionId, stopGeneration);
+    await this.dispatchQueuedNotificationsIfNeeded(sessionId, dispatchableNotificationCount);
+    this.assertStartupAllowed(sessionId, stopGeneration);
 
     const initialPrompt = options?.initialPrompt ?? 'Continue with the task.';
-    if (initialPrompt) {
+    const shouldSendInitialPrompt =
+      dispatchableNotificationCount === 0 ||
+      (typeof options?.initialPrompt === 'string' && !options.initialPromptIsDefault);
+    if (shouldSendInitialPrompt && initialPrompt) {
       await sendSessionMessage(sessionId, initialPrompt);
     }
 
     logger.info('Session started', { sessionId, provider: session.provider });
   }
 
-  async restartSession(sessionId: string, sendSessionMessage: SendSessionMessage): Promise<void> {
+  async restartSession(
+    sessionId: string,
+    sendSessionMessage: SendSessionMessage,
+    options?: StartSessionOptions
+  ): Promise<void> {
     const isRunning = this.runtimeManager.isSessionRunning(sessionId);
     const isStopInProgress = this.runtimeManager.isStopInProgress(sessionId);
 
@@ -171,14 +207,39 @@ export class SessionLifecycleService {
         });
       }
     }
-    await this.startSession(sessionId, sendSessionMessage, {
-      initialPrompt: 'Continue with the task.',
-    });
+    await this.startSession(
+      sessionId,
+      sendSessionMessage,
+      options ?? {
+        initialPrompt: 'Continue with the task.',
+        initialPromptIsDefault: true,
+      }
+    );
     logger.info('Session restarted', { sessionId });
   }
 
   async stopSession(sessionId: string, options?: StopSessionOptions): Promise<void> {
+    if (this.stoppingSessions.has(sessionId)) {
+      logger.debug('Session stop already in progress', { sessionId });
+      return;
+    }
+
+    this.stopGenerations.set(sessionId, this.getStopGeneration(sessionId) + 1);
+    this.stoppingSessions.add(sessionId);
+    try {
+      await this.stopSessionWithBarrier(sessionId, options);
+    } finally {
+      this.stoppingSessions.delete(sessionId);
+    }
+  }
+
+  private async stopSessionWithBarrier(
+    sessionId: string,
+    options?: StopSessionOptions
+  ): Promise<void> {
     this.promptTurnCompletionService.clearSession(sessionId);
+    this.onBeforeStopSession?.(sessionId);
+    this.sessionDomainService.clearQueuedWork(sessionId, { emitSnapshot: true });
     const session = await this.loadSessionForStop(sessionId);
     const workspaceId = session?.workspaceId ?? this.acpEventProcessor.getWorkspaceId(sessionId);
 
@@ -201,9 +262,7 @@ export class SessionLifecycleService {
 
     let stopClientFailed = false;
     try {
-      if (!this.runtimeManager.isStopInProgress(sessionId)) {
-        await this.runtimeManager.stopClient(sessionId);
-      }
+      await this.stopRuntimeAndPendingCreation(sessionId);
     } catch (error) {
       stopClientFailed = true;
       logger.warn('Error stopping ACP session runtime; continuing cleanup', {
@@ -211,9 +270,8 @@ export class SessionLifecycleService {
         error: error instanceof Error ? error.message : String(error),
       });
     } finally {
-      this.finalizeOrphanedToolCallsOnStop(sessionId);
+      this.finalizeOrphanedToolCalls(sessionId, 'session_stop');
       await this.updateStoppedSessionState(sessionId);
-      this.sessionDomainService.clearQueuedWork(sessionId, { emitSnapshot: true });
       this.sessionDomainService.setRuntimeSnapshot(sessionId, {
         phase: 'idle',
         processState: 'stopped',
@@ -245,8 +303,25 @@ export class SessionLifecycleService {
     }
   }
 
+  private async stopRuntimeAndPendingCreation(sessionId: string): Promise<void> {
+    if (!this.runtimeManager.isStopInProgress(sessionId)) {
+      await this.runtimeManager.stopClient(sessionId);
+    }
+
+    const pendingCreations = this.clientCreationOperations.get(sessionId);
+    if (!pendingCreations || pendingCreations.size === 0) {
+      return;
+    }
+
+    await Promise.allSettled([...pendingCreations]);
+    if (!this.runtimeManager.isStopInProgress(sessionId)) {
+      await this.runtimeManager.stopClient(sessionId);
+    }
+  }
+
   async stopWorkspaceSessions(workspaceId: string): Promise<void> {
     const sessions = await this.repository.getSessionsByWorkspaceId(workspaceId);
+    const stopErrors: unknown[] = [];
 
     for (const session of sessions) {
       if (
@@ -261,8 +336,15 @@ export class SessionLifecycleService {
             workspaceId,
             error: error instanceof Error ? error.message : String(error),
           });
+          stopErrors.push(error);
         }
       }
+    }
+
+    if (stopErrors.length > 0) {
+      throw new Error(
+        `Failed to stop ${stopErrors.length} workspace session${stopErrors.length === 1 ? '' : 's'}`
+      );
     }
 
     logger.info('Stopped all workspace sessions', { workspaceId, count: sessions.length });
@@ -272,19 +354,22 @@ export class SessionLifecycleService {
     sessionId: string,
     options?: GetOrCreateSessionClientOptions
   ): Promise<unknown> {
+    const stopGeneration = this.getStopGeneration(sessionId);
     const session = await this.repository.getSessionById(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
     }
+    this.assertStartupAllowed(sessionId, stopGeneration);
 
     const hadClient = !!this.runtimeManager.getClient(sessionId);
-    const { handle, resolvedPreset } = await this.getOrCreateAcpSessionClient(
-      sessionId,
-      options ?? {},
-      session
-    );
+    const { handle, resolvedPreset, dispatchableNotificationCount } =
+      await this.getOrCreateAcpSessionClient(sessionId, options ?? {}, session, stopGeneration);
+    this.assertStartupAllowed(sessionId, stopGeneration);
     if (!hadClient) {
       await this.applyConfiguredPermissionPreset(sessionId, session, handle, resolvedPreset);
+      this.assertStartupAllowed(sessionId, stopGeneration);
+      await this.dispatchQueuedNotificationsIfNeeded(sessionId, dispatchableNotificationCount);
+      this.assertStartupAllowed(sessionId, stopGeneration);
     }
 
     return handle;
@@ -294,14 +379,17 @@ export class SessionLifecycleService {
     session: AgentSessionRecord,
     options?: GetOrCreateSessionClientOptions
   ): Promise<unknown> {
+    const stopGeneration = this.getStopGeneration(session.id);
+    this.assertStartupAllowed(session.id, stopGeneration);
     const hadClient = !!this.runtimeManager.getClient(session.id);
-    const { handle, resolvedPreset } = await this.getOrCreateAcpSessionClient(
-      session.id,
-      options ?? {},
-      session
-    );
+    const { handle, resolvedPreset, dispatchableNotificationCount } =
+      await this.getOrCreateAcpSessionClient(session.id, options ?? {}, session, stopGeneration);
+    this.assertStartupAllowed(session.id, stopGeneration);
     if (!hadClient) {
       await this.applyConfiguredPermissionPreset(session.id, session, handle, resolvedPreset);
+      this.assertStartupAllowed(session.id, stopGeneration);
+      await this.dispatchQueuedNotificationsIfNeeded(session.id, dispatchableNotificationCount);
+      this.assertStartupAllowed(session.id, stopGeneration);
     }
 
     return handle;
@@ -335,7 +423,7 @@ export class SessionLifecycleService {
       };
     }
 
-    if (this.isStaleLoadingRuntime(base)) {
+    if (isStaleLoadingRuntime(base)) {
       return {
         ...base,
         phase: 'idle',
@@ -348,11 +436,26 @@ export class SessionLifecycleService {
     return base;
   }
 
+  isSessionStopping(sessionId: string): boolean {
+    return this.stoppingSessions.has(sessionId) || this.runtimeManager.isStopInProgress(sessionId);
+  }
+
+  getStopGeneration(sessionId: string): number {
+    return this.stopGenerations.get(sessionId) ?? 0;
+  }
+
+  private assertStartupAllowed(sessionId: string, stopGeneration: number): void {
+    if (this.isSessionStopping(sessionId) || this.getStopGeneration(sessionId) !== stopGeneration) {
+      throw new Error('Session is currently being stopped');
+    }
+  }
+
   async getSessionOptions(sessionId: string): Promise<{
     workingDir: string;
     resumeProviderSessionId: string | undefined;
     systemPrompt: string | undefined;
     model: string;
+    workspaceStatus: WorkspaceStatus;
   } | null> {
     const sessionContext = await this.loadSessionContext(sessionId);
     if (!sessionContext) {
@@ -364,6 +467,7 @@ export class SessionLifecycleService {
       resumeProviderSessionId: sessionContext.resumeProviderSessionId,
       systemPrompt: sessionContext.systemPrompt,
       model: sessionContext.model,
+      workspaceStatus: sessionContext.workspaceStatus,
     };
   }
 
@@ -377,19 +481,6 @@ export class SessionLifecycleService {
       });
       throw error;
     }
-  }
-
-  private isStaleLoadingRuntime(runtime: SessionRuntimeState): boolean {
-    if (runtime.phase !== 'loading' || runtime.processState === 'alive') {
-      return false;
-    }
-
-    const updatedAtMs = Date.parse(runtime.updatedAt);
-    if (Number.isNaN(updatedAtMs)) {
-      return false;
-    }
-
-    return Date.now() - updatedAtMs > STALE_LOADING_RUNTIME_MAX_AGE_MS;
   }
 
   private setupAcpEventHandler(sessionId: string): AcpRuntimeEventHandlers {
@@ -418,18 +509,25 @@ export class SessionLifecycleService {
       },
       onExit: async (sid: string, exitCode: number | null) => {
         this.promptTurnCompletionService.clearSession(sid);
+        this.onSessionExit?.(sid);
+        this.finalizeOrphanedToolCalls(sid, 'runtime_exit');
         this.acpEventProcessor.clearSessionState(sid);
         this.sessionPermissionService.cancelPendingRequests(sid);
         acpTraceLogger.log(sid, 'runtime_exit', { exitCode });
 
         try {
           this.sessionDomainService.markProcessExit(sid, exitCode);
+          const persistedStatus = getPersistedStatusForExitCode(exitCode);
           const session = await this.repository.updateSession(sid, {
-            status: SessionStatus.COMPLETED,
+            status: persistedStatus,
           });
-          logger.debug('Updated ACP session status to COMPLETED on exit', { sessionId: sid });
+          logger.debug('Updated ACP session status on exit', {
+            sessionId: sid,
+            exitCode,
+            status: persistedStatus,
+          });
 
-          await this.clearRatchetActiveSessionIfMatching(session.workspaceId, sid);
+          await this.recordRatchetSessionEndOnExit(session.workspaceId, sid, exitCode);
           void this.maybeDiscoverPROnSessionEnd(session.workspaceId);
           if (session.workflow === 'ratchet') {
             await this.persistRatchetTranscript(sid, session);
@@ -480,22 +578,33 @@ export class SessionLifecycleService {
       model?: string;
     },
     session?: AgentSessionRecord,
-    permissionPreset?: PermissionPreset
-  ): Promise<AcpProcessHandle> {
+    permissionPreset?: PermissionPreset,
+    stopGeneration = this.getStopGeneration(sessionId)
+  ): Promise<{ handle: AcpProcessHandle; dispatchableNotificationCount: number }> {
     const sessionContext = await this.loadSessionContext(sessionId, session);
     if (!sessionContext) {
       throw new Error(`Session context not ready: ${sessionId}`);
     }
+    this.assertStartupAllowed(sessionId, stopGeneration);
 
     await this.repository.markWorkspaceHasHadSessions(sessionContext.workspaceId);
+    this.assertStartupAllowed(sessionId, stopGeneration);
     this.acpEventProcessor.registerSessionContext(sessionId, {
       workspaceId: sessionContext.workspaceId,
       workingDir: sessionContext.workingDir,
+      provider: session?.provider ?? 'CLAUDE',
     });
 
     const handlers = this.setupAcpEventHandler(sessionId);
     const shouldSuppressReplay = this.shouldSuppressReplayDuringAcpResume(sessionId, session);
     this.acpEventProcessor.setReplaySuppression(sessionId, shouldSuppressReplay);
+
+    const apiPort = String(configService.getBackendPort());
+    const mcpServerConfig = getChildWorkspaceMcpServerConfig({
+      workspaceId: sessionContext.workspaceId,
+      parentWorkspaceId: sessionContext.parentWorkspaceId ?? null,
+      apiBaseUrl: `http://localhost:${apiPort}`,
+    });
 
     const clientOptions: AcpClientOptions = {
       provider: session?.provider ?? 'CLAUDE',
@@ -505,18 +614,42 @@ export class SessionLifecycleService {
       permissionPreset,
       sessionId,
       resumeProviderSessionId: session?.providerSessionId ?? undefined,
+      mcpServers: [mcpServerConfig],
     };
 
     let handle: AcpProcessHandle;
-    try {
-      handle = await this.runtimeManager.getOrCreateClient(sessionId, clientOptions, handlers, {
+    this.assertStartupAllowed(sessionId, stopGeneration);
+    const creationPromise = this.runtimeManager.getOrCreateClient(
+      sessionId,
+      clientOptions,
+      handlers,
+      {
         workspaceId: sessionContext.workspaceId,
         workingDir: sessionContext.workingDir,
+      }
+    );
+    const sessionCreations =
+      this.clientCreationOperations.get(sessionId) ?? new Set<Promise<AcpProcessHandle>>();
+    sessionCreations.add(creationPromise);
+    this.clientCreationOperations.set(sessionId, sessionCreations);
+    try {
+      handle = await creationPromise;
+      this.assertStartupAllowed(sessionId, stopGeneration);
+      await this.sessionConfigService.applyConfiguredReasoningEffort(sessionId, handle, {
+        persistSnapshot: false,
+        emitUpdates: false,
       });
     } catch (error) {
       this.acpEventProcessor.clearSessionState(sessionId);
       throw error;
+    } finally {
+      sessionCreations.delete(creationPromise);
+      if (sessionCreations.size === 0) {
+        this.clientCreationOperations.delete(sessionId);
+      }
     }
+
+    this.assertStartupAllowed(sessionId, stopGeneration);
 
     await this.persistAcpConfigSnapshot(sessionId, {
       provider: handle.provider as PersistAcpConfigSnapshotParams['provider'],
@@ -537,7 +670,16 @@ export class SessionLifecycleService {
       capabilities: this.buildAcpChatBarCapabilities(handle),
     });
 
-    return handle;
+    // Queue pending notifications only after the ACP client starts successfully.
+    // Callers decide when dispatch is safe for their startup flow.
+    this.assertStartupAllowed(sessionId, stopGeneration);
+    const dispatchableNotificationCount = await this.deliverPendingChildNotifications(
+      sessionId,
+      sessionContext.workspaceId,
+      stopGeneration
+    );
+
+    return { handle, dispatchableNotificationCount };
   }
 
   private shouldSuppressReplayDuringAcpResume(
@@ -586,12 +728,13 @@ export class SessionLifecycleService {
     );
   }
 
-  private finalizeOrphanedToolCallsOnStop(sessionId: string): void {
+  private finalizeOrphanedToolCalls(sessionId: string, reason: string): void {
     try {
-      this.acpEventProcessor.finalizeOrphanedToolCalls(sessionId, 'session_stop');
+      this.acpEventProcessor.finalizeOrphanedToolCalls(sessionId, reason);
     } catch (error) {
-      logger.warn('Failed finalizing orphaned ACP tool calls during stop', {
+      logger.warn('Failed finalizing orphaned ACP tool calls', {
         sessionId,
+        reason,
         error: error instanceof Error ? error.message : String(error),
       });
       this.acpEventProcessor.clearPendingToolCalls(sessionId);
@@ -634,9 +777,13 @@ export class SessionLifecycleService {
     try {
       await this.retryService.run(
         () =>
-          this.repository.updateSession(sessionId, {
-            status: SessionStatus.IDLE,
-          }),
+          this.repository.updateSessionIfStatus(
+            sessionId,
+            {
+              status: SessionStatus.IDLE,
+            },
+            [SessionStatus.RUNNING]
+          ),
         {
           attempts: 2,
           operationName: 'updateStoppedSessionState',
@@ -661,9 +808,11 @@ export class SessionLifecycleService {
     }
 
     try {
-      await this.clearRatchetActiveSessionIfMatching(session.workspaceId, sessionId);
+      // A stop is deliberate, so the dispatch settles as COMPLETED (no retry).
+      // No-ops if another session-end path already settled the record.
+      await this.recordRatchetSessionEnd(session.workspaceId, sessionId, 'COMPLETED');
     } catch (error) {
-      logger.warn('Failed clearing ratchet active session pointer during stop', {
+      logger.warn('Failed settling ratchet dispatch record during stop', {
         sessionId,
         workspaceId: session.workspaceId,
         error: error instanceof Error ? error.message : String(error),
@@ -675,71 +824,49 @@ export class SessionLifecycleService {
     }
 
     try {
+      await this.persistRatchetTranscript(sessionId, session);
       await this.repository.deleteSession(sessionId);
       logger.debug('Deleted transient ratchet session after stop', { sessionId });
     } catch (error) {
-      logger.warn('Failed deleting transient ratchet session during stop', {
+      logger.warn('Failed persisting or deleting transient ratchet session during stop', {
         sessionId,
         error: error instanceof Error ? error.message : String(error),
       });
     }
   }
 
-  private async clearRatchetActiveSessionIfMatching(
+  private async recordRatchetSessionEnd(
     workspaceId: string,
-    sessionId: string
+    sessionId: string,
+    outcome: RatchetSessionEndOutcome
   ): Promise<void> {
     if (!this.workspaceBridge) {
       return;
     }
 
-    await this.workspaceBridge.clearRatchetActiveSessionIfMatching(workspaceId, sessionId);
+    await this.workspaceBridge.recordRatchetSessionEnd(workspaceId, sessionId, outcome);
   }
 
   /**
-   * After a session ends, check if a PR was created for the workspace's branch
-   * that the interceptor may have missed. This is a fast fallback that avoids
-   * waiting for the 3-minute periodic scheduler.
+   * Deliberate stops (isStopInProgress) and clean exits settle the ratchet
+   * dispatch as COMPLETED; unexpected exits settle it as DIED so the ratchet
+   * can re-dispatch (bounded) for the same PR state.
    */
+  private async recordRatchetSessionEndOnExit(
+    workspaceId: string,
+    sessionId: string,
+    exitCode: number | null
+  ): Promise<void> {
+    const outcome =
+      exitCode === 0 || this.runtimeManager.isStopInProgress(sessionId) ? 'COMPLETED' : 'DIED';
+    await this.recordRatchetSessionEnd(workspaceId, sessionId, outcome);
+  }
+
   private async maybeDiscoverPROnSessionEnd(workspaceId: string): Promise<void> {
-    try {
-      const workspace = await workspaceAccessor.findByIdWithProject(workspaceId);
-      if (!workspace) {
-        return;
-      }
-      // Already associated — nothing to do
-      if (workspace.prUrl) {
-        return;
-      }
-      const { branchName, createdAt, project } = workspace;
-      if (!(branchName && project?.githubOwner && project?.githubRepo)) {
-        return;
-      }
-      const pr = await githubCLIService.findPRForBranch(
-        project.githubOwner,
-        project.githubRepo,
-        branchName,
-        createdAt
-      );
-      if (!pr) {
-        return;
-      }
-      const result = await prSnapshotService.attachAndRefreshPR(workspaceId, pr.url);
-      if (result.success) {
-        logger.info('Discovered PR for workspace on session end', {
-          workspaceId,
-          branchName,
-          prNumber: result.snapshot.prNumber,
-          prUrl: pr.url,
-        });
-      }
-    } catch (error) {
-      // Fire-and-forget: log but don't surface to caller
-      logger.debug('PR discovery on session end failed', {
-        workspaceId,
-        error: error instanceof Error ? error.message : String(error),
-      });
+    if (!this.workspaceBridge) {
+      return;
     }
+    await maybeDiscoverPROnSessionEndHelper(workspaceId, logger, this.workspaceBridge);
   }
 
   private clearSessionStoreIfInactive(
@@ -748,7 +875,7 @@ export class SessionLifecycleService {
   ): void {
     if (
       this.runtimeManager.isSessionRunning(sessionId) ||
-      chatConnectionService.countConnectionsViewingSession(sessionId) > 0
+      sessionEventBus.countViewers(sessionId) > 0
     ) {
       return;
     }
@@ -766,7 +893,7 @@ export class SessionLifecycleService {
     }
 
     const transcript = this.sessionDomainService.getTranscriptSnapshot(sessionId);
-    const workspace = await workspaceAccessor.findById(session.workspaceId);
+    const workspace = await workspaceDataService.findById(session.workspaceId);
     if (!workspace?.worktreePath) {
       logger.warn('Cannot persist ratchet transcript: no worktree path', {
         sessionId,
@@ -793,8 +920,15 @@ export class SessionLifecycleService {
     options: {
       model?: string;
     },
-    session: AgentSessionRecord
-  ): Promise<{ handle: AcpProcessHandle; resolvedPreset?: PermissionPreset }> {
+    session: AgentSessionRecord,
+    stopGeneration: number
+  ): Promise<{
+    handle: AcpProcessHandle;
+    resolvedPreset?: PermissionPreset;
+    dispatchableNotificationCount: number;
+  }> {
+    this.assertStartupAllowed(sessionId, stopGeneration);
+
     const existingAcp = this.runtimeManager.getClient(sessionId);
     if (existingAcp) {
       this.sessionDomainService.setRuntimeSnapshot(sessionId, {
@@ -803,7 +937,7 @@ export class SessionLifecycleService {
         activity: existingAcp.isPromptInFlight ? 'WORKING' : 'IDLE',
         updatedAt: new Date().toISOString(),
       });
-      return { handle: existingAcp };
+      return { handle: existingAcp, dispatchableNotificationCount: 0 };
     }
 
     this.sessionDomainService.setRuntimeSnapshot(sessionId, {
@@ -814,10 +948,20 @@ export class SessionLifecycleService {
     });
 
     const resolvedPreset = await this.resolvePermissionPreset(session);
+    this.assertStartupAllowed(sessionId, stopGeneration);
 
     let handle: AcpProcessHandle;
+    let dispatchableNotificationCount = 0;
     try {
-      handle = await this.createAcpClient(sessionId, options, session, resolvedPreset);
+      const created = await this.createAcpClient(
+        sessionId,
+        options,
+        session,
+        resolvedPreset,
+        stopGeneration
+      );
+      handle = created.handle;
+      dispatchableNotificationCount = created.dispatchableNotificationCount;
     } catch (error) {
       this.sessionDomainService.setRuntimeSnapshot(sessionId, {
         phase: 'error',
@@ -828,6 +972,8 @@ export class SessionLifecycleService {
       });
       throw error;
     }
+
+    this.assertStartupAllowed(sessionId, stopGeneration);
 
     await this.repository.updateSession(sessionId, {
       status: SessionStatus.RUNNING,
@@ -840,7 +986,24 @@ export class SessionLifecycleService {
       updatedAt: new Date().toISOString(),
     });
 
-    return { handle, resolvedPreset };
+    return { handle, resolvedPreset, dispatchableNotificationCount };
+  }
+
+  private async dispatchQueuedNotificationsIfNeeded(
+    sessionId: string,
+    dispatchableNotificationCount: number
+  ): Promise<void> {
+    if (dispatchableNotificationCount === 0 || !this.messageQueueBridge) {
+      return;
+    }
+    try {
+      await this.messageQueueBridge.tryDispatchNextMessage(sessionId);
+    } catch (error) {
+      logger.warn('Failed to dispatch queued workspace notifications', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private async persistAcpConfigSnapshot(
@@ -888,6 +1051,9 @@ export class SessionLifecycleService {
       });
     }
 
+    // Resolve parent workspace context for child workspace system prompt injection
+    const parentCtx = await this.resolveParentWorkspaceContext(workspace);
+
     const claudeMdContent = await ClaudeMdService.readClaudeMd(workspace.worktreePath);
 
     const { workflowPrompt, systemPrompt, injectedBranchRename } =
@@ -899,6 +1065,11 @@ export class SessionLifecycleService {
           hasHadSessions: workspace.hasHadSessions,
           name: workspace.name,
           description: workspace.description ?? undefined,
+          runScriptPort: workspace.runScriptPort,
+          parentWorkspaceId: workspace.parentWorkspaceId,
+          parentWorkspaceName: parentCtx.parentWorkspaceName,
+          parentProjectName: parentCtx.parentProjectName,
+          reportBackOn: parentCtx.reportBackOn,
         },
         project,
         claudeMdContent,
@@ -924,7 +1095,216 @@ export class SessionLifecycleService {
       systemPrompt,
       model: session.model,
       workspaceId: workspace.id,
+      workspaceStatus: workspace.status,
+      parentWorkspaceId: workspace.parentWorkspaceId,
     };
+  }
+
+  private async deliverPendingChildNotifications(
+    sessionId: string,
+    workspaceId: string,
+    stopGeneration = this.getStopGeneration(sessionId)
+  ): Promise<number> {
+    try {
+      const pending = await workspaceNotificationService.listPendingForDelivery(workspaceId);
+      this.assertStartupAllowed(sessionId, stopGeneration);
+      if (pending.length === 0) {
+        return 0;
+      }
+      if (!this.messageQueueBridge) {
+        logger.warn(
+          'Cannot deliver pending workspace notifications: message queue bridge missing',
+          {
+            sessionId,
+            workspaceId,
+            count: pending.length,
+          }
+        );
+        return 0;
+      }
+      let enqueuedCount = 0;
+      let dispatchableCount = 0;
+      const consumedContentMatchIds = new Set<string>();
+      for (const notification of pending) {
+        this.assertStartupAllowed(sessionId, stopGeneration);
+        const timestamp = notification.createdAt.toISOString();
+        const messageId = workspaceNotificationMessageId(notification.id);
+        if (this.sessionDomainService.hasQueuedMessage(sessionId, messageId)) {
+          dispatchableCount += 1;
+          continue;
+        }
+        let claudeMessage: AgentMessage;
+        if (notification.direction === 'PARENT_TO_CHILD') {
+          claudeMessage = {
+            type: 'parent_workspace_update' as const,
+            parentWorkspaceId: notification.sourceWorkspaceId,
+            parentWorkspaceName: notification.sourceWorkspaceName,
+            parentProjectName: notification.sourceProjectName,
+            text: notification.message,
+            timestamp,
+          };
+        } else {
+          claudeMessage = {
+            type: 'child_workspace_update' as const,
+            childWorkspaceId: notification.sourceWorkspaceId,
+            childWorkspaceName: notification.sourceWorkspaceName,
+            childProjectName: notification.sourceProjectName,
+            text: notification.message,
+            timestamp,
+          };
+        }
+        const enqueueText = buildWorkspaceNotificationMessageText(notification);
+        const alreadyDelivered = await this.markDeliveredIfTranscriptMatch(
+          sessionId,
+          workspaceId,
+          notification.id,
+          messageId,
+          enqueueText,
+          consumedContentMatchIds
+        );
+        this.assertStartupAllowed(sessionId, stopGeneration);
+        if (alreadyDelivered) {
+          continue;
+        }
+        if (this.sessionDomainService.hasQueuedMessage(sessionId, messageId)) {
+          dispatchableCount += 1;
+          continue;
+        }
+
+        const enqueueResult = this.sessionDomainService.enqueue(sessionId, {
+          id: messageId,
+          text: enqueueText,
+          timestamp,
+          settings: {
+            selectedModel: null,
+            reasoningEffort: null,
+            thinkingEnabled: false,
+            planModeEnabled: false,
+          },
+        } satisfies QueuedMessage);
+        if ('error' in enqueueResult) {
+          logger.warn('Failed to enqueue pending workspace notification', {
+            sessionId,
+            workspaceId,
+            notificationId: notification.id,
+            error: enqueueResult.error,
+          });
+          continue;
+        }
+        enqueuedCount += 1;
+        dispatchableCount += 1;
+        const order = this.sessionDomainService.appendClaudeEvent(sessionId, claudeMessage);
+        this.sessionDomainService.emitDelta(sessionId, {
+          type: 'agent_message',
+          data: claudeMessage,
+          order,
+        } as SessionDeltaEvent & { order: number });
+      }
+      logger.info('Queued pending workspace notifications', {
+        sessionId,
+        workspaceId,
+        count: enqueuedCount,
+        dispatchableCount,
+      });
+      return dispatchableCount;
+    } catch (error) {
+      logger.warn('Failed to deliver pending workspace notifications', {
+        sessionId,
+        workspaceId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return 0;
+    }
+  }
+
+  private findCommittedQueuedWorkspaceNotificationMessage(
+    sessionId: string,
+    messageId: string,
+    messageText: string,
+    consumedContentMatchIds: ReadonlySet<string>
+  ): { id: string; matchedByContent: boolean } | undefined {
+    const userEntries = this.sessionDomainService
+      .getTranscriptSnapshot(sessionId)
+      .filter((entry) => entry.source === 'user');
+    const exactIdMatch = userEntries.find((entry) => entry.id === messageId);
+    if (exactIdMatch) {
+      return { id: exactIdMatch.id, matchedByContent: false };
+    }
+    if (this.sessionDomainService.getHistoryHydrationSource(sessionId) !== 'jsonl') {
+      return undefined;
+    }
+    const contentMatch = userEntries.find(
+      (entry) =>
+        !entry.id.startsWith(WORKSPACE_NOTIFICATION_MESSAGE_ID_PREFIX) &&
+        entry.text === messageText &&
+        !consumedContentMatchIds.has(entry.id)
+    );
+    if (contentMatch) {
+      return { id: contentMatch.id, matchedByContent: true };
+    }
+    return undefined;
+  }
+
+  private async markDeliveredIfTranscriptMatch(
+    sessionId: string,
+    workspaceId: string,
+    notificationId: string,
+    messageId: string,
+    messageText: string,
+    consumedContentMatchIds: Set<string>
+  ): Promise<boolean> {
+    const committedMessage = this.findCommittedQueuedWorkspaceNotificationMessage(
+      sessionId,
+      messageId,
+      messageText,
+      consumedContentMatchIds
+    );
+    if (!committedMessage) {
+      return false;
+    }
+    if (committedMessage.matchedByContent) {
+      consumedContentMatchIds.add(committedMessage.id);
+    }
+    await this.markDeliveredAfterTranscriptMatch(sessionId, workspaceId, notificationId);
+    return true;
+  }
+
+  private async markDeliveredAfterTranscriptMatch(
+    sessionId: string,
+    workspaceId: string,
+    notificationId: string
+  ): Promise<void> {
+    try {
+      await workspaceNotificationService.markDelivered([notificationId]);
+    } catch (error) {
+      logger.warn('Failed to mark already-transcripted workspace notification delivered', {
+        sessionId,
+        workspaceId,
+        notificationId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async resolveParentWorkspaceContext(workspace: {
+    parentWorkspaceId: string | null;
+    creationMetadata: unknown;
+  }): Promise<{ parentWorkspaceName?: string; parentProjectName?: string; reportBackOn?: string }> {
+    if (!workspace.parentWorkspaceId) {
+      return {};
+    }
+    let parentWorkspaceName: string | undefined;
+    let parentProjectName: string | undefined;
+    const parentWorkspace = await this.repository.getWorkspaceById(workspace.parentWorkspaceId);
+    if (parentWorkspace) {
+      parentWorkspaceName = parentWorkspace.name;
+      const parentProject = await this.repository.getProjectById(parentWorkspace.projectId);
+      parentProjectName = parentProject?.name;
+    }
+    const metadata = workspace.creationMetadata as Record<string, unknown> | null;
+    const reportBackOn =
+      typeof metadata?.reportBackOn === 'string' ? metadata.reportBackOn : undefined;
+    return { parentWorkspaceName, parentProjectName, reportBackOn };
   }
 
   private async resolvePermissionPreset(
@@ -932,7 +1312,7 @@ export class SessionLifecycleService {
   ): Promise<PermissionPreset> {
     const fallback: PermissionPreset = session?.workflow === 'ratchet' ? 'YOLO' : 'STRICT';
     try {
-      const settings = await userSettingsAccessor.get();
+      const settings = await userSettingsService.get();
       return session?.workflow === 'ratchet'
         ? settings.ratchetPermissions
         : settings.defaultWorkspacePermissions;

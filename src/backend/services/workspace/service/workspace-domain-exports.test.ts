@@ -7,15 +7,26 @@ import {
   deriveWorkspaceFlowState,
   deriveWorkspaceFlowStateFromWorkspace,
   getWorkspaceInitPolicy,
+  gitCloneService,
+  gitOpsService,
   kanbanStateService,
   // Lifecycle
   WorkspaceCreationService,
+  WorkspaceSnapshotStore,
   WorkspaceStateMachineError,
   WorktreePathSafetyError,
   workspaceActivityService,
+  workspaceAutoIterationService,
   workspaceDataService,
+  workspaceMaintenanceService,
+  workspaceNotificationService,
+  workspacePrSnapshotService,
   // Query
   workspaceQueryService,
+  workspaceRatchetService,
+  workspaceRelationshipsService,
+  workspaceRunScriptService,
+  workspaceSnapshotStore,
   workspaceStateMachine,
   worktreeLifecycleService,
 } from './index';
@@ -70,6 +81,18 @@ describe('Workspace domain exports', () => {
     expect(typeof WorkspaceCreationService).toBe('function');
   });
 
+  it.each([
+    ['workspaceAutoIterationService', workspaceAutoIterationService],
+    ['workspacePrSnapshotService', workspacePrSnapshotService],
+    ['workspaceRatchetService', workspaceRatchetService],
+    ['workspaceRunScriptService', workspaceRunScriptService],
+    ['workspaceRelationshipsService', workspaceRelationshipsService],
+    ['workspaceMaintenanceService', workspaceMaintenanceService],
+    ['workspaceNotificationService', workspaceNotificationService],
+  ])('exports %s as an intent-focused service', (_name, service) => {
+    expect(service).toBeDefined();
+  });
+
   // --- Worktree ---
   it('exports worktreeLifecycleService as an object', () => {
     expect(worktreeLifecycleService).toBeDefined();
@@ -81,6 +104,13 @@ describe('Workspace domain exports', () => {
 
   it('exports WorktreePathSafetyError as a constructor', () => {
     expect(typeof WorktreePathSafetyError).toBe('function');
+  });
+
+  it('exports workspace git and snapshot services', () => {
+    expect(gitCloneService).toBeDefined();
+    expect(gitOpsService).toBeDefined();
+    expect(typeof WorkspaceSnapshotStore).toBe('function');
+    expect(workspaceSnapshotStore).toBeDefined();
   });
 
   // --- Query ---

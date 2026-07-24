@@ -7,8 +7,11 @@ import type { AppContext } from '@/backend/app-context';
 import { WS_READY_STATE } from '@/backend/constants/websocket';
 import { createPostRunLogsUpgradeHandler, postRunLogsConnections } from './post-run-logs.handler';
 
+const allowedOrigin = 'http://localhost:3000';
+
 class MockWebSocket extends EventEmitter {
   readyState: number = WS_READY_STATE.OPEN;
+  bufferedAmount = 0;
   send = vi.fn();
 }
 
@@ -54,13 +57,19 @@ describe('createPostRunLogsUpgradeHandler', () => {
     };
     const appContext = {
       services: {
+        configService: {
+          getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin] })),
+        },
         createLogger: vi.fn(() => logger),
         runScriptService,
       },
     } as unknown as AppContext;
 
     const handler = createPostRunLogsUpgradeHandler(appContext);
-    const request = {} as IncomingMessage;
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
     const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
     const wss = { handleUpgrade: vi.fn() } as unknown as WebSocketServer;
 
@@ -73,9 +82,122 @@ describe('createPostRunLogsUpgradeHandler', () => {
       new WeakMap<WebSocket, boolean>()
     );
 
-    expect(logger.warn).toHaveBeenCalledWith('Post-run logs WebSocket missing workspaceId');
+    expect(logger.warn).toHaveBeenCalledWith('post-run logs WebSocket missing workspaceId');
     expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('400 Bad Request'));
     expect(socket.destroy).toHaveBeenCalledTimes(1);
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects unauthorized origins before checking workspaceId', () => {
+    const logger = createLogger();
+    const runScriptService = {
+      getPostRunOutputBuffer: vi.fn(() => ''),
+      subscribeToPostRunOutput: vi.fn(),
+    };
+    const appContext = {
+      services: {
+        configService: {
+          getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin] })),
+        },
+        createLogger: vi.fn(() => logger),
+        runScriptService,
+      },
+    } as unknown as AppContext;
+
+    const handler = createPostRunLogsUpgradeHandler(appContext);
+    const request = { headers: { origin: 'https://attacker.example' } } as IncomingMessage;
+    const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
+    const wss = { handleUpgrade: vi.fn() } as unknown as WebSocketServer;
+
+    handler(
+      request,
+      socket,
+      Buffer.alloc(0),
+      new URL('http://localhost/post-run-logs'),
+      wss,
+      new WeakMap<WebSocket, boolean>()
+    );
+
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('Unauthorized origin'));
+    expect(logger.warn).not.toHaveBeenCalledWith('post-run logs WebSocket missing workspaceId');
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects untrusted remote addresses before opening a WebSocket', () => {
+    const logger = createLogger();
+    const runScriptService = {
+      getPostRunOutputBuffer: vi.fn(() => ''),
+      subscribeToPostRunOutput: vi.fn(),
+    };
+    const appContext = {
+      services: {
+        configService: {
+          getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin], trustedLocalCidrs: [] })),
+        },
+        createLogger: vi.fn(() => logger),
+        runScriptService,
+      },
+    } as unknown as AppContext;
+
+    const handler = createPostRunLogsUpgradeHandler(appContext);
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '203.0.113.10' },
+    } as unknown as IncomingMessage;
+    const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
+    const wss = { handleUpgrade: vi.fn() } as unknown as WebSocketServer;
+
+    handler(
+      request,
+      socket,
+      Buffer.alloc(0),
+      new URL('http://localhost/post-run-logs?workspaceId=workspace-1'),
+      wss,
+      new WeakMap<WebSocket, boolean>()
+    );
+
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('403 Forbidden'));
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('Untrusted remote address'));
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects forwarded local upgrades before opening a WebSocket', () => {
+    const logger = createLogger();
+    const runScriptService = {
+      getPostRunOutputBuffer: vi.fn(() => ''),
+      subscribeToPostRunOutput: vi.fn(),
+    };
+    const appContext = {
+      services: {
+        configService: {
+          getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin], trustedLocalCidrs: [] })),
+        },
+        createLogger: vi.fn(() => logger),
+        runScriptService,
+      },
+    } as unknown as AppContext;
+
+    const handler = createPostRunLogsUpgradeHandler(appContext);
+    const request = {
+      headers: { origin: allowedOrigin, 'x-forwarded-for': '203.0.113.10' },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
+    const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
+    const wss = { handleUpgrade: vi.fn() } as unknown as WebSocketServer;
+
+    handler(
+      request,
+      socket,
+      Buffer.alloc(0),
+      new URL('http://localhost/post-run-logs?workspaceId=workspace-1'),
+      wss,
+      new WeakMap<WebSocket, boolean>()
+    );
+
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('403 Forbidden'));
+    expect(socket.write).toHaveBeenCalledWith(
+      expect.stringContaining('Forwarded WebSocket upgrades are not trusted')
+    );
     expect(wss.handleUpgrade).not.toHaveBeenCalled();
   });
 
@@ -93,6 +215,9 @@ describe('createPostRunLogsUpgradeHandler', () => {
     };
     const appContext = {
       services: {
+        configService: {
+          getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin] })),
+        },
         createLogger: vi.fn(() => logger),
         runScriptService,
       },
@@ -100,7 +225,10 @@ describe('createPostRunLogsUpgradeHandler', () => {
 
     const ws = new MockWebSocket();
     const handler = createPostRunLogsUpgradeHandler(appContext);
-    const request = {} as IncomingMessage;
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
     const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
     const wss = createWssFromQueue([ws]);
     const wsAliveMap = new WeakMap<WebSocket, boolean>();
@@ -122,14 +250,19 @@ describe('createPostRunLogsUpgradeHandler', () => {
     expect(ws.send).toHaveBeenCalledWith(
       JSON.stringify({ type: 'output', data: 'buffered post-run logs\n' })
     );
-    expect(postRunLogsConnections.get(workspaceId)?.has(ws as unknown as WebSocket)).toBe(true);
+    expect(postRunLogsConnections.subscribers(workspaceId).has(ws as unknown as WebSocket)).toBe(
+      true
+    );
 
     if (!outputCallback) {
       throw new Error('Expected output callback to be registered');
     }
 
     outputCallback('live output');
-    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'output', data: 'live output' }));
+    expect(ws.send).toHaveBeenCalledWith(
+      JSON.stringify({ type: 'output', data: 'live output' }),
+      expect.any(Function)
+    );
 
     const sendsBeforeClosed = ws.send.mock.calls.length;
     ws.readyState = WS_READY_STATE.CLOSED;
@@ -138,13 +271,13 @@ describe('createPostRunLogsUpgradeHandler', () => {
 
     ws.emit('error', new Error('post-run socket failed'));
     expect(logger.error).toHaveBeenCalledWith(
-      'Post-run logs WebSocket error',
+      'post-run logs WebSocket error',
       expect.objectContaining({ message: 'post-run socket failed' })
     );
 
     ws.emit('close');
     expect(unsubscribe).toHaveBeenCalledTimes(1);
-    expect(postRunLogsConnections.has(workspaceId)).toBe(false);
+    expect(postRunLogsConnections.hasSubscribers(workspaceId)).toBe(false);
   });
 
   it('tracks multiple connections and only deletes workspace entry after the last close', () => {
@@ -162,6 +295,9 @@ describe('createPostRunLogsUpgradeHandler', () => {
     };
     const appContext = {
       services: {
+        configService: {
+          getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin] })),
+        },
         createLogger: vi.fn(() => logger),
         runScriptService,
       },
@@ -170,7 +306,10 @@ describe('createPostRunLogsUpgradeHandler', () => {
     const ws1 = new MockWebSocket();
     const ws2 = new MockWebSocket();
     const handler = createPostRunLogsUpgradeHandler(appContext);
-    const request = {} as IncomingMessage;
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
     const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
     const wss = createWssFromQueue([ws1, ws2]);
     const wsAliveMap = new WeakMap<WebSocket, boolean>();
@@ -182,14 +321,14 @@ describe('createPostRunLogsUpgradeHandler', () => {
     expect(runScriptService.getPostRunOutputBuffer).toHaveBeenCalledTimes(2);
     expect(ws1.send).not.toHaveBeenCalled();
     expect(ws2.send).not.toHaveBeenCalled();
-    expect(postRunLogsConnections.get(workspaceId)?.size).toBe(2);
+    expect(postRunLogsConnections.subscriberCount(workspaceId)).toBe(2);
 
     ws1.emit('close');
     expect(unsubscribeFirst).toHaveBeenCalledTimes(1);
-    expect(postRunLogsConnections.get(workspaceId)?.size).toBe(1);
+    expect(postRunLogsConnections.subscriberCount(workspaceId)).toBe(1);
 
     ws2.emit('close');
     expect(unsubscribeSecond).toHaveBeenCalledTimes(1);
-    expect(postRunLogsConnections.has(workspaceId)).toBe(false);
+    expect(postRunLogsConnections.hasSubscribers(workspaceId)).toBe(false);
   });
 });

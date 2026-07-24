@@ -17,6 +17,7 @@ import { AutoIterationProgressBanner } from './auto-iteration-progress-banner';
 import type { useSessionManagement, useWorkspaceData } from './use-workspace-detail';
 import type { useWorkspaceInitStatus } from './use-workspace-detail-hooks';
 import { ChatContent, type ChatContentProps } from './workspace-detail-chat-content';
+import { getVisibleInitBanner } from './workspace-detail-container.utils';
 import { ArchivingOverlay, ScriptFailedBanner } from './workspace-overlays';
 
 interface WorkspaceStateProps {
@@ -26,7 +27,7 @@ interface WorkspaceStateProps {
   handleBackToWorkspaces: () => void;
   isScriptFailed: boolean;
   workspaceInitStatus: ReturnType<typeof useWorkspaceInitStatus>['workspaceInitStatus'];
-  setupWarningDismissed: boolean;
+  setupWarningDismissed: boolean | null;
   dismissSetupWarning: () => void;
 }
 
@@ -62,6 +63,8 @@ interface ArchiveDialogProps {
   open: boolean;
   setOpen: Dispatch<SetStateAction<boolean>>;
   hasUncommitted: boolean;
+  isCheckingGitStatus: boolean;
+  activeChildCount: number;
   onConfirm: (commitUncommitted: boolean) => void;
 }
 
@@ -85,17 +88,21 @@ function ScriptBanner({
   workspaceId: string;
   isScriptFailed: boolean;
   workspaceInitStatus: WorkspaceStateProps['workspaceInitStatus'];
-  setupWarningDismissed: boolean;
+  setupWarningDismissed: boolean | null;
   dismissSetupWarning: () => void;
 }) {
-  if (isScriptFailed && !setupWarningDismissed) {
+  const visibleBanner = getVisibleInitBanner(
+    workspaceInitStatus?.chatBanner,
+    setupWarningDismissed
+  );
+  if (isScriptFailed && visibleBanner) {
     return (
       <ScriptFailedBanner
         workspaceId={workspaceId}
         initErrorMessage={workspaceInitStatus?.initErrorMessage ?? null}
         initOutput={workspaceInitStatus?.initOutput ?? null}
         hasStartupScript={workspaceInitStatus?.hasStartupScript ?? false}
-        showDismiss={workspaceInitStatus?.chatBanner?.showDismiss ?? false}
+        showDismiss={visibleBanner.showDismiss}
         onDismiss={dismissSetupWarning}
       />
     );
@@ -227,6 +234,8 @@ export function WorkspaceDetailView({
         open={archiveDialog.open}
         onOpenChange={archiveDialog.setOpen}
         hasUncommitted={archiveDialog.hasUncommitted}
+        isCheckingGitStatus={archiveDialog.isCheckingGitStatus}
+        activeChildCount={archiveDialog.activeChildCount}
         onConfirm={archiveDialog.onConfirm}
       />
     </div>

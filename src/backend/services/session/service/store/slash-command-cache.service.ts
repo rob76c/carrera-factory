@@ -1,9 +1,11 @@
 import type { Prisma } from '@prisma-gen/client';
 import { createLogger } from '@/backend/services/logger.service';
-import { userSettingsAccessor } from '@/backend/services/settings';
+import { userSettingsService } from '@/backend/services/settings';
 import type { CommandInfo } from '@/shared/acp-protocol';
 
 const logger = createLogger('slash-command-cache');
+const CACHE_PAYLOAD_VERSION = 2;
+const SLASH_COMMAND_CACHE_UPDATE_MAX_ATTEMPTS = 5;
 
 function isCommandInfo(value: unknown): value is CommandInfo {
   if (!value || typeof value !== 'object') {
@@ -33,12 +35,15 @@ function normalizeCommands(commands: CommandInfo[]): CommandInfo[] {
   });
 }
 
-function toCommandInfoArray(value: unknown): CommandInfo[] | null {
+function toCommandInfoArray(value: unknown, allowEmpty = false): CommandInfo[] | null {
   if (!Array.isArray(value)) {
     return null;
   }
   const commands = value.filter(isCommandInfo);
-  return commands.length > 0 ? normalizeCommands(commands) : null;
+  if (commands.length > 0) {
+    return normalizeCommands(commands);
+  }
+  return allowEmpty && value.length === 0 ? [] : null;
 }
 
 type SessionProvider = 'CLAUDE' | 'CODEX';
@@ -61,11 +66,39 @@ function toProviderCommandMap(value: unknown): CachedSlashCommandsByProvider | n
   return Object.keys(map).length > 0 ? map : null;
 }
 
+function toVersionedProviderCommandMap(value: unknown): CachedSlashCommandsByProvider | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  if (record.version !== CACHE_PAYLOAD_VERSION) {
+    return null;
+  }
+
+  if (!record.global || typeof record.global !== 'object' || Array.isArray(record.global)) {
+    return null;
+  }
+
+  const map: CachedSlashCommandsByProvider = {};
+  const global = record.global as Record<string, unknown>;
+  for (const provider of ['CLAUDE', 'CODEX'] as const) {
+    const commands = toCommandInfoArray(global[provider]);
+    if (commands) {
+      map[provider] = commands;
+    }
+  }
+
+  return Object.keys(map).length > 0 ? map : null;
+}
+
 function toProviderPayload(
   commandsByProvider: CachedSlashCommandsByProvider
 ): Prisma.InputJsonObject {
   const entries = Object.entries(commandsByProvider)
-    .filter((entry): entry is [SessionProvider, CommandInfo[]] => Boolean(entry[1]))
+    .filter(
+      (entry): entry is [SessionProvider, CommandInfo[]] => Boolean(entry[1]) && entry[1].length > 0
+    )
     .map(([provider, commands]) => [
       provider,
       commands.map(
@@ -78,7 +111,10 @@ function toProviderPayload(
       ),
     ]);
 
-  return Object.fromEntries(entries) as Prisma.InputJsonObject;
+  return {
+    version: CACHE_PAYLOAD_VERSION,
+    global: Object.fromEntries(entries) as Prisma.InputJsonObject,
+  };
 }
 
 function areCommandsEqual(a: CommandInfo[], b: CommandInfo[]): boolean {
@@ -106,35 +142,54 @@ function areCommandsEqual(a: CommandInfo[], b: CommandInfo[]): boolean {
 
 class SlashCommandCacheService {
   async getCachedCommands(provider: SessionProvider): Promise<CommandInfo[] | null> {
-    const settings = await userSettingsAccessor.get();
-    const commandsByProvider = toProviderCommandMap(settings.cachedSlashCommands);
-    return commandsByProvider?.[provider] ?? null;
+    const settings = await userSettingsService.get();
+    const versionedCommandsByProvider = toVersionedProviderCommandMap(settings.cachedSlashCommands);
+    if (versionedCommandsByProvider) {
+      return versionedCommandsByProvider[provider] ?? null;
+    }
+
+    if (provider === 'CODEX') {
+      const legacyCommandsByProvider = toProviderCommandMap(settings.cachedSlashCommands);
+      return legacyCommandsByProvider?.CODEX ?? null;
+    }
+
+    return null;
   }
 
   async setCachedCommands(provider: SessionProvider, commands: CommandInfo[]): Promise<void> {
-    if (commands.length === 0) {
-      return;
-    }
-
     const normalized = normalizeCommands(commands);
 
     try {
-      const settings = await userSettingsAccessor.get();
-      const existingMap = toProviderCommandMap(settings.cachedSlashCommands) ?? {};
-      const existing = existingMap[provider] ?? null;
+      for (let attempt = 0; attempt < SLASH_COMMAND_CACHE_UPDATE_MAX_ATTEMPTS; attempt += 1) {
+        const settings = await userSettingsService.get();
+        const existingMap = toVersionedProviderCommandMap(settings.cachedSlashCommands) ?? {};
+        const legacyMap = toProviderCommandMap(settings.cachedSlashCommands);
+        if (!existingMap.CODEX && legacyMap?.CODEX) {
+          existingMap.CODEX = legacyMap.CODEX;
+        }
+        const existing = existingMap[provider] ?? null;
 
-      if (existing && areCommandsEqual(existing, normalized)) {
-        return;
+        if (existing && areCommandsEqual(existing, normalized)) {
+          return;
+        }
+
+        const nextPayload: CachedSlashCommandsByProvider = {
+          ...existingMap,
+          [provider]: normalized,
+        };
+
+        const updated = await userSettingsService.compareAndSetCachedSlashCommands(
+          settings.updatedAt,
+          toProviderPayload(nextPayload)
+        );
+        if (updated) {
+          return;
+        }
       }
 
-      const nextPayload: CachedSlashCommandsByProvider = {
-        ...existingMap,
-        [provider]: normalized,
-      };
-
-      await userSettingsAccessor.update({
-        cachedSlashCommands: toProviderPayload(nextPayload),
-      });
+      throw new Error(
+        `Failed to update cached slash commands for ${provider} after ${SLASH_COMMAND_CACHE_UPDATE_MAX_ATTEMPTS} attempts`
+      );
     } catch (error) {
       logger.warn('Failed to update cached slash commands', {
         error: error instanceof Error ? error.message : String(error),

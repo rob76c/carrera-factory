@@ -1,23 +1,27 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import ts from 'typescript';
 
 import {
+  infrastructureServiceRegistry,
   prismaModelNames,
   type ServiceName,
   serviceRegistry,
 } from '../src/backend/services/registry';
+import { getInfrastructureServiceClassificationErrors } from '../src/backend/services/service-registry-check.helpers';
 
 const rootDir = process.cwd();
 const servicesRoot = path.join(rootDir, 'src/backend/services');
 const schemaPath = path.join(rootDir, 'prisma/schema.prisma');
-const infraServiceFileNames = new Set(
-  readdirSync(servicesRoot, { withFileTypes: true })
-    .filter(
-      (entry) => entry.isFile() && (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx'))
-    )
-    .map((entry) => entry.name.replace(/\.(ts|tsx)$/u, ''))
-);
+const prismaGeneratedRoot = path.join(rootDir, 'prisma/generated');
+const publicPrismaGeneratedSpecifiers = new Set([
+  '@prisma-gen/browser',
+  '@prisma-gen/client',
+  '@prisma-gen/commonInputTypes',
+  '@prisma-gen/enums',
+  '@prisma-gen/models',
+]);
+const infrastructureServiceNames = new Set(Object.keys(infrastructureServiceRegistry));
 
 function readPrismaModelNames(schemaFilePath: string): Set<string> {
   const schema = readFileSync(schemaFilePath, 'utf8');
@@ -25,22 +29,21 @@ function readPrismaModelNames(schemaFilePath: string): Set<string> {
   return new Set(Array.from(modelNameMatches, (match) => match[1]));
 }
 
-function listTypeScriptFiles(dirPath: string): string[] {
+function listTypeScriptFiles(dirPath: string, includeTests = false): string[] {
   const entries = readdirSync(dirPath, { withFileTypes: true });
   const filePaths: string[] = [];
 
   for (const entry of entries) {
     const entryPath = path.join(dirPath, entry.name);
     if (entry.isDirectory()) {
-      filePaths.push(...listTypeScriptFiles(entryPath));
+      filePaths.push(...listTypeScriptFiles(entryPath, includeTests));
       continue;
     }
 
     if (
       entry.isFile() &&
       (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx')) &&
-      !entry.name.endsWith('.test.ts') &&
-      !entry.name.endsWith('.test.tsx')
+      (includeTests || !(entry.name.endsWith('.test.ts') || entry.name.endsWith('.test.tsx')))
     ) {
       filePaths.push(entryPath);
     }
@@ -62,6 +65,13 @@ function collectModuleSpecifiers(filePath: string): string[] {
         ts.isStringLiteral(moduleSpecifier) &&
         moduleSpecifier.text.length > 0
       ) {
+        moduleSpecifiers.push(moduleSpecifier.text);
+      }
+    }
+
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const [moduleSpecifier] = node.arguments;
+      if (moduleSpecifier && ts.isStringLiteral(moduleSpecifier)) {
         moduleSpecifiers.push(moduleSpecifier.text);
       }
     }
@@ -151,6 +161,12 @@ function isRegisteredServiceName(serviceName: string): serviceName is ServiceNam
   return Object.hasOwn(serviceRegistry, serviceName);
 }
 
+function checkInfrastructureServiceClassification(errors: string[]): void {
+  errors.push(
+    ...getInfrastructureServiceClassificationErrors(servicesRoot, infrastructureServiceRegistry)
+  );
+}
+
 function getFromService(relativePath: string): ServiceName | null {
   const fromMatch = relativePath.match(/^src\/backend\/services\/([^/]+)\//);
   if (!fromMatch) {
@@ -191,8 +207,7 @@ function validateCrossServiceImport(
   }
 
   if (!isRegisteredServiceName(serviceImport.toServiceName)) {
-    // Registry scope is service capsules only. Root infra service files are out of scope.
-    if (infraServiceFileNames.has(serviceImport.toServiceName)) {
+    if (infrastructureServiceNames.has(serviceImport.toServiceName)) {
       return;
     }
     errors.push(
@@ -259,6 +274,69 @@ function checkCrossServiceImports(errors: string[]): void {
   }
 }
 
+function isInsideDirectory(filePath: string, directoryPath: string): boolean {
+  const relativePath = path.relative(directoryPath, filePath);
+  return (
+    relativePath.length === 0 || !(relativePath.startsWith('..') || path.isAbsolute(relativePath))
+  );
+}
+
+function checkPrismaGeneratedImport(
+  filePath: string,
+  relativePath: string,
+  moduleSpecifier: string,
+  errors: string[]
+): void {
+  if (moduleSpecifier.startsWith('@prisma-gen/')) {
+    if (!publicPrismaGeneratedSpecifiers.has(moduleSpecifier)) {
+      errors.push(
+        `${relativePath} imports "${moduleSpecifier}", but generated Prisma imports must use public @prisma-gen entrypoints: ${Array.from(publicPrismaGeneratedSpecifiers).join(', ')}.`
+      );
+    }
+    return;
+  }
+
+  if (moduleSpecifier === 'prisma/generated' || moduleSpecifier.startsWith('prisma/generated/')) {
+    errors.push(
+      `${relativePath} imports "${moduleSpecifier}" directly. Use a public @prisma-gen/* entrypoint instead.`
+    );
+    return;
+  }
+
+  if (!moduleSpecifier.startsWith('.')) {
+    return;
+  }
+
+  const resolvedImportPath = path.resolve(path.dirname(filePath), moduleSpecifier);
+  if (isInsideDirectory(resolvedImportPath, prismaGeneratedRoot)) {
+    errors.push(
+      `${relativePath} imports "${moduleSpecifier}" from prisma/generated directly. Use a public @prisma-gen/* entrypoint instead.`
+    );
+  }
+}
+
+function checkPrismaGeneratedImports(errors: string[]): void {
+  const codeRoots = ['src', 'scripts', 'electron', 'packages'];
+
+  for (const codeRoot of codeRoots) {
+    const absoluteCodeRoot = path.join(rootDir, codeRoot);
+    if (!existsSync(absoluteCodeRoot)) {
+      continue;
+    }
+
+    for (const filePath of listTypeScriptFiles(absoluteCodeRoot, true)) {
+      if (isInsideDirectory(filePath, prismaGeneratedRoot)) {
+        continue;
+      }
+
+      const relativePath = getRelativeServiceFilePath(filePath);
+      for (const moduleSpecifier of collectModuleSpecifiers(filePath)) {
+        checkPrismaGeneratedImport(filePath, relativePath, moduleSpecifier, errors);
+      }
+    }
+  }
+}
+
 function checkRegistryModelList(errors: string[]): void {
   const schemaModelNames = readPrismaModelNames(schemaPath);
 
@@ -284,9 +362,11 @@ function checkRegistryModelList(errors: string[]): void {
 function main(): void {
   const errors: string[] = [];
 
+  checkInfrastructureServiceClassification(errors);
   checkRegistryModelList(errors);
   checkDependencyGraph(errors);
   checkCrossServiceImports(errors);
+  checkPrismaGeneratedImports(errors);
 
   if (errors.length > 0) {
     const output = [

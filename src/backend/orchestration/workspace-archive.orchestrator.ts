@@ -1,7 +1,12 @@
-import { TRPCError } from '@trpc/server';
+import { ApplicationError } from '@/backend/lib/application-error';
 import { createLogger } from '@/backend/services/logger.service';
-import { workspaceStateMachine, worktreeLifecycleService } from '@/backend/services/workspace';
+import {
+  workspaceMaintenanceService,
+  workspaceStateMachine,
+  worktreeLifecycleService,
+} from '@/backend/services/workspace';
 import type { WorkspaceWithProject } from './types';
+import { fireLifecycleNotification } from './workspace-children.orchestrator';
 
 const logger = createLogger('workspace-archive-orchestrator');
 
@@ -10,6 +15,7 @@ interface WorktreeCleanupOptions {
 }
 
 export type ArchiveWorkspaceDependencies = {
+  cleanupWorkspaceScopedCaches(workspaceId: string): void;
   githubCLIService: {
     addIssueComment(
       owner: string,
@@ -29,6 +35,56 @@ export type ArchiveWorkspaceDependencies = {
     destroyWorkspaceTerminals(workspaceId: string): void;
   };
 };
+
+export type WorkspaceRuntimeCleanupDependencies = {
+  runScriptService: Pick<ArchiveWorkspaceDependencies['runScriptService'], 'stopRunScript'>;
+  sessionService: ArchiveWorkspaceDependencies['sessionService'];
+  terminalService: ArchiveWorkspaceDependencies['terminalService'];
+};
+
+export interface ArchiveRecoveryResult {
+  archived: string[];
+  failed: Array<{ id: string; error: string }>;
+}
+
+export async function cleanupWorkspaceRuntimeResources(
+  workspaceId: string,
+  services: WorkspaceRuntimeCleanupDependencies,
+  operation: 'archive' | 'delete'
+): Promise<void> {
+  const { runScriptService, sessionService, terminalService } = services;
+
+  const cleanupResults = await Promise.allSettled([
+    sessionService.stopWorkspaceSessions(workspaceId),
+    (async () => {
+      const result = await runScriptService.stopRunScript(workspaceId);
+      if (!result.success) {
+        throw new Error(result.error ?? 'Unknown run script stop failure');
+      }
+    })(),
+    Promise.resolve().then(() => {
+      terminalService.destroyWorkspaceTerminals(workspaceId);
+    }),
+  ]);
+
+  const cleanupErrors = cleanupResults.flatMap((result) =>
+    result.status === 'rejected' ? [result.reason] : []
+  );
+
+  if (cleanupErrors.length > 0) {
+    logger.error(`Failed to cleanup workspace resources before ${operation}`, {
+      workspaceId,
+      errors: cleanupErrors.map((error) =>
+        error instanceof Error ? error.message : String(error)
+      ),
+    });
+    const message = `Failed to cleanup workspace resources before ${operation}`;
+    throw new ApplicationError('INTERNAL_ERROR', message, {
+      cause:
+        cleanupErrors.length === 1 ? cleanupErrors[0] : new AggregateError(cleanupErrors, message),
+    });
+  }
+}
 
 /**
  * Handle GitHub issue after workspace archive.
@@ -72,6 +128,44 @@ async function handleGitHubIssueOnArchive(
   }
 }
 
+async function completeArchive(
+  workspace: WorkspaceWithProject,
+  options: WorktreeCleanupOptions,
+  services: ArchiveWorkspaceDependencies
+) {
+  await cleanupWorkspaceRuntimeResources(workspace.id, services, 'archive');
+
+  try {
+    await worktreeLifecycleService.cleanupWorkspaceWorktree(workspace, options);
+  } catch (error) {
+    logger.error('Failed to cleanup workspace worktree before archive', {
+      workspaceId: workspace.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+
+  const archivedWorkspace = await workspaceStateMachine.markArchived(workspace.id);
+  services.cleanupWorkspaceScopedCaches(workspace.id);
+  services.runScriptService.evictWorkspaceBuffers(workspace.id);
+
+  // Notify parent workspace that this child was archived (fire-and-forget)
+  fireLifecycleNotification(
+    workspace.id,
+    `Child workspace "${workspace.name}" has been archived.`
+  ).catch((err: unknown) =>
+    logger.warn('Failed to send archive lifecycle notification', {
+      workspaceId: workspace.id,
+      error: err,
+    })
+  );
+
+  // Handle associated GitHub issue after successful archive
+  await handleGitHubIssueOnArchive(workspace, services);
+
+  return archivedWorkspace;
+}
+
 /**
  * Archive a workspace: validates the transition, stops all running processes,
  * cleans up the worktree, and updates the state.
@@ -84,66 +178,18 @@ export async function archiveWorkspace(
   options: WorktreeCleanupOptions,
   services: ArchiveWorkspaceDependencies
 ) {
-  const { runScriptService, sessionService, terminalService } = services;
-
   if (!workspaceStateMachine.isValidTransition(workspace.status, 'ARCHIVING')) {
-    throw new TRPCError({
-      code: 'BAD_REQUEST',
-      message: `Cannot archive workspace from status: ${workspace.status}`,
-    });
+    throw new ApplicationError(
+      'INVALID_INPUT',
+      `Cannot archive workspace from status: ${workspace.status}`
+    );
   }
 
   const { previousStatus: statusBeforeArchive } =
     await workspaceStateMachine.startArchivingWithSourceStatus(workspace.id);
 
   try {
-    const cleanupResults = await Promise.allSettled([
-      sessionService.stopWorkspaceSessions(workspace.id),
-      (async () => {
-        const result = await runScriptService.stopRunScript(workspace.id);
-        if (!result.success) {
-          throw new Error(result.error ?? 'Unknown run script stop failure');
-        }
-      })(),
-      Promise.resolve().then(() => {
-        terminalService.destroyWorkspaceTerminals(workspace.id);
-      }),
-    ]);
-
-    const cleanupErrors = cleanupResults.flatMap((result) =>
-      result.status === 'rejected' ? [result.reason] : []
-    );
-
-    if (cleanupErrors.length > 0) {
-      logger.error('Failed to cleanup workspace resources before archive', {
-        workspaceId: workspace.id,
-        errors: cleanupErrors.map((error) =>
-          error instanceof Error ? error.message : String(error)
-        ),
-      });
-      throw new TRPCError({
-        code: 'INTERNAL_SERVER_ERROR',
-        message: 'Failed to cleanup workspace resources before archive',
-      });
-    }
-
-    try {
-      await worktreeLifecycleService.cleanupWorkspaceWorktree(workspace, options);
-    } catch (error) {
-      logger.error('Failed to cleanup workspace worktree before archive', {
-        workspaceId: workspace.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      throw error;
-    }
-
-    const archivedWorkspace = await workspaceStateMachine.markArchived(workspace.id);
-    runScriptService.evictWorkspaceBuffers(workspace.id);
-
-    // Handle associated GitHub issue after successful archive
-    await handleGitHubIssueOnArchive(workspace, services);
-
-    return archivedWorkspace;
+    return await completeArchive(workspace, options, services);
   } catch (error) {
     try {
       await workspaceStateMachine.transition(workspace.id, statusBeforeArchive);
@@ -156,4 +202,56 @@ export async function archiveWorkspace(
     }
     throw error;
   }
+}
+
+/**
+ * Resume ARCHIVING workspaces left behind by process termination.
+ * Normal archive rollback cannot run when the process exits mid-request, so
+ * startup recovery either completes the archive or moves the workspace to
+ * FAILED where users can see it and retry.
+ */
+export async function recoverStaleArchivingWorkspaces(
+  services: ArchiveWorkspaceDependencies,
+  options: WorktreeCleanupOptions = { commitUncommitted: true }
+): Promise<ArchiveRecoveryResult> {
+  const staleWorkspaces = await workspaceMaintenanceService.findStaleArchiving();
+  const result: ArchiveRecoveryResult = { archived: [], failed: [] };
+
+  if (staleWorkspaces.length === 0) {
+    return result;
+  }
+
+  logger.warn('Recovering stale archiving workspaces on startup', {
+    count: staleWorkspaces.length,
+    workspaceIds: staleWorkspaces.map((workspace) => workspace.id),
+  });
+
+  for (const workspace of staleWorkspaces) {
+    try {
+      await completeArchive(workspace, options, services);
+      result.archived.push(workspace.id);
+      logger.info('Recovered stale archiving workspace', { workspaceId: workspace.id });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      result.failed.push({ id: workspace.id, error: errorMessage });
+      logger.error('Failed to recover stale archiving workspace', {
+        workspaceId: workspace.id,
+        error: errorMessage,
+      });
+
+      try {
+        await workspaceStateMachine.transition(workspace.id, 'FAILED', {
+          errorMessage: `Archive recovery failed after restart: ${errorMessage}`,
+        });
+      } catch (transitionError) {
+        logger.error('Failed to mark stale archiving workspace as failed', {
+          workspaceId: workspace.id,
+          error:
+            transitionError instanceof Error ? transitionError.message : String(transitionError),
+        });
+      }
+    }
+  }
+
+  return result;
 }

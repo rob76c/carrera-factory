@@ -2,10 +2,89 @@ import { SessionProvider } from '@prisma-gen/client';
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 import { getProviderUnavailableMessage } from '@/backend/lib/provider-cli-availability';
-import { getQuickAction, listQuickActions } from '@/backend/prompts/quick-actions';
-import { sessionDataService, sessionProviderResolverService } from '@/backend/services/session';
 import { SessionStatus } from '@/shared/core';
-import { publicProcedure, router } from './trpc';
+import { type Context, publicProcedure, router } from './trpc';
+
+const createSessionInputSchema = z.object({
+  workspaceId: z.string(),
+  name: z.string().optional(),
+  workflow: z.string(),
+  model: z.string().optional(),
+  provider: z.nativeEnum(SessionProvider).optional(),
+  initialMessage: z.string().optional(),
+});
+
+async function createAgentSessionFromInput(
+  ctx: Context,
+  input: z.infer<typeof createSessionInputSchema>
+) {
+  const {
+    configService,
+    sessionDataService,
+    sessionDomainService,
+    sessionProviderResolverService,
+  } = ctx.appContext.services;
+  const maxSessions = configService.getMaxSessionsPerWorkspace();
+
+  const provider = await sessionProviderResolverService.resolveSessionProvider({
+    workspaceId: input.workspaceId,
+    explicitProvider: input.provider,
+  });
+
+  const cliHealth = await ctx.appContext.services.cliHealthService.checkHealth();
+  const providerUnavailableMessage = getProviderUnavailableMessage(provider, cliHealth);
+  if (providerUnavailableMessage) {
+    throw new TRPCError({
+      code: 'PRECONDITION_FAILED',
+      message: providerUnavailableMessage,
+    });
+  }
+
+  const creation = await sessionDataService.createAgentSessionWithinWorkspaceLimit({
+    workspaceId: input.workspaceId,
+    name: input.name,
+    workflow: input.workflow,
+    model: input.model,
+    provider,
+    maxSessions,
+  });
+  if (creation.outcome === 'limit_reached') {
+    throw new TRPCError({
+      code: 'PRECONDITION_FAILED',
+      message: `Maximum sessions per workspace (${maxSessions}) reached`,
+    });
+  }
+
+  const session = creation.session;
+  if (input.initialMessage) {
+    sessionDomainService.storeInitialMessage(session.id, input.initialMessage);
+  }
+  return session;
+}
+
+async function rollbackCreatedSession(
+  sessionId: string,
+  sessionDataService: Context['appContext']['services']['sessionDataService'],
+  sessionDomainService: Context['appContext']['services']['sessionDomainService']
+) {
+  sessionDomainService.clearSession(sessionId);
+
+  try {
+    await sessionDataService.deleteAgentSession(sessionId);
+  } catch {
+    try {
+      await sessionDataService.updateAgentSession(sessionId, {
+        status: SessionStatus.FAILED,
+        providerProcessPid: null,
+        providerMetadata: {
+          rollbackReason: 'startup_failed_after_create',
+        },
+      });
+    } catch {
+      // Preserve the startup error even if rollback cleanup cannot repair the row.
+    }
+  }
+}
 
 export const sessionRouter = router({
   // Session limits
@@ -18,12 +97,12 @@ export const sessionRouter = router({
   // Quick Actions
 
   // List all available quick actions
-  listQuickActions: publicProcedure.query(() => listQuickActions()),
+  listQuickActions: publicProcedure.query(({ ctx }) => ctx.appContext.services.listQuickActions()),
 
   // Get a specific quick action by ID
   getQuickAction: publicProcedure
     .input(z.object({ id: z.string() }))
-    .query(({ input }) => getQuickAction(input.id)),
+    .query(({ ctx, input }) => ctx.appContext.services.getQuickAction(input.id)),
 
   // Sessions
 
@@ -37,7 +116,7 @@ export const sessionRouter = router({
       })
     )
     .query(async ({ ctx, input }) => {
-      const { sessionService } = ctx.appContext.services;
+      const { sessionDataService, sessionService } = ctx.appContext.services;
       const { workspaceId, ...filters } = input;
       const sessions = await sessionDataService.findAgentSessionsByWorkspaceId(
         workspaceId,
@@ -51,7 +130,8 @@ export const sessionRouter = router({
     }),
 
   // Get session by ID
-  getSession: publicProcedure.input(z.object({ id: z.string() })).query(async ({ input }) => {
+  getSession: publicProcedure.input(z.object({ id: z.string() })).query(async ({ ctx, input }) => {
+    const { sessionDataService } = ctx.appContext.services;
     const session = await sessionDataService.findAgentSessionById(input.id);
     if (!session) {
       throw new Error(`Session not found: ${input.id}`);
@@ -60,57 +140,40 @@ export const sessionRouter = router({
   }),
 
   // Create a new session
-  createSession: publicProcedure
+  createSession: publicProcedure.input(createSessionInputSchema).mutation(({ ctx, input }) => {
+    return createAgentSessionFromInput(ctx, input);
+  }),
+
+  // Create and start a session as one atomic user action.
+  createAndStartSession: publicProcedure
     .input(
-      z.object({
-        workspaceId: z.string(),
-        name: z.string().optional(),
-        workflow: z.string(),
-        model: z.string().optional(),
-        provider: z.nativeEnum(SessionProvider).optional(),
-        initialMessage: z.string().optional(),
+      createSessionInputSchema.extend({
+        initialPrompt: z.string().optional(),
       })
     )
     .mutation(async ({ ctx, input }) => {
-      const { configService, sessionDomainService } = ctx.appContext.services;
-      // Check per-workspace session limit
-      const maxSessions = configService.getMaxSessionsPerWorkspace();
-      const existingSessions = await sessionDataService.findAgentSessionsByWorkspaceId(
-        input.workspaceId
-      );
+      const { sessionDataService, sessionService, sessionDomainService } = ctx.appContext.services;
+      const session = await createAgentSessionFromInput(ctx, input);
 
-      if (existingSessions.length >= maxSessions) {
-        throw new TRPCError({
-          code: 'PRECONDITION_FAILED',
-          message: `Maximum sessions per workspace (${maxSessions}) reached`,
+      try {
+        await sessionService.startSession(session.id, {
+          initialPrompt: input.initialPrompt,
         });
+      } catch (error) {
+        try {
+          await sessionService.stopSession(session.id, {
+            cleanupTransientRatchetSession: false,
+          });
+        } catch {
+          // Best-effort runtime cleanup; preserve the startup error.
+        }
+
+        await rollbackCreatedSession(session.id, sessionDataService, sessionDomainService);
+
+        throw error;
       }
 
-      const provider = await sessionProviderResolverService.resolveSessionProvider({
-        workspaceId: input.workspaceId,
-        explicitProvider: input.provider,
-      });
-
-      const cliHealth = await ctx.appContext.services.cliHealthService.checkHealth();
-      const providerUnavailableMessage = getProviderUnavailableMessage(provider, cliHealth);
-      if (providerUnavailableMessage) {
-        throw new TRPCError({
-          code: 'PRECONDITION_FAILED',
-          message: providerUnavailableMessage,
-        });
-      }
-
-      const session = await sessionDataService.createAgentSession({
-        workspaceId: input.workspaceId,
-        name: input.name,
-        workflow: input.workflow,
-        model: input.model,
-        provider,
-      });
-      if (input.initialMessage) {
-        sessionDomainService.storeInitialMessage(session.id, input.initialMessage);
-      }
-      return session;
+      return (await sessionDataService.findAgentSessionById(session.id)) ?? session;
     }),
 
   // Update a session (metadata only - use start/stop for status changes)
@@ -123,7 +186,8 @@ export const sessionRouter = router({
         model: z.string().optional(),
       })
     )
-    .mutation(({ input }) => {
+    .mutation(({ ctx, input }) => {
+      const { sessionDataService } = ctx.appContext.services;
       const { id, ...updates } = input;
       return sessionDataService.updateAgentSession(id, updates);
     }),
@@ -137,7 +201,7 @@ export const sessionRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      const { sessionService } = ctx.appContext.services;
+      const { sessionDataService, sessionService } = ctx.appContext.services;
       await sessionService.startSession(input.id, {
         initialPrompt: input.initialPrompt,
       });
@@ -148,7 +212,7 @@ export const sessionRouter = router({
   stopSession: publicProcedure
     .input(z.object({ id: z.string() }))
     .mutation(async ({ ctx, input }) => {
-      const { sessionService } = ctx.appContext.services;
+      const { sessionDataService, sessionService } = ctx.appContext.services;
       await sessionService.stopSession(input.id, {
         cleanupTransientRatchetSession: false,
       });
@@ -159,7 +223,7 @@ export const sessionRouter = router({
   restartSession: publicProcedure
     .input(z.object({ id: z.string() }))
     .mutation(async ({ ctx, input }) => {
-      const { sessionService } = ctx.appContext.services;
+      const { sessionDataService, sessionService } = ctx.appContext.services;
       await sessionService.restartSession(input.id);
       return sessionDataService.findAgentSessionById(input.id);
     }),
@@ -168,7 +232,7 @@ export const sessionRouter = router({
   deleteSession: publicProcedure
     .input(z.object({ id: z.string() }))
     .mutation(async ({ ctx, input }) => {
-      const { sessionService, sessionDomainService } = ctx.appContext.services;
+      const { sessionDataService, sessionService, sessionDomainService } = ctx.appContext.services;
       // Stop process first to prevent orphaned session processes
       await sessionService.stopSession(input.id, {
         cleanupTransientRatchetSession: false,
@@ -189,16 +253,18 @@ export const sessionRouter = router({
         limit: z.number().min(1).max(100).optional(),
       })
     )
-    .query(({ input }) => {
+    .query(({ ctx, input }) => {
+      const { terminalSessionService } = ctx.appContext.services;
       const { workspaceId, ...filters } = input;
-      return sessionDataService.findTerminalSessionsByWorkspaceId(workspaceId, filters);
+      return terminalSessionService.findWorkspaceSessions(workspaceId, filters);
     }),
 
   // Get terminal session by ID
   getTerminalSession: publicProcedure
     .input(z.object({ id: z.string() }))
-    .query(async ({ input }) => {
-      const session = await sessionDataService.findTerminalSessionById(input.id);
+    .query(async ({ ctx, input }) => {
+      const { terminalSessionService } = ctx.appContext.services;
+      const session = await terminalSessionService.findSession(input.id);
       if (!session) {
         throw new Error(`Terminal session not found: ${input.id}`);
       }
@@ -213,8 +279,9 @@ export const sessionRouter = router({
         name: z.string().optional(),
       })
     )
-    .mutation(({ input }) => {
-      return sessionDataService.createTerminalSession(input);
+    .mutation(({ ctx, input }) => {
+      const { terminalSessionService } = ctx.appContext.services;
+      return terminalSessionService.registerSession(input);
     }),
 
   // Update a terminal session
@@ -222,18 +289,18 @@ export const sessionRouter = router({
     .input(
       z.object({
         id: z.string(),
-        name: z.string().optional(),
+        name: z.string(),
       })
     )
-    .mutation(({ input }) => {
-      const { id, ...updates } = input;
-      return sessionDataService.updateTerminalSession(id, updates);
+    .mutation(({ ctx, input }) => {
+      const { terminalSessionService } = ctx.appContext.services;
+      return terminalSessionService.renameSession(input.id, input.name);
     }),
 
   // Delete a terminal session
   deleteTerminalSession: publicProcedure
     .input(z.object({ id: z.string() }))
-    .mutation(({ input }) => {
-      return sessionDataService.deleteTerminalSession(input.id);
+    .mutation(({ ctx, input }) => {
+      return ctx.appContext.services.terminalSessionService.removeSession(input.id);
     }),
 });

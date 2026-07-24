@@ -1,7 +1,51 @@
-import { CircleDot, GitBranch, GitPullRequest } from 'lucide-react';
-import { PendingRequestBadge } from '@/client/components/pending-request-badge';
+import {
+  ClockIcon,
+  DotOutlineIcon,
+  GitBranchIcon,
+  GitPullRequestIcon,
+  TreeStructureIcon,
+} from '@phosphor-icons/react';
 import type { ServerWorkspace } from '@/client/components/use-workspace-list-state';
 import { WorkspaceStatusIcon } from '@/client/components/workspace-status-icon';
+import { getVisibleWorkspaceStatusReason } from '@/client/lib/workspace-status-reason-display';
+
+function CreationSourceIcon({ creationSource }: { creationSource?: string | null }) {
+  if (creationSource === 'PERIODIC_TASK') {
+    return <ClockIcon className="h-3 w-3 shrink-0 text-muted-foreground" />;
+  }
+  if (creationSource === 'CHILD_WORKSPACE') {
+    return <TreeStructureIcon className="h-3 w-3 shrink-0 text-violet-500" />;
+  }
+  return null;
+}
+
+function PrLink({ prNumber, onOpenPr }: { prNumber: number; onOpenPr?: () => void }) {
+  const content = (
+    <>
+      <GitPullRequestIcon className="h-2.5 w-2.5" />
+      <span>#{prNumber}</span>
+    </>
+  );
+  if (onOpenPr) {
+    return (
+      <button
+        type="button"
+        className="flex items-center gap-0.5 hover:text-foreground"
+        onPointerUp={(event) => {
+          event.stopPropagation();
+        }}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onOpenPr();
+        }}
+      >
+        {content}
+      </button>
+    );
+  }
+  return <span className="flex items-center gap-0.5">{content}</span>;
+}
 
 export function WorkspaceItemContent({
   workspace,
@@ -28,6 +72,7 @@ export function WorkspaceItemContent({
       ? `#${workspace.githubIssueNumber}`
       : workspace.linearIssueId;
   const hasIssue = Boolean(issueLabel);
+  const statusReason = getVisibleWorkspaceStatusReason(workspace.statusReason);
 
   return (
     <div className="flex flex-col gap-0.5 min-w-0 w-full">
@@ -36,6 +81,7 @@ export function WorkspaceItemContent({
           pendingRequestType={workspace.pendingRequestType}
           isWorking={workspace.isWorking}
         />
+        <CreationSourceIcon creationSource={workspace.creationSource} />
         <span className="truncate text-sm">{workspace.name}</span>
       </div>
       {hasMetaRow && (
@@ -43,7 +89,7 @@ export function WorkspaceItemContent({
           <span className="flex items-center gap-1 min-w-0 truncate">
             {showBranch && (
               <>
-                <GitBranch className="h-2.5 w-2.5 shrink-0" />
+                <GitBranchIcon className="h-2.5 w-2.5 shrink-0" />
                 <span className="font-mono truncate">{workspace.branchName}</span>
               </>
             )}
@@ -57,32 +103,15 @@ export function WorkspaceItemContent({
             )}
           </span>
           <span className="shrink-0 justify-self-end">
-            {showPR &&
-              (onOpenPr ? (
-                <button
-                  type="button"
-                  className="flex items-center gap-0.5 hover:text-foreground"
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    onOpenPr();
-                  }}
-                >
-                  <GitPullRequest className="h-2.5 w-2.5" />
-                  <span>#{workspace.prNumber}</span>
-                </button>
-              ) : (
-                <span className="flex items-center gap-0.5">
-                  <GitPullRequest className="h-2.5 w-2.5" />
-                  <span>#{workspace.prNumber}</span>
-                </span>
-              ))}
+            {showPR && workspace.prNumber != null && (
+              <PrLink prNumber={workspace.prNumber} onOpenPr={onOpenPr} />
+            )}
           </span>
         </div>
       )}
-      {workspace.pendingRequestType && (
-        <div className="pl-[calc(0.5rem+8px)]">
-          <PendingRequestBadge type={workspace.pendingRequestType} size="xs" />
+      {statusReason && (
+        <div className="pl-[calc(0.5rem+8px)] text-[11px] text-muted-foreground truncate">
+          {statusReason.label}
         </div>
       )}
       {hasIssue && (
@@ -91,18 +120,21 @@ export function WorkspaceItemContent({
             <button
               type="button"
               className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground underline-offset-2 hover:underline"
+              onPointerUp={(event) => {
+                event.stopPropagation();
+              }}
               onClick={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
                 onOpenIssue();
               }}
             >
-              <CircleDot className="h-2.5 w-2.5" />
+              <DotOutlineIcon className="h-2.5 w-2.5" />
               {issueLabel}
             </button>
           ) : (
             <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
-              <CircleDot className="h-2.5 w-2.5" />
+              <DotOutlineIcon className="h-2.5 w-2.5" />
               {issueLabel}
             </span>
           )}

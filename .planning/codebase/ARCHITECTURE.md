@@ -1,232 +1,314 @@
+<!-- refreshed: 2026-05-17 -->
 # Architecture
 
-**Analysis Date:** 2026-02-10 (post-SRP refactor)
+**Analysis Date:** 2026-05-17
+
+## System Overview
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                  Runtime Entry Points                        │
+├──────────────────┬──────────────────┬───────────────────────┤
+│ CLI/standalone   │ React/Vite UI     │ Electron wrapper      │
+│ `src/cli/index.ts`│ `src/client/*`   │ `electron/main/*`     │
+└────────┬─────────┴────────┬─────────┴──────────┬────────────┘
+         │                  │                     │
+         ▼                  ▼                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  Express + tRPC + WebSocket                  │
+│ `src/backend/server.ts`, `src/backend/trpc/`,                │
+│ `src/backend/routers/websocket/`                             │
+└────────┬───────────────────────────────┬────────────────────┘
+         │                               │
+         ▼                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Service Capsules + Orchestration                             │
+│ `src/backend/services/{name}/`, `src/backend/orchestration/` │
+└────────┬───────────────────────────────┬────────────────────┘
+         │                               │
+         ▼                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│ SQLite/Prisma + In-memory Runtime State + External CLIs       │
+│ `prisma/schema.prisma`, `src/backend/db.ts`, ACP, git, gh     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Component Responsibilities
+
+| Component | Responsibility | File |
+|-----------|----------------|------|
+| CLI entrypoint | Runs `ff serve`, migrations, production build, proxy mode, and hidden internal ACP adapter command. | `src/cli/index.ts` |
+| Backend server | Configures Express middleware, health routes, tRPC, WebSocket upgrades, static SPA serving, startup reconciliation, schedulers, and graceful shutdown. | `src/backend/server.ts` |
+| App context | Creates injectable service graph for backend runtime and tests. Use it when code needs cross-cutting services from request context. | `src/backend/app-context.ts` |
+| tRPC root router | Composes domain routers into the typed API consumed by the React client. | `src/backend/trpc/index.ts` |
+| WebSocket routers | Own chat, terminal, setup terminal, dev log, post-run log, and snapshot streaming upgrade handlers. | `src/backend/routers/websocket/index.ts` |
+| Service registry | Declares service capsules, allowed service dependencies, and Prisma model ownership. | `src/backend/services/registry.ts` |
+| Service capsules | Own business logic and resource access for one domain behind a public barrel. | `src/backend/services/{name}/index.ts` |
+| Orchestration | Coordinates cross-service workflows and bridge wiring without making services import each other. | `src/backend/orchestration/` |
+| Snapshot store pipeline | Converts domain events and periodic reconciliation into project-scoped workspace snapshots for UI cache updates. | `src/backend/orchestration/event-collector.orchestrator.ts`, `src/backend/services/workspace-snapshot-store.service.ts` |
+| React app | Provides route tree, layout, tRPC provider, WebSocket hooks, and feature views. | `src/client/router.tsx`, `src/client/root.tsx` |
+| Shared UI components | Houses shadcn/ui primitives and reusable chat/workspace/project UI. | `src/components/` |
+| Shared contracts | Holds cross-runtime enums, schemas, ACP protocol types, websocket schemas, and pure helpers. | `src/shared/`, `src/lib/` |
+| Electron shell | Starts the backend in-process for packaged desktop builds and loads the frontend in a secure BrowserWindow. | `electron/main/server-manager.ts`, `electron/main/lifecycle.ts` |
+| Prisma schema | Defines persistent domain records and enum state machines. | `prisma/schema.prisma` |
 
 ## Pattern Overview
 
-**Overall:** Full-stack Express + tRPC + React monorepo with clear backend/frontend separation and domain-driven module architecture.
+**Overall:** Modular TypeScript monolith with service capsules, orchestration bridges, typed tRPC APIs, and WebSocket streams.
 
 **Key Characteristics:**
-- **tRPC API Layer**: Backend exposes typed procedures via tRPC (Express adapter), consumed by React frontend via `@trpc/react-query`
-- **Domain Module Architecture**: Business logic organized into 6 domain modules in `src/backend/domains/` (session, workspace, github, ratchet, terminal, run-script)
-- **Orchestration Layer**: Cross-domain flows coordinated via `src/backend/orchestration/` with bridge interfaces
-- **Infrastructure Services**: ~25 cross-cutting services in `src/backend/services/` (logger, config, scheduler, health, etc.)
-- **Resource Accessors**: Database layer abstraction in `src/backend/resource_accessors/` (11 accessors) wrapping Prisma
-- **SQLite + Prisma**: Local-first database with migrations, schema-driven types
+- Express hosts both `/api/trpc` and WebSocket upgrade endpoints; in production it also serves the Vite SPA from `dist/client`.
+- Backend domains are service capsules under `src/backend/services/{name}/` with `index.ts` as the only public API.
+- Cross-service behavior belongs in `src/backend/orchestration/`, which imports service barrels and configures bridge objects.
+- Data access is kept in each capsule's `resources/` directory and backed by Prisma models declared in `prisma/schema.prisma`.
+- React views consume tRPC through `src/client/lib/trpc.ts` and realtime state through `useWebSocketTransport`.
+- Architecture boundaries are enforced by `scripts/check-service-registry.ts` and `.dependency-cruiser.cjs`; both checks pass for this tree.
 
 ## Layers
 
-**API/RPC Layer:**
-- Purpose: Expose backend functionality to frontend via typed RPC procedures
-- Location: `src/backend/trpc/`
-- Contains: Routers (workspace, session, project, admin, github, etc.), public procedures, context setup
-- Depends on: Domain modules (via barrel imports), resource accessors, Zod schemas
-- Used by: Frontend React components via `src/frontend/lib/trpc.ts`
+**Runtime Entrypoints:**
+- Purpose: Start the app in CLI, standalone backend, dev frontend, proxy, or Electron modes.
+- Location: `src/cli/index.ts`, `src/backend/index.ts`, `src/client/main.tsx`, `electron/main/index.ts`
+- Contains: command parsing, process spawning, migration startup, backend boot, React root creation, Electron lifecycle setup.
+- Depends on: backend server factory, migration runner, Vite, Electron APIs, process environment.
+- Used by: npm scripts in `package.json`, published `ff` binary, Electron packaging.
 
-**Domain Module Layer:**
-- Purpose: Encapsulate all business logic for a specific domain concept
-- Location: `src/backend/domains/{name}/`
-- Contains: 6 domain modules, each with services, types, and co-located tests
-- Domains: `session` (Claude process lifecycle, chat, event forwarding), `workspace` (creation, state machine, worktree, kanban), `github` (CLI, PR snapshots, review monitoring), `ratchet` (CI monitoring, auto-fix, reconciliation), `terminal` (pty management, output buffering), `run-script` (script execution, startup scripts)
-- Pattern: Each domain exports a single public API via `index.ts` barrel file
-- Constraint: Domains never import from sibling domains (enforced by dependency-cruiser)
+**Transport Layer:**
+- Purpose: Expose HTTP and WebSocket interfaces.
+- Location: `src/backend/server.ts`, `src/backend/trpc/`, `src/backend/routers/`
+- Contains: Express middleware, health routes, tRPC routers, WebSocket upgrade handlers, tRPC context.
+- Depends on: `AppContext`, service barrels, orchestration functions, shared schemas.
+- Used by: React tRPC client, WebSocket hooks, CLI/Electron runtime.
+
+**Backend Service Capsules:**
+- Purpose: Encapsulate domain business logic and persistence access.
+- Location: `src/backend/services/{name}/`
+- Contains: `index.ts` barrel, optional `service/` logic, optional `resources/` Prisma accessors, co-located tests.
+- Depends on: same-capsule internals, declared capsule dependencies via barrels, root infrastructure services where allowed.
+- Used by: tRPC routers, WebSocket handlers, orchestration, app context.
 
 **Orchestration Layer:**
-- Purpose: Coordinate cross-domain flows without creating direct domain-to-domain coupling
+- Purpose: Coordinate cross-domain workflows while preserving service boundaries.
 - Location: `src/backend/orchestration/`
-- Contains: `workspace-init.orchestrator.ts`, `workspace-archive.orchestrator.ts`, `domain-bridges.orchestrator.ts`
-- Pattern: Orchestrators import from domain barrels; domains use bridge interfaces for cross-domain callbacks
-- Used by: tRPC routers, server startup (bridge wiring)
-
-**Infrastructure Service Layer:**
-- Purpose: Provide cross-cutting infrastructure capabilities
-- Location: `src/backend/services/`
-- Contains: ~25 infrastructure services (logger, config, scheduler, port allocation, health, rate limiter, notification, file lock, data backup, etc.)
-- Depends on: Configuration, Node.js APIs, external services
-- Used by: Domain modules, orchestrators, tRPC routers
-
-**Resource Access Layer:**
-- Purpose: Encapsulate all Prisma database queries
-- Location: `src/backend/resource_accessors/`
-- Contains: Workspace, project, session, decision-log, terminal-session, user-settings accessors
-- Depends on: Prisma, typed schemas
-- Used by: Domain modules, infrastructure services
-
-**Frontend UI Layer:**
-- Purpose: Render React components, manage user interactions
-- Location: `src/client/` (routes), `src/frontend/components/` (reusable components), `src/components/` (shadcn/ui)
-- Contains: Route pages, feature components, shared components, hooks
-- Depends on: tRPC client, React Router, Zustand (state), React hooks
-- Used by: Browser/Electron renderer
+- Contains: domain bridge configuration, workspace initialization/archive, child workspace coordination, event collection, snapshot reconciliation, schedulers, health helpers.
+- Depends on: service barrels and shared pure helpers.
+- Used by: `src/backend/server.ts`, selected tRPC mutations such as workspace create/archive, startup tasks.
 
 **Data Layer:**
-- Purpose: SQLite database with Prisma ORM
-- Location: `prisma/schema.prisma`, managed via `src/backend/db.ts`
-- Contains: Models (Workspace, ClaudeSession, TerminalSession, Project, DecisionLog, etc.)
-- Depends on: Better SQLite3 adapter
-- Used by: Resource accessors (only access point)
+- Purpose: Persist projects, workspaces, sessions, settings, decision logs, and periodic tasks.
+- Location: `prisma/schema.prisma`, `src/backend/db.ts`, `src/backend/services/*/resources/`
+- Contains: Prisma SQLite schema, Prisma client singleton, resource accessors.
+- Depends on: `@prisma-gen/client`, `@prisma/adapter-better-sqlite3`, config service.
+- Used by: service resources and startup/shutdown cleanup.
+
+**Realtime Runtime State:**
+- Purpose: Track long-lived ACP sessions, terminal processes, chat connections, pending requests, snapshot streams, and schedulers.
+- Location: `src/backend/services/session/service/`, `src/backend/services/terminal/service/`, `src/backend/services/workspace-snapshot-store.service.ts`, `src/backend/orchestration/`
+- Contains: module-level singletons, EventEmitter services, process managers, coalescers, in-memory connection maps.
+- Depends on: service capsules, WebSocket handlers, ACP SDK/adapter processes, node-pty.
+- Used by: WebSocket transports, tRPC status queries, startup recovery, graceful shutdown.
+
+**Frontend Application Layer:**
+- Purpose: Render routes, manage React Query cache, and connect UI controls to API/realtime channels.
+- Location: `src/client/`, `src/components/`, `src/hooks/`, `src/lib/`
+- Contains: React Router route tree, tRPC provider, shared UI components, chat reducer, WebSocket transport hooks, cache mappers.
+- Depends on: shared contracts, `AppRouter` type, React Query, React Router, shadcn/Radix components.
+- Used by: Vite development server, production SPA served by backend, Electron BrowserWindow.
+
+**Shared Contract Layer:**
+- Purpose: Provide frontend/backend-neutral contracts and pure helpers.
+- Location: `src/shared/`, `src/lib/`, `packages/core/src/`
+- Contains: enums, ACP protocol schemas, websocket schemas, sidebar/CI helpers, public core package types.
+- Depends on: framework-neutral packages only.
+- Used by: backend services, frontend UI, package exports.
 
 ## Data Flow
 
-**Workspace Creation Flow:**
+### Primary tRPC Request Path
 
-1. User submits form in `src/client/routes/projects/workspaces/new.tsx`
-2. Frontend calls `trpc.workspace.create()` via `src/frontend/lib/trpc.ts` (tRPC client)
-3. tRPC request hits `src/backend/trpc/workspace.trpc.ts::create` procedure
-4. Procedure calls `WorkspaceCreationService` from `@/backend/domains/workspace`
-5. Workspace domain persists workspace via `workspaceAccessor.create()`
-6. Orchestrator (`workspace-init.orchestrator.ts`) coordinates worktree setup and optional session creation across domains
-7. Frontend receives typed response, updates React state via `@trpc/react-query`
+1. React mounts `<TRPCProvider>` and creates a tRPC client for `/api/trpc` (`src/client/lib/providers.tsx:27`, `src/client/lib/trpc.ts:21`).
+2. Route or component hooks call typed procedures from `trpc.*` (`src/client/routes/projects/workspaces/use-workspace-detail.ts:24`).
+3. Express receives `/api/trpc` and creates request context with `AppContext` plus project/task headers (`src/backend/server.ts:135`, `src/backend/trpc/trpc.ts:23`).
+4. `appRouter` dispatches to domain routers such as `workspaceRouter` and `sessionRouter` (`src/backend/trpc/index.ts:15`).
+5. Routers validate inputs with Zod and call services/orchestrators (`src/backend/trpc/workspace.trpc.ts:117`, `src/backend/trpc/session.trpc.ts:10`).
+6. Service resources read/write Prisma models through accessors (`src/backend/services/workspace/resources/workspace.accessor.ts`, `src/backend/db.ts:48`).
+7. Router returns SuperJSON data to React Query (`src/backend/trpc/trpc.ts:36`, `src/client/lib/trpc.ts:26`).
 
-**Session Lifecycle Flow:**
+### Workspace Creation and Initialization
 
-1. User clicks "Start Session" in workspace detail
-2. Frontend calls `trpc.session.create()` -> `src/backend/trpc/session.trpc.ts`
-3. tRPC procedure calls `sessionService` from `@/backend/domains/session`
-4. Session domain instantiates `SessionManager` from `domains/session/claude/`
-5. SessionManager spawns Claude subprocess via `claudeClient.run()` and registers in `ProcessRegistry`
-6. Session state persisted via `sessionDomainService` and `claudeSessionAccessor`
-7. WebSocket established for real-time message streaming (chat, terminal output)
-8. Session messages forwarded via `chatEventForwarderService` to client
+1. UI calls `workspace.create` with one of the discriminated creation sources (`src/backend/trpc/workspace.trpc.ts:41`, `src/backend/trpc/workspace.trpc.ts:200`).
+2. Router resolves provider health and session capacity, then uses `WorkspaceCreationService` (`src/backend/trpc/workspace.trpc.ts:207`, `src/backend/trpc/workspace.trpc.ts:226`).
+3. Router creates the default agent session when enabled (`src/backend/trpc/workspace.trpc.ts:232`).
+4. Router starts `initializeWorkspaceWorktree` in the background (`src/backend/trpc/workspace.trpc.ts:257`).
+5. Orchestrator moves workspace to provisioning, resolves/creates git worktree, reads `factory-factory.json`, persists run-script commands, creates default terminal, starts default ACP session, runs startup script pipeline, then marks ready or failed (`src/backend/orchestration/workspace-init.orchestrator.ts:1097`).
+6. Domain events feed the snapshot pipeline so sidebars, Kanban, and detail headers update without polling (`src/backend/orchestration/event-collector.orchestrator.ts:392`, `src/client/hooks/use-project-snapshot-sync.ts:300`).
 
-**PR Ratchet Monitoring Flow:**
+### Chat Session WebSocket Flow
 
-1. Scheduler triggers `ratchetService.checkAllPRs()` periodically
-2. Ratchet domain queries workspaces with `ratchetEnabled=true`
-3. Cross-domain calls to GitHub domain go through bridge interfaces (configured at startup via `domain-bridges.orchestrator.ts`)
-4. Updates workspace state through workspace domain bridge
-5. When CI fails, ratchet domain creates auto-fix session through session domain bridge
-6. Kanban state derived in real-time from ratchet state (not stored, computed)
+1. Chat UI builds `/chat?sessionId=...&connectionId=...` and uses `useWebSocketTransport` (`src/components/chat/use-chat-websocket.ts:143`, `src/hooks/use-websocket-transport.ts:136`).
+2. Backend upgrade routing sends `/chat` to `createChatUpgradeHandler` (`src/backend/server.ts:256`).
+3. Chat handler validates optional working directory, registers connection, logs session traffic, and delegates message handling (`src/backend/routers/websocket/chat.handler.ts:94`, `src/backend/routers/websocket/chat.handler.ts:211`, `src/backend/routers/websocket/chat.handler.ts:243`).
+4. `chatMessageHandlerService` and `sessionService` start/load ACP sessions and dispatch user messages (`src/backend/routers/websocket/chat.handler.ts:84`, `src/backend/services/session/service/`).
+5. Session domain events are forwarded to connected clients and to the snapshot event collector (`src/backend/orchestration/domain-bridges.orchestrator.ts:203`, `src/backend/orchestration/event-collector.orchestrator.ts:600`).
+
+### Snapshot Stream Flow
+
+1. Server startup configures domain bridges, event collector, and snapshot reconciliation (`src/backend/server.ts:419`, `src/backend/server.ts:429`).
+2. Domain events enqueue snapshot field updates through `EventCoalescer` (`src/backend/orchestration/event-collector.orchestrator.ts:149`, `src/backend/orchestration/event-collector.orchestrator.ts:450`).
+3. `workspaceSnapshotStore.upsert` emits `SNAPSHOT_CHANGED` after deriving flow, Kanban, and sidebar fields from configured helpers (`src/backend/orchestration/domain-bridges.orchestrator.ts:408`).
+4. `/snapshots` WebSocket sends `snapshot_full`, `snapshot_changed`, and `snapshot_removed` messages scoped by project ID (`src/backend/routers/websocket/snapshots.handler.ts:145`, `src/backend/routers/websocket/snapshots.handler.ts:190`).
+5. `useProjectSnapshotSync` maps snapshot entries into React Query caches for sidebar, Kanban, detail, and list fallbacks (`src/client/hooks/use-project-snapshot-sync.ts:177`, `src/client/hooks/use-project-snapshot-sync.ts:214`).
+6. Periodic reconciliation recomputes authoritative snapshots from DB/runtime/git every 60 seconds and removes stale store entries (`src/backend/orchestration/snapshot-reconciliation.orchestrator.ts:296`, `src/backend/orchestration/snapshot-reconciliation.orchestrator.ts:364`).
+
+### Electron Runtime Flow
+
+1. Electron main process creates `ServerManager` and lifecycle controller (`electron/main/index.ts:8`).
+2. Dev Electron loads `VITE_DEV_SERVER_URL`; production Electron sets database/static/log environment variables before dynamic backend imports (`electron/main/server-manager.ts:33`, `electron/main/server-manager.ts:63`).
+3. Production Electron runs migrations, imports `createServer`, starts the backend in-process, and loads the URL into a secure BrowserWindow (`electron/main/server-manager.ts:76`, `electron/main/server-manager.ts:101`, `electron/main/lifecycle.ts:134`).
+4. Preload exposes only dialog and focus IPC APIs to the renderer (`electron/preload/index.ts:4`).
 
 **State Management:**
-- **Database Source of Truth**: All durable state in SQLite (Workspace, ClaudeSession, etc.)
-- **Cached Computed Fields**: `cachedKanbanColumn`, `stateComputedAt` optimize list queries
-- **In-Memory Session State**: Claude subprocess lifecycle tracked in memory (ProcessRegistry, SessionManager)
-- **Frontend State**: React Query caches tRPC responses, Zustand for local UI state
-- **Real-time Updates**: WebSocket events from backend push changes to frontend (chat, terminal, status)
+- Persistent state lives in SQLite models from `prisma/schema.prisma`.
+- Runtime process state lives in service singletons created by `src/backend/app-context.ts` and cleaned up by `src/backend/server.ts`.
+- UI server state lives in React Query caches created by `src/client/lib/providers.tsx`.
+- Realtime workspace summary state is normalized through `workspaceSnapshotStore` and synchronized by `/snapshots`.
 
 ## Key Abstractions
 
-**Workspace:**
-- Purpose: Represents a unit of work tied to a git branch, PR, and optionally GitHub issue
-- Files: `src/backend/domains/workspace/` (creation, state machine, query, worktree lifecycle, kanban state)
-- State: NEW -> PROVISIONING -> READY (or FAILED, ARCHIVED)
-- Tracks: Branch, PR, ratchet state, run script status, session count
-- Pattern: State machine with derived computed state (kanban column)
+**Service Capsule:**
+- Purpose: Public barrel plus private service/resource internals for a backend domain.
+- Examples: `src/backend/services/session/index.ts`, `src/backend/services/workspace/index.ts`, `src/backend/services/periodic-task/index.ts`
+- Pattern: Import from `@/backend/services/<name>` outside the capsule; keep `service/` and `resources/` imports internal to the capsule.
 
-**ClaudeSession:**
-- Purpose: Represents a Claude SDK session (interactive agent run)
-- Files: `src/backend/domains/session/` (lifecycle, store, claude process management, chat services)
-- Lifecycle: IDLE -> RUNNING -> PAUSED -> COMPLETED (or FAILED)
-- Tracks: Workflow type (explore, implement, test), messages, resources, status
-- Pattern: Process manager spawns subprocess, lifecycle managed by SessionManager
+**Service Registry:**
+- Purpose: Defines capsule names, allowed `dependsOn`, and Prisma model ownership.
+- Examples: `src/backend/services/registry.ts`, `scripts/check-service-registry.ts`
+- Pattern: Update registry when adding a service capsule or owning a new Prisma model; run `pnpm check:service-registry`.
 
-**Domain Module Pattern:**
-- Purpose: Self-contained business logic module with explicit public API
-- Structure: `src/backend/domains/{name}/index.ts` barrel, internal services, types, tests
-- Constraint: No cross-domain imports; use bridges for callbacks
-- Examples: session (largest, includes claude/ subprocess management), workspace (state machine + worktree)
+**AppContext:**
+- Purpose: Injectable service graph passed into Express/tRPC/WebSocket handlers.
+- Examples: `src/backend/app-context.ts`, `src/backend/server.ts:67`
+- Pattern: Read services from `ctx.appContext.services` in tRPC and from handler closure in WebSocket factories.
 
-**Resource Accessor Pattern:**
-- Purpose: Single point of Prisma access, all queries go through accessors
-- Examples: `workspaceAccessor`, `claudeSessionAccessor`, `projectAccessor`
-- Pattern: Methods return typed Prisma payloads, include relations as needed
-- Benefit: Easy to trace data flow, refactor queries in one place
+**Domain Bridges:**
+- Purpose: Let services collaborate without direct cyclic imports.
+- Examples: `src/backend/orchestration/domain-bridges.orchestrator.ts`, `src/backend/services/*/service/bridges.ts`
+- Pattern: Define a capability interface in the service, then wire concrete implementations in orchestration startup.
 
-**Bridge Interface Pattern:**
-- Purpose: Allow domains to invoke cross-domain operations without direct imports
-- Files: `src/backend/domains/{name}/bridges.ts`, wired in `src/backend/orchestration/domain-bridges.orchestrator.ts`
-- Pattern: Domain defines bridge interface -> orchestrator injects implementation at startup -> domain calls bridge at runtime
-- Benefit: Domains remain independently testable; cross-domain coupling is explicit and centralized
+**tRPC Router:**
+- Purpose: Type-safe request/response API between React and backend.
+- Examples: `src/backend/trpc/workspace.trpc.ts`, `src/backend/trpc/session.trpc.ts`
+- Pattern: Validate inputs with Zod, keep transport logic thin, call service barrels or orchestration functions.
 
-**tRPC Router Pattern:**
-- Purpose: Define typed RPC endpoints
-- Files: `src/backend/trpc/*.trpc.ts`
-- Pattern: `publicProcedure` (no auth currently) with Zod input validation, handlers call domain services via barrel imports
-- Scoping: Optional headers `X-Project-Id`, `X-Top-Level-Task-Id` set in context for access control
+**WebSocket Upgrade Handler:**
+- Purpose: Long-lived realtime transports for chat, terminal, logs, and snapshots.
+- Examples: `src/backend/routers/websocket/chat.handler.ts`, `src/backend/routers/websocket/snapshots.handler.ts`
+- Pattern: Export `create*UpgradeHandler(appContext)`, validate query/input, register connection, delegate business logic to services.
+
+**Resource Accessor:**
+- Purpose: Encapsulate Prisma access for service-owned models.
+- Examples: `src/backend/services/workspace/resources/workspace.accessor.ts`, `src/backend/services/session/resources/agent-session.accessor.ts`
+- Pattern: Keep direct `prisma` imports in resource accessors; use service methods or barrels from higher layers.
+
+**Workspace Snapshot:**
+- Purpose: Denormalized realtime workspace state for fast UI updates.
+- Examples: `src/backend/services/workspace-snapshot-store.service.ts`, `src/client/lib/snapshot-to-sidebar.ts`, `src/client/lib/snapshot-to-kanban.ts`
+- Pattern: Mutate through event collector/reconciliation, stream by project over `/snapshots`, map into cache-specific shapes in client helpers.
 
 ## Entry Points
 
-**CLI Entrypoint:**
+**CLI Binary:**
 - Location: `src/cli/index.ts`
-- Triggers: `pnpm dev`, `pnpm start` commands
-- Responsibilities:
-  - Parse CLI args (project config, database path, port)
-  - Spawn backend server and frontend Vite dev server
-  - Manage child process lifecycle (SIGTERM, SIGINT, failures)
-  - Open browser to frontend
-  - Serve combined app on single port
+- Triggers: `ff`, `factory-factory`, npm scripts.
+- Responsibilities: `serve`, `db:migrate`, `db:studio`, `build`, `proxy`, hidden `internal codex-app-server-acp`.
 
-**Backend Server Entrypoint:**
-- Location: `src/backend/index.ts` (standalone), `src/backend/server.ts::createServer()` (library)
-- Triggers: Direct node execution or import by Electron
-- Responsibilities:
-  - Create AppContext with all domain modules and infrastructure services
-  - Configure domain bridges via `configureDomainBridges()`
-  - Initialize Express app and HTTP server
-  - Setup middleware (CORS, security, logging)
-  - Register tRPC routes at `/api/trpc`
-  - Register REST routes (health, project, MCP)
-  - Setup WebSocket upgrade handlers (chat, terminal, dev-logs)
-  - Start listening, handle graceful shutdown
+**Standalone Backend:**
+- Location: `src/backend/index.ts`
+- Triggers: CLI production server, direct node execution, dev backend watcher.
+- Responsibilities: Create `AppContext`, create server, register server instance, start server, handle process signals.
 
-**Frontend Entrypoint:**
+**Backend Server Factory:**
+- Location: `src/backend/server.ts`
+- Triggers: `src/backend/index.ts`, Electron `ServerManager`.
+- Responsibilities: Configure Express, tRPC, WebSockets, static files, startup tasks, schedulers, cleanup.
+
+**React App:**
 - Location: `src/client/main.tsx`
-- Triggers: Vite build/dev, bundled in production
-- Responsibilities:
-  - Mount React app to `#root` element
-  - Setup React Router with routes defined in `src/client/router.tsx`
-  - Initialize tRPC client via `src/frontend/lib/providers.tsx`
-  - Render root layout and child routes
+- Triggers: Vite entry from `index.html`.
+- Responsibilities: Mount React StrictMode and router.
 
-**Electron Entrypoint:**
+**React Router:**
+- Location: `src/client/router.tsx`
+- Triggers: React root render.
+- Responsibilities: Define routes for projects, workspaces, reviews, admin, logs, and mobile baseline.
+
+**Electron Main:**
 - Location: `electron/main/index.ts`
-- Triggers: `pnpm dev:electron`
-- Responsibilities:
-  - Import `createServer` from backend
-  - Spawn backend server on dynamic port
-  - Create Electron main window with renderer
-  - Bridge IPC for cross-process communication
+- Triggers: Electron process.
+- Responsibilities: Register fatal handlers, server lifecycle, IPC handlers, and BrowserWindow lifecycle.
+
+**Prisma Schema:**
+- Location: `prisma/schema.prisma`
+- Triggers: Prisma generate/migrate, runtime Prisma client.
+- Responsibilities: Define SQLite models and enums for projects, workspaces, sessions, settings, periodic tasks, and decision logs.
+
+## Architectural Constraints
+
+- **Threading:** Node.js single event loop with child processes and timers. Backend starts ACP runtimes, terminal ptys, Vite/backend child processes in CLI dev mode, scheduler loops, WebSocket heartbeats, and reconciliation intervals.
+- **Global state:** Module-level singletons exist by design in `src/backend/db.ts`, `src/backend/services/session/service/`, `src/backend/services/terminal/service/`, `src/backend/services/workspace-snapshot-store.service.ts`, `src/backend/orchestration/event-collector.orchestrator.ts`, and WebSocket connection maps in `src/backend/routers/websocket/*.handler.ts`.
+- **Circular imports:** Disallowed by `.dependency-cruiser.cjs`; `pnpm deps:check` reports no dependency violations.
+- **Service dependencies:** Service-to-service imports must target barrels and match `dependsOn` in `src/backend/services/registry.ts`; `pnpm check:service-registry` passes.
+- **Frontend/backend boundary:** UI code may import backend tRPC types only through `src/client/lib/trpc.ts`; dependency-cruiser blocks direct frontend imports from `src/backend/`.
+- **Database access:** Direct `src/backend/db.ts` imports are limited to service resources, `src/backend/server.ts`, tests, and the DB module itself.
+- **Orchestration imports:** Orchestration may import service barrels, not service internals; `.dependency-cruiser.cjs` enforces this.
+- **Shared contracts:** `src/shared/` must not import backend, client, or component layers.
+
+## Anti-Patterns
+
+### Deep Service Imports
+
+**What happens:** Code outside a service capsule imports `@/backend/services/<name>/service/...` or `@/backend/services/<name>/resources/...`.
+**Why it's wrong:** It bypasses registry dependency checks, model ownership, and the public capsule API.
+**Do this instead:** Export the needed capability from `src/backend/services/<name>/index.ts` and import `@/backend/services/<name>`; see `src/backend/orchestration/domain-bridges.orchestrator.ts:19`.
+
+### Service-to-Service Orchestration Inside Services
+
+**What happens:** A service imports another service's internals or orchestration module to complete a cross-domain workflow.
+**Why it's wrong:** It creates cycles and hides coordination outside the orchestration layer.
+**Do this instead:** Define a bridge type in the service capsule and wire it from `src/backend/orchestration/domain-bridges.orchestrator.ts`.
+
+### tRPC Owning Business Workflows
+
+**What happens:** Router procedures grow into long workflow implementations with DB, git, sessions, and external APIs mixed together.
+**Why it's wrong:** Transport code becomes hard to test and reuse outside HTTP.
+**Do this instead:** Keep Zod validation and response shaping in `src/backend/trpc/*.trpc.ts`; move cross-service workflow into `src/backend/orchestration/` or service capsule methods.
+
+### Frontend Polling for Realtime Workspace State
+
+**What happens:** Components repeatedly poll workspace summary state that is already available through `/snapshots`.
+**Why it's wrong:** It duplicates the snapshot pipeline and increases backend load.
+**Do this instead:** Use `src/client/hooks/use-project-snapshot-sync.ts` to update React Query caches from `/snapshots`; keep tRPC queries as bootstrap/fallback.
 
 ## Error Handling
 
-**Strategy:** Centralized logging, typed error responses via tRPC, user-facing error boundaries
+**Strategy:** Validate at transport edges with Zod, throw `TRPCError` for typed API failures, log operational failures with scoped loggers, and keep background workflows best-effort with explicit recovery paths.
 
 **Patterns:**
-- **Logger Service**: All errors logged via `createLogger()` from `src/backend/services/logger.service.ts`
-  - Structured logging with level (info, warn, error)
-  - Session-specific logs written to `~/.factory-factory/logs/sessions/[sessionId].log`
-- **tRPC Error Propagation**: Services throw errors, tRPC catches and returns typed error to frontend
-  - Input validation via Zod, returns 400 Bad Request
-  - Business logic errors return 500 with message
-  - Frontend error boundary in `src/client/error-boundary.tsx` catches render errors
-- **Process Error Handling**: Unhandled promise rejections logged, process graceful shutdown attempted
-  - `src/backend/index.ts` registers `uncaughtException` and `unhandledRejection` handlers
+- tRPC uses Zod schemas and `TRPCError` for not found/precondition/internal failures (`src/backend/trpc/workspace.trpc.ts:218`).
+- WebSocket handlers reject invalid upgrades with `sendBadRequest` and emit structured error messages (`src/backend/routers/websocket/chat.handler.ts:172`, `src/backend/routers/websocket/chat.handler.ts:144`).
+- Server startup uses `runStartupTask` wrappers so reconciliation failures are logged without preventing boot (`src/backend/server.ts:294`).
+- Workspace initialization catches failures, marks workspace failed, cleans up sessions/terminals/worktrees, and clears init modes (`src/backend/orchestration/workspace-init.orchestrator.ts:138`, `src/backend/orchestration/workspace-init.orchestrator.ts:1208`).
+- Graceful shutdown stops WebSockets, sessions, terminals, schedulers, ratchet, periodic tasks, reconciliation, rate limiter, interceptors, loggers, and Prisma (`src/backend/server.ts:322`).
 
 ## Cross-Cutting Concerns
 
-**Logging:**
-- Centralized service: `src/backend/services/logger.service.ts`
-- Creates contextual loggers with namespace (e.g., 'workspace-trpc', 'session-service')
-- Session-specific logs written to file + console based on NODE_ENV
-- Frontend logs via browser console (no file aggregation)
-
-**Validation:**
-- Input validation: Zod schemas on all tRPC procedures (required)
-- Database validation: Prisma schema constraints (unique, not null)
-- No raw typecasts; prefer typed Prisma payloads
-
-**Authentication:**
-- Currently: No auth implemented (all endpoints public)
-- Scoping: Optional headers for project/task context
-- Future: Would be middleware on tRPC context
-
-**Configuration:**
-- Environment-driven: `DATABASE_PATH`, `BACKEND_PORT`, `FRONTEND_STATIC_PATH`, `NODE_ENV`
-- Config service: `src/backend/services/config.service.ts` reads and caches system config
-- Workspace-level config: `factory-factory.json` in repo (run script, startup script)
-- User settings: Stored in database (workspace order, notification settings, auto-fix toggles)
+**Logging:** Use `createLogger` from `src/backend/services/logger.service.ts`; access it via `AppContext` in request/handler code when possible. Session traffic has dedicated file logging through session services.
+**Validation:** Use Zod at tRPC and WebSocket boundaries; shared schemas live in `src/shared/` and backend-specific schemas in `src/backend/schemas/`.
+**Authentication:** No app-level user authentication is detected. GitHub uses local `gh` auth through the GitHub service; Linear uses encrypted API key configuration.
+**Authorization/Safety:** Workspace file/socket operations validate paths under worktree base directories (`src/backend/routers/websocket/chat.handler.ts:94`); command execution safety is mediated by ACP permission modes and service configuration.
+**Configuration:** Centralized through `src/backend/services/config.service.ts`, environment schemas in `src/backend/services/env-schemas.ts`, and `factory-factory.json` project/worktree command config.
+**Scheduling:** Long-running background loops live in `src/backend/orchestration/scheduler.service.ts`, `src/backend/services/ratchet/`, `src/backend/services/periodic-task/`, and snapshot reconciliation.
 
 ---
 
-*Architecture analysis: 2026-02-10 (updated post-SRP refactor)*
+*Architecture analysis: 2026-05-17*

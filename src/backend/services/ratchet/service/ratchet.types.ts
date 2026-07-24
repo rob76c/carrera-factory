@@ -1,4 +1,5 @@
-import type { workspaceAccessor } from '@/backend/services/workspace';
+import type { RatchetDispatchOutcome } from '@prisma-gen/client';
+import type { workspaceRatchetService } from '@/backend/services/workspace';
 import type { CIStatus, RatchetState } from '@/shared/core';
 
 export interface RatchetStatusCheckRollupItem {
@@ -29,15 +30,12 @@ export interface PRStateInfo {
   }>;
 }
 
-export interface ReviewPollTracker {
-  snapshotKey: string;
-  lastPolledAt: number;
-  pollCount: number;
+export interface PRStateFetchSkipped {
+  skipped: true;
+  reason: 'recently_fetched';
 }
 
-export type ReviewPollResult =
-  | { action: 'waiting' }
-  | { action: 'comments-found'; freshPrState: PRStateInfo };
+export type PRStateFetchResult = PRStateInfo | PRStateFetchSkipped | null;
 
 export type RatchetAction =
   | { type: 'WAITING'; reason: string }
@@ -62,22 +60,36 @@ export interface RatchetCheckResult {
 }
 
 export type WorkspaceWithPR = NonNullable<
-  Awaited<ReturnType<(typeof workspaceAccessor)['findForRatchetById']>>
+  Awaited<ReturnType<(typeof workspaceRatchetService)['findCandidateById']>>
 >;
+
+/**
+ * Result of verifying the recorded fixer session pointer against reality.
+ * 'settled' means this check transitioned the dispatch record out of RUNNING;
+ * 'ended_concurrently' means another path (lifecycle exit hook / stop) settled
+ * it while this check was in flight, so the record read at the start of the
+ * check is stale and the decision should wait for the next cycle.
+ */
+export type ActiveFixerCheckResult =
+  | { kind: 'none' }
+  | { kind: 'active'; action: RatchetAction }
+  | { kind: 'settled'; outcome: Exclude<RatchetDispatchOutcome, 'RUNNING'> }
+  | { kind: 'ended_concurrently' };
 
 export interface RatchetDecisionContext {
   workspace: WorkspaceWithPR;
   prStateInfo: PRStateInfo;
   previousState: RatchetState;
   newState: RatchetState;
-  finalState: RatchetState;
   hasNewReviewActivitySinceLastDispatch: boolean;
   hasStateChangedSinceLastDispatch: boolean;
   isCleanPrWithNoNewReviewActivity: boolean;
-  activeRatchetSession: RatchetAction | null;
-  hasOtherActiveSession: boolean;
+  activeFixerCheck: ActiveFixerCheckResult;
+  /** Dispatch outcome after any settling done by this check. */
+  dispatchOutcome: RatchetDispatchOutcome | null;
+  dispatchRetryCount: number;
 }
 
 export type RatchetDecision =
   | { type: 'RETURN_ACTION'; action: RatchetAction }
-  | { type: 'TRIGGER_FIXER' };
+  | { type: 'TRIGGER_FIXER'; retryCount: number };

@@ -8,7 +8,11 @@
 import type { Prisma } from '@prisma-gen/client';
 import type { z } from 'zod';
 import { createLogger } from '@/backend/services/logger.service';
-import { type DataBackupTransactionClient, dataBackupAccessor } from '@/backend/services/settings';
+import {
+  type DataBackupTransactionClient,
+  dataBackupAccessor,
+} from '@/backend/services/settings/resources/data-backup.accessor';
+import { autoIterationConfigSchema } from '@/shared/schemas/auto-iteration.schema';
 import type {
   ExportData,
   exportedAgentSessionSchema,
@@ -52,6 +56,8 @@ type ExportedUserSettings = z.infer<typeof exportedUserSettingsSchema>;
 
 const toISOString = (date: Date | null): string | null => (date ? date.toISOString() : null);
 const parseDate = (str: string | null): Date | null => (str ? new Date(str) : null);
+const parseAutoIterationConfigForExport = (value: unknown) =>
+  value == null ? null : autoIterationConfigSchema.parse(value);
 
 /** Strip the encrypted API key from issueTrackerConfig for safe export. */
 function sanitizeIssueTrackerConfigForExport(config: unknown): unknown {
@@ -165,6 +171,11 @@ async function importWorkspaces(
         runScriptPort: workspace.runScriptPort,
         runScriptStartedAt: parseDate(workspace.runScriptStartedAt),
         runScriptStatus: workspace.runScriptStatus,
+        mode: workspace.mode,
+        autoIterationConfig:
+          workspace.autoIterationConfig != null
+            ? (workspace.autoIterationConfig as Prisma.InputJsonValue)
+            : undefined,
         prUrl: workspace.prUrl,
         githubIssueNumber: workspace.githubIssueNumber,
         githubIssueUrl: workspace.githubIssueUrl,
@@ -312,9 +323,12 @@ async function importUserSettings(
       // Ratchet settings
       ratchetEnabled: settings.ratchetEnabled,
       ratchetReplyToPrComments: settings.ratchetReplyToPrComments,
+      ratchetReviewTriggerMode: settings.ratchetReviewTriggerMode,
       defaultSessionProvider: settings.defaultSessionProvider,
       defaultClaudeModel: settings.defaultClaudeModel,
       defaultCodexModel: settings.defaultCodexModel,
+      defaultClaudeReasoningEffort: settings.defaultClaudeReasoningEffort,
+      defaultCodexReasoningEffort: settings.defaultCodexReasoningEffort,
       defaultWorkspacePermissions: settings.defaultWorkspacePermissions,
       ratchetPermissions: settings.ratchetPermissions,
       // Note: workspaceOrder and cachedSlashCommands are intentionally not imported
@@ -390,6 +404,8 @@ class DataBackupService {
           runScriptPort: w.runScriptPort,
           runScriptStartedAt: toISOString(w.runScriptStartedAt),
           runScriptStatus: w.runScriptStatus,
+          mode: w.mode,
+          autoIterationConfig: parseAutoIterationConfigForExport(w.autoIterationConfig),
           prUrl: w.prUrl,
           githubIssueNumber: w.githubIssueNumber,
           githubIssueUrl: w.githubIssueUrl,
@@ -453,9 +469,12 @@ class DataBackupService {
               // Ratchet settings
               ratchetEnabled: userSettings.ratchetEnabled,
               ratchetReplyToPrComments: userSettings.ratchetReplyToPrComments,
+              ratchetReviewTriggerMode: userSettings.ratchetReviewTriggerMode,
               defaultSessionProvider: userSettings.defaultSessionProvider,
               defaultClaudeModel: userSettings.defaultClaudeModel,
               defaultCodexModel: userSettings.defaultCodexModel,
+              defaultClaudeReasoningEffort: userSettings.defaultClaudeReasoningEffort,
+              defaultCodexReasoningEffort: userSettings.defaultCodexReasoningEffort,
               defaultWorkspacePermissions: userSettings.defaultWorkspacePermissions,
               ratchetPermissions: userSettings.ratchetPermissions,
               // Note: workspaceOrder and cachedSlashCommands are intentionally excluded

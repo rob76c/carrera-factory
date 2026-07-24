@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  deriveSessionUiStatusKind,
   getSessionRuntimeErrorMessage,
   getSessionSummaryErrorMessage,
+  hasWorkingSessionSummary,
+  isSessionSummaryWorking,
   type SessionRuntimeLastExit,
   type SessionRuntimePhase,
+  type SessionUiStatusInput,
+  sessionUiStatusKindFromSummary,
 } from './session-runtime';
 
 interface RuntimeErrorCase {
@@ -69,4 +74,95 @@ describe('session runtime error message helpers', () => {
       ).toBe(testCase.expected);
     });
   }
+});
+
+describe('deriveSessionUiStatusKind', () => {
+  function makeInput(overrides: Partial<SessionUiStatusInput> = {}): SessionUiStatusInput {
+    return {
+      phase: 'idle',
+      processState: 'alive',
+      activity: 'IDLE',
+      lastExit: null,
+      ...overrides,
+    };
+  }
+
+  it('maps lifecycle transition phases directly', () => {
+    expect(deriveSessionUiStatusKind(makeInput({ phase: 'loading' }))).toBe('loading');
+    expect(deriveSessionUiStatusKind(makeInput({ phase: 'starting' }))).toBe('starting');
+    expect(deriveSessionUiStatusKind(makeInput({ phase: 'stopping' }))).toBe('stopping');
+  });
+
+  it('reports error phase before process state', () => {
+    expect(deriveSessionUiStatusKind(makeInput({ phase: 'error', processState: 'stopped' }))).toBe(
+      'error'
+    );
+  });
+
+  it('reports stopped process before working, distinguishing unexpected exits', () => {
+    expect(
+      deriveSessionUiStatusKind(
+        makeInput({ phase: 'running', processState: 'stopped', activity: 'WORKING' })
+      )
+    ).toBe('stopped');
+    expect(
+      deriveSessionUiStatusKind(
+        makeInput({ phase: 'running', processState: 'stopped', lastExit: unexpectedExit })
+      )
+    ).toBe('unexpected-exit');
+  });
+
+  it('treats activity WORKING or phase running as working', () => {
+    expect(deriveSessionUiStatusKind(makeInput({ activity: 'WORKING' }))).toBe('working');
+    expect(deriveSessionUiStatusKind(makeInput({ phase: 'running' }))).toBe('working');
+  });
+
+  it('falls back to idle', () => {
+    expect(deriveSessionUiStatusKind(makeInput())).toBe('idle');
+    expect(deriveSessionUiStatusKind(makeInput({ processState: 'unknown' }))).toBe('idle');
+  });
+});
+
+describe('sessionUiStatusKindFromSummary', () => {
+  it('adapts summary field names to the runtime input shape', () => {
+    expect(
+      sessionUiStatusKindFromSummary({
+        runtimePhase: 'idle',
+        processState: 'stopped',
+        activity: 'IDLE',
+        lastExit: unexpectedExit,
+      })
+    ).toBe('unexpected-exit');
+    expect(
+      sessionUiStatusKindFromSummary({
+        runtimePhase: 'idle',
+        processState: 'alive',
+        activity: 'WORKING',
+        lastExit: null,
+      })
+    ).toBe('working');
+  });
+});
+
+describe('session runtime working helpers', () => {
+  it('treats activity WORKING as working even when lifecycle phase has not caught up', () => {
+    expect(isSessionSummaryWorking({ activity: 'WORKING', runtimePhase: 'idle' })).toBe(true);
+  });
+
+  it('treats runtime phase running as working even when activity has not caught up', () => {
+    expect(isSessionSummaryWorking({ activity: 'IDLE', runtimePhase: 'running' })).toBe(true);
+  });
+
+  it('treats idle activity and idle phase as not working', () => {
+    expect(isSessionSummaryWorking({ activity: 'IDLE', runtimePhase: 'idle' })).toBe(false);
+  });
+
+  it('detects any working summary in a list', () => {
+    expect(
+      hasWorkingSessionSummary([
+        { activity: 'IDLE', runtimePhase: 'idle' },
+        { activity: 'IDLE', runtimePhase: 'running' },
+      ])
+    ).toBe(true);
+  });
 });

@@ -155,6 +155,16 @@ describe('corsMiddleware', () => {
       expect(mockRes.headers['Access-Control-Allow-Origin']).toBe('http://localhost:3001');
     });
 
+    it('should set Access-Control-Allow-Origin for equivalent loopback origins', () => {
+      const mockReq = createMockReq({
+        headers: { origin: 'http://127.0.0.1:3000' },
+      });
+
+      corsMiddleware(mockReq, toResponse(mockRes), mockNext);
+
+      expect(mockRes.headers['Access-Control-Allow-Origin']).toBe('http://127.0.0.1:3000');
+    });
+
     it('should not set Access-Control-Allow-Origin for disallowed origins', () => {
       const mockReq = createMockReq({
         headers: { origin: 'http://evil.com' },
@@ -200,6 +210,20 @@ describe('corsMiddleware', () => {
 
       expect(mockRes.headers['Access-Control-Allow-Origin']).toBeUndefined();
     });
+
+    it('should allow equivalent loopback origins when custom config uses localhost', () => {
+      mockGetCorsConfig.mockReturnValue({
+        allowedOrigins: ['http://localhost:4000'],
+      });
+
+      const mockReq = createMockReq({
+        headers: { origin: 'http://127.0.0.1:4000' },
+      });
+
+      corsMiddleware(mockReq, toResponse(mockRes), mockNext);
+
+      expect(mockRes.headers['Access-Control-Allow-Origin']).toBe('http://127.0.0.1:4000');
+    });
   });
 
   describe('CORS headers', () => {
@@ -219,7 +243,7 @@ describe('corsMiddleware', () => {
       corsMiddleware(mockReq, toResponse(mockRes), mockNext);
 
       expect(mockRes.headers['Access-Control-Allow-Headers']).toBe(
-        'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Project-Id, X-Top-Level-Task-Id'
+        'Origin, X-Requested-With, Content-Type, Accept, Authorization'
       );
     });
 

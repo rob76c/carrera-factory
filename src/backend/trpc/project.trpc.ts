@@ -1,19 +1,80 @@
+import { readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { basename, isAbsolute, join, relative } from 'node:path';
 import { z } from 'zod';
-import { compareFilesByRelevance, listFilesRecursive } from '@/backend/lib/file-helpers';
+import type { ApplicationServices } from '@/backend/app-context';
+import { searchFilesRecursive } from '@/backend/lib/file-helpers';
 import { gitCommandC } from '@/backend/lib/shell';
-import { cryptoService } from '@/backend/services/crypto.service';
-import { FactoryConfigService } from '@/backend/services/factory-config.service';
-import { gitCloneService, parseGithubUrl } from '@/backend/services/git-clone.service';
-import { projectManagementService } from '@/backend/services/workspace';
+import { parseGithubUrl } from '@/backend/services/workspace';
 import { IssueProvider } from '@/shared/core/enums';
 import { FactoryConfigSchema } from '@/shared/schemas/factory-config.schema';
 import {
   IssueTrackerConfigSchema,
   sanitizeIssueTrackerConfig,
 } from '@/shared/schemas/issue-tracker-config.schema';
-import { publicProcedure, router } from './trpc';
+import { publicProcedure, router, trustedLocalProcedure } from './trpc';
+
+function parseCommandFileDescription(filePath: string): string {
+  try {
+    const content = readFileSync(filePath, 'utf-8');
+    const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    if (!match) {
+      return '';
+    }
+    const descLine = match[1]?.split(/\r?\n/).find((l) => l.startsWith('description:'));
+    return descLine ? descLine.slice('description:'.length).trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+function resolveContainedRegularFile(rootReal: string, filePath: string): string | null {
+  try {
+    const fileReal = realpathSync(filePath);
+    const rel = relative(rootReal, fileReal);
+    if (rel.startsWith('..') || isAbsolute(rel)) {
+      return null;
+    }
+    if (!statSync(fileReal).isFile()) {
+      return null;
+    }
+    return fileReal;
+  } catch {
+    return null;
+  }
+}
+
+function scanSlashCommandDirs(
+  dirs: { dir: string; containmentRoot?: string }[]
+): { name: string; description: string }[] {
+  const seen = new Set<string>();
+  const commands: { name: string; description: string }[] = [];
+  for (const { dir, containmentRoot } of dirs) {
+    let files: string[];
+    let rootReal: string;
+    try {
+      rootReal = containmentRoot ? realpathSync(containmentRoot) : realpathSync(dir);
+      files = readdirSync(dir).filter((f) => f.endsWith('.md'));
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      const filePath = join(dir, file);
+      const fileReal = resolveContainedRegularFile(rootReal, filePath);
+      if (!fileReal) {
+        continue;
+      }
+      const name = basename(file, '.md');
+      if (seen.has(name)) {
+        continue;
+      }
+      seen.add(name);
+      commands.push({ name, description: parseCommandFileDescription(fileReal) });
+    }
+  }
+  return commands;
+}
 
 async function getBranchMap(repoPath: string, refPrefix: string): Promise<Map<string, string>> {
   const result = await gitCommandC(repoPath, [
@@ -68,6 +129,7 @@ function buildRemoteEntries(
 }
 
 async function validateStartupScriptFields(
+  projectManagementService: ApplicationServices['projectManagementService'],
   id: string,
   updates: {
     startupScriptCommand?: string | null;
@@ -112,7 +174,8 @@ export const projectRouter = router({
         })
         .optional()
     )
-    .query(async ({ input }) => {
+    .query(async ({ ctx, input }) => {
+      const { projectManagementService } = ctx.appContext.services;
       const projects = await projectManagementService.list(input);
       return projects.map((project) => ({
         ...project,
@@ -121,7 +184,8 @@ export const projectRouter = router({
     }),
 
   // Get project by ID
-  getById: publicProcedure.input(z.object({ id: z.string() })).query(async ({ input }) => {
+  getById: publicProcedure.input(z.object({ id: z.string() })).query(async ({ ctx, input }) => {
+    const { projectManagementService } = ctx.appContext.services;
     const project = await projectManagementService.findById(input.id);
     if (!project) {
       throw new Error(`Project not found: ${input.id}`);
@@ -133,7 +197,8 @@ export const projectRouter = router({
   }),
 
   // Get project by slug
-  getBySlug: publicProcedure.input(z.object({ slug: z.string() })).query(async ({ input }) => {
+  getBySlug: publicProcedure.input(z.object({ slug: z.string() })).query(async ({ ctx, input }) => {
+    const { projectManagementService } = ctx.appContext.services;
     const project = await projectManagementService.findBySlug(input.slug);
     if (!project) {
       throw new Error(`Project not found: ${input.slug}`);
@@ -147,7 +212,8 @@ export const projectRouter = router({
   // List local + remote branches for a project
   listBranches: publicProcedure
     .input(z.object({ projectId: z.string() }))
-    .query(async ({ input }) => {
+    .query(async ({ ctx, input }) => {
+      const { projectManagementService } = ctx.appContext.services;
       const project = await projectManagementService.findById(input.projectId);
       if (!project) {
         throw new Error(`Project not found: ${input.projectId}`);
@@ -180,28 +246,39 @@ export const projectRouter = router({
         limit: z.number().min(1).max(100).default(50),
       })
     )
-    .query(async ({ input }) => {
+    .query(async ({ ctx, input }) => {
+      const { projectManagementService } = ctx.appContext.services;
       const project = await projectManagementService.findById(input.projectId);
       if (!project) {
         throw new Error(`Project not found: ${input.projectId}`);
       }
 
-      let files = await listFilesRecursive(project.repoPath);
-
-      if (input.query) {
-        const queryLower = input.query.toLowerCase();
-        files = files.filter((file) => file.toLowerCase().includes(queryLower));
-      }
-
-      const queryLower = input.query?.toLowerCase();
-      files.sort((a, b) => compareFilesByRelevance(a, b, queryLower));
-      files = files.slice(0, input.limit);
+      const files = await searchFilesRecursive(project.repoPath, {
+        query: input.query,
+        limit: input.limit,
+      });
 
       return { files };
     }),
 
+  // List slash commands available for a project (for autocomplete in new workspace form)
+  listSlashCommands: publicProcedure
+    .input(z.object({ projectId: z.string() }))
+    .query(async ({ ctx, input }) => {
+      const { projectManagementService } = ctx.appContext.services;
+      const project = await projectManagementService.findById(input.projectId);
+      if (!project) {
+        throw new Error(`Project not found: ${input.projectId}`);
+      }
+      const dirs = [
+        { dir: join(homedir(), '.claude', 'commands') },
+        { dir: join(project.repoPath, '.claude', 'commands'), containmentRoot: project.repoPath },
+      ];
+      return { commands: scanSlashCommandDirs(dirs) };
+    }),
+
   // Create a new project (only repoPath required - name/slug/worktree derived)
-  create: publicProcedure
+  create: trustedLocalProcedure
     .input(
       z.object({
         repoPath: z.string().min(1, 'Repository path is required'),
@@ -212,7 +289,7 @@ export const projectRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      const { configService } = ctx.appContext.services;
+      const { configService, projectManagementService } = ctx.appContext.services;
       const { startupScriptCommand, startupScriptPath, startupScriptTimeout } = input;
 
       // Validate only one of command or path is set
@@ -240,7 +317,7 @@ export const projectRouter = router({
     }),
 
   // Update a project
-  update: publicProcedure
+  update: trustedLocalProcedure
     .input(
       z.object({
         id: z.string(),
@@ -258,7 +335,8 @@ export const projectRouter = router({
         issueTrackerConfig: IssueTrackerConfigSchema.nullable().optional(),
       })
     )
-    .mutation(async ({ input }) => {
+    .mutation(async ({ ctx, input }) => {
+      const { cryptoService, projectManagementService } = ctx.appContext.services;
       const { id, ...updates } = input;
 
       // Validate new repo path if provided
@@ -269,7 +347,7 @@ export const projectRouter = router({
         }
       }
 
-      await validateStartupScriptFields(id, updates);
+      await validateStartupScriptFields(projectManagementService, id, updates);
 
       // Encrypt Linear API key before persisting
       if (updates.issueTrackerConfig?.linear?.apiKey) {
@@ -290,36 +368,35 @@ export const projectRouter = router({
     }),
 
   // Archive a project (soft delete)
-  archive: publicProcedure.input(z.object({ id: z.string() })).mutation(({ input }) => {
-    return projectManagementService.archive(input.id);
+  archive: publicProcedure.input(z.object({ id: z.string() })).mutation(({ ctx, input }) => {
+    return ctx.appContext.services.projectManagementService.archive(input.id);
   }),
 
   // Validate repo path
-  validateRepoPath: publicProcedure.input(z.object({ repoPath: z.string() })).query(({ input }) => {
-    return projectManagementService.validateRepoPath(input.repoPath);
-  }),
+  validateRepoPath: publicProcedure
+    .input(z.object({ repoPath: z.string() }))
+    .query(({ ctx, input }) => {
+      return ctx.appContext.services.projectManagementService.validateRepoPath(input.repoPath);
+    }),
 
   // Check if factory-factory.json exists in the repository
   checkFactoryConfig: publicProcedure
     .input(z.object({ repoPath: z.string() }))
-    .query(async ({ input }) => {
-      try {
-        const config = await FactoryConfigService.readConfig(input.repoPath);
-        return { exists: config !== null };
-      } catch {
-        return { exists: false };
-      }
+    .query(async ({ ctx, input }) => {
+      const config = await ctx.appContext.services.factoryConfigService.readConfig(input.repoPath);
+      return { exists: config !== null };
     }),
 
   // Save factory-factory.json to the project repo
-  saveFactoryConfig: publicProcedure
+  saveFactoryConfig: trustedLocalProcedure
     .input(
       z.object({
         projectId: z.string(),
         config: FactoryConfigSchema,
       })
     )
-    .mutation(async ({ input }) => {
+    .mutation(async ({ ctx, input }) => {
+      const { projectManagementService } = ctx.appContext.services;
       const project = await projectManagementService.findById(input.projectId);
       if (!project) {
         throw new Error('Project not found');
@@ -332,12 +409,12 @@ export const projectRouter = router({
     }),
 
   // Check if GitHub CLI is authenticated
-  checkGithubAuth: publicProcedure.query(() => {
-    return gitCloneService.checkGithubAuth();
+  checkGithubAuth: publicProcedure.query(({ ctx }) => {
+    return ctx.appContext.services.gitCloneService.checkGithubAuth();
   }),
 
   // Clone a GitHub repo and create a project
-  createFromGithub: publicProcedure
+  createFromGithub: trustedLocalProcedure
     .input(
       z.object({
         githubUrl: z
@@ -353,7 +430,7 @@ export const projectRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      const { configService } = ctx.appContext.services;
+      const { configService, gitCloneService, projectManagementService } = ctx.appContext.services;
       const { startupScriptCommand, startupScriptPath, startupScriptTimeout } = input;
 
       if (startupScriptCommand && startupScriptPath) {

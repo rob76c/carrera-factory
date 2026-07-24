@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type {
-  SnapshotUpdateInput,
-  WorkspaceSnapshotEntry,
-} from '@/backend/services/workspace-snapshot-store.service';
+import { SERVICE_THRESHOLDS } from '@/backend/services/constants';
+import type { SnapshotUpdateInput, WorkspaceSnapshotEntry } from '@/backend/services/workspace';
+import { computeKanbanColumn, deriveWorkspaceFlowState } from '@/backend/services/workspace';
+import { deriveWorkspaceSidebarStatus } from '@/shared/core';
 import type { SessionRuntimeState } from '@/shared/session-runtime';
 
 // ---------------------------------------------------------------------------
@@ -10,26 +10,7 @@ import type { SessionRuntimeState } from '@/shared/session-runtime';
 // ---------------------------------------------------------------------------
 
 const mockFindAllNonArchived = vi.fn();
-
-vi.mock('@/backend/services/workspace', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/backend/services/workspace')>();
-  return {
-    ...actual,
-    workspaceAccessor: {
-      findAllNonArchivedWithSessionsAndProject: (...args: unknown[]) =>
-        mockFindAllNonArchived(...args),
-    },
-  };
-});
-
 const mockGetWorkspaceGitStats = vi.fn();
-
-vi.mock('@/backend/services/git-ops.service', () => ({
-  gitOpsService: {
-    getWorkspaceGitStats: (...args: unknown[]) => mockGetWorkspaceGitStats(...args),
-  },
-}));
-
 const mockUpsert = vi.fn();
 const mockGetByWorkspaceId = vi.fn();
 const mockGetAllWorkspaceIds = vi.fn().mockReturnValue([]);
@@ -38,14 +19,24 @@ const mockLoggerWarn = vi.fn();
 const mockLoggerInfo = vi.fn();
 const mockLoggerError = vi.fn();
 
-vi.mock('@/backend/services/workspace-snapshot-store.service', () => ({
-  workspaceSnapshotStore: {
-    upsert: (...args: unknown[]) => mockUpsert(...args),
-    getByWorkspaceId: (...args: unknown[]) => mockGetByWorkspaceId(...args),
-    getAllWorkspaceIds: () => mockGetAllWorkspaceIds(),
-    remove: (...args: unknown[]) => mockRemove(...args),
-  },
-}));
+vi.mock('@/backend/services/workspace', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/backend/services/workspace')>();
+  return {
+    ...actual,
+    workspaceMaintenanceService: {
+      findActiveWithSessionsAndProject: (...args: unknown[]) => mockFindAllNonArchived(...args),
+    },
+    gitOpsService: {
+      getWorkspaceGitStats: (...args: unknown[]) => mockGetWorkspaceGitStats(...args),
+    },
+    workspaceSnapshotStore: {
+      upsert: (...args: unknown[]) => mockUpsert(...args),
+      getByWorkspaceId: (...args: unknown[]) => mockGetByWorkspaceId(...args),
+      getAllWorkspaceIds: () => mockGetAllWorkspaceIds(),
+      remove: (...args: unknown[]) => mockRemove(...args),
+    },
+  };
+});
 
 vi.mock('@/backend/services/logger.service', () => ({
   createLogger: () => ({
@@ -92,6 +83,8 @@ function createMockWorkspace(overrides: Record<string, unknown> = {}): Record<st
     prUpdatedAt: new Date('2026-01-02T00:00:00Z'),
     ratchetEnabled: true,
     ratchetState: 'IDLE',
+    ratchetDispatchOutcome: 'DIED',
+    ratchetDispatchRetryCount: SERVICE_THRESHOLDS.ratchetDispatchMaxRetries,
     runScriptStatus: 'IDLE',
     agentSessions: [
       {
@@ -152,6 +145,8 @@ function createSnapshotEntry(
     prUpdatedAt: '2026-01-02T00:00:00Z',
     ratchetEnabled: true,
     ratchetState: 'IDLE',
+    ratchetDispatchOutcome: 'DIED',
+    ratchetDispatchRetryCount: SERVICE_THRESHOLDS.ratchetDispatchMaxRetries,
     runScriptStatus: 'IDLE',
     hasHadSessions: true,
     isWorking: false,
@@ -249,6 +244,33 @@ describe('detectDrift', () => {
     ]);
   });
 
+  it.each([
+    {
+      field: 'ratchetDispatchOutcome' as const,
+      snapshotValue: 'RUNNING' as const,
+      authoritativeValue: 'DIED' as const,
+    },
+    {
+      field: 'ratchetDispatchRetryCount' as const,
+      snapshotValue: 1,
+      authoritativeValue: SERVICE_THRESHOLDS.ratchetDispatchMaxRetries,
+    },
+  ])('detects Ratchet drift when $field changes', (drift) => {
+    const existing = createSnapshotEntry({ [drift.field]: drift.snapshotValue });
+    const authoritative: SnapshotUpdateInput = {
+      [drift.field]: drift.authoritativeValue,
+    };
+
+    expect(detectDrift(existing, authoritative)).toEqual([
+      {
+        field: drift.field,
+        group: 'ratchet',
+        snapshotValue: drift.snapshotValue,
+        authoritativeValue: drift.authoritativeValue,
+      },
+    ]);
+  });
+
   it('ignores undefined authoritative fields', () => {
     const existing = createSnapshotEntry({ status: 'NEW', prState: 'OPEN' });
     const authoritative: SnapshotUpdateInput = { status: 'READY' };
@@ -292,14 +314,33 @@ describe('SnapshotReconciliationService', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    service = new SnapshotReconciliationService();
     bridges = createMockBridges();
-    service.configure(bridges);
+    service = new SnapshotReconciliationService({
+      createLogger: () => ({
+        info: (...args: unknown[]) => mockLoggerInfo(...args),
+        debug: vi.fn(),
+        warn: (...args: unknown[]) => mockLoggerWarn(...args),
+        error: (...args: unknown[]) => mockLoggerError(...args),
+      }),
+      gitOpsService: { getWorkspaceGitStats: mockGetWorkspaceGitStats },
+      session: bridges.session,
+      workspaceMaintenanceService: {
+        findActiveWithSessionsAndProject: mockFindAllNonArchived,
+      },
+      workspaceSnapshotStore: {
+        getAllWorkspaceIds: mockGetAllWorkspaceIds,
+        getByWorkspaceId: mockGetByWorkspaceId,
+        remove: mockRemove,
+        upsert: mockUpsert,
+      },
+    });
 
     // Default: no workspaces, no stale entries
     mockFindAllNonArchived.mockResolvedValue([]);
     mockGetAllWorkspaceIds.mockReturnValue([]);
     mockGetByWorkspaceId.mockReturnValue(undefined);
+    mockUpsert.mockReturnValue({ accepted: true, changed: true, emitted: true });
+    mockRemove.mockReturnValue(true);
   });
 
   afterEach(async () => {
@@ -336,6 +377,29 @@ describe('SnapshotReconciliationService', () => {
       expect(fields.branchName).toBe('feature/test');
       expect(fields.prState).toBe('OPEN');
       expect(fields.ratchetEnabled).toBe(true);
+      expect(fields.ratchetDispatchOutcome).toBe('DIED');
+      expect(fields.ratchetDispatchRetryCount).toBe(SERVICE_THRESHOLDS.ratchetDispatchMaxRetries);
+
+      const { WorkspaceSnapshotStore } = await vi.importActual<
+        typeof import('@/backend/services/workspace')
+      >('@/backend/services/workspace');
+      const snapshotStore = new WorkspaceSnapshotStore();
+      snapshotStore.configure({
+        deriveFlowState: (input) =>
+          deriveWorkspaceFlowState({
+            ...input,
+            prUpdatedAt: input.prUpdatedAt ? new Date(input.prUpdatedAt) : null,
+          }),
+        computeKanbanColumn,
+        deriveSidebarStatus: deriveWorkspaceSidebarStatus,
+      });
+      snapshotStore.upsert('ws-1', fields, 'reconciliation', 100);
+      const snapshot = snapshotStore.getByWorkspaceId('ws-1');
+      expect(snapshot).toMatchObject({
+        ratchetDispatchOutcome: 'DIED',
+        ratchetDispatchRetryCount: SERVICE_THRESHOLDS.ratchetDispatchMaxRetries,
+        kanbanColumn: 'WAITING',
+      });
 
       // Verify second workspace was also upserted
       const secondCall = mockUpsert.mock.calls[1]!;
@@ -670,6 +734,43 @@ describe('SnapshotReconciliationService', () => {
       expect(upsertFields.isWorking).toBe(true);
     });
 
+    it('does not treat stale persisted RUNNING sessions as working after restart', async () => {
+      const ws = createMockWorkspace({
+        id: 'ws-1',
+        worktreePath: null,
+        agentSessions: [
+          {
+            id: 'cs-stale',
+            name: 'Stale Chat',
+            workflow: 'followup',
+            model: 'claude-sonnet',
+            status: 'RUNNING',
+            updatedAt: new Date('2026-01-03T15:00:00.000Z'),
+          },
+        ],
+      });
+      mockFindAllNonArchived.mockResolvedValue([ws]);
+      vi.mocked(bridges.session.getRuntimeSnapshot).mockReturnValue({
+        phase: 'idle',
+        processState: 'stopped',
+        activity: 'IDLE',
+        updatedAt: '2026-01-03T15:00:00.000Z',
+      });
+
+      await service.reconcile();
+
+      const upsertFields = mockUpsert.mock.calls[0]![1] as SnapshotUpdateInput;
+      expect(upsertFields.sessionSummaries).toEqual([
+        expect.objectContaining({
+          sessionId: 'cs-stale',
+          persistedStatus: 'RUNNING',
+          runtimePhase: 'idle',
+          activity: 'IDLE',
+        }),
+      ]);
+      expect(upsertFields.isWorking).toBe(false);
+    });
+
     it('returns ReconciliationResult with correct counts', async () => {
       const ws1 = createMockWorkspace({
         id: 'ws-1',
@@ -700,11 +801,54 @@ describe('SnapshotReconciliationService', () => {
 
       const result = await service.reconcile();
 
+      expect(result.workspacesScanned).toBe(2);
+      expect(result.workspacesChanged).toBe(2);
+      expect(result.deltasEmitted).toBe(3);
       expect(result.workspacesReconciled).toBe(2);
       expect(result.driftsDetected).toBeGreaterThan(0);
       expect(result.staleEntriesRemoved).toBe(1);
       expect(result.gitStatsComputed).toBe(1);
       expect(result.durationMs).toBeGreaterThanOrEqual(0);
+      expect(mockLoggerInfo).toHaveBeenCalledWith(
+        'Reconciliation complete',
+        expect.objectContaining({
+          workspacesScanned: 2,
+          workspacesChanged: 2,
+          deltasEmitted: 3,
+        })
+      );
+    });
+
+    it('reports zero changes and deltas for repeated unchanged reconciliation', async () => {
+      mockFindAllNonArchived.mockResolvedValue([
+        createMockWorkspace({ id: 'ws-1', worktreePath: null }),
+      ]);
+      mockGetByWorkspaceId.mockReturnValue(createSnapshotEntry());
+      mockUpsert
+        .mockReturnValueOnce({ accepted: true, changed: true, emitted: true })
+        .mockReturnValue({ accepted: true, changed: false, emitted: false });
+
+      const initial = await service.reconcile();
+      const unchanged = await service.reconcile();
+
+      expect(initial).toMatchObject({
+        workspacesScanned: 1,
+        workspacesChanged: 1,
+        deltasEmitted: 1,
+      });
+      expect(unchanged).toMatchObject({
+        workspacesScanned: 1,
+        workspacesChanged: 0,
+        deltasEmitted: 0,
+      });
+      expect(mockLoggerInfo).toHaveBeenLastCalledWith(
+        'Reconciliation complete',
+        expect.objectContaining({
+          workspacesScanned: 1,
+          workspacesChanged: 0,
+          deltasEmitted: 0,
+        })
+      );
     });
   });
 
@@ -771,5 +915,49 @@ describe('SnapshotReconciliationService', () => {
       // Confirm it completed
       expect(mockFindAllNonArchived).toHaveBeenCalledTimes(1);
     });
+  });
+});
+
+describe('per-graph snapshot reconciliation', () => {
+  it('uses only the accessor, store, git, and session dependencies supplied at construction', async () => {
+    const createDependencies = (workspaceId: string) => {
+      const store = {
+        getAllWorkspaceIds: vi.fn(() => []),
+        getByWorkspaceId: vi.fn(),
+        remove: vi.fn(),
+        upsert: vi.fn(() => ({ accepted: true, changed: true, emitted: true })),
+      };
+      return {
+        createLogger: () => ({ info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+        gitOpsService: { getWorkspaceGitStats: vi.fn() },
+        session: createMockBridges().session,
+        workspaceMaintenanceService: {
+          findActiveWithSessionsAndProject: vi
+            .fn()
+            .mockResolvedValue([createMockWorkspace({ id: workspaceId, worktreePath: null })]),
+        },
+        workspaceSnapshotStore: store,
+      };
+    };
+    const firstDependencies = createDependencies('first');
+    const secondDependencies = createDependencies('second');
+    const first = new SnapshotReconciliationService(firstDependencies as never);
+    new SnapshotReconciliationService(secondDependencies as never);
+
+    await first.reconcile();
+
+    expect(
+      firstDependencies.workspaceMaintenanceService.findActiveWithSessionsAndProject
+    ).toHaveBeenCalledOnce();
+    expect(firstDependencies.workspaceSnapshotStore.upsert).toHaveBeenCalledWith(
+      'first',
+      expect.any(Object),
+      'reconciliation',
+      expect.any(Number)
+    );
+    expect(
+      secondDependencies.workspaceMaintenanceService.findActiveWithSessionsAndProject
+    ).not.toHaveBeenCalled();
+    expect(secondDependencies.workspaceSnapshotStore.upsert).not.toHaveBeenCalled();
   });
 });

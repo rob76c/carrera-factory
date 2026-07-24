@@ -5,6 +5,317 @@ All notable changes to Factory Factory will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-07-17
+
+### Added
+
+- Add configurable Ratchet review-trigger modes for changes-requested feedback, unresolved inline threads, and optional commented review summaries (#1969)
+- Add `TRUST_PROXY_HEADERS` support for deployments behind trusted reverse proxies (#1976)
+
+### Changed
+
+- Derive Kanban columns from next-action ownership so automated CI and Ratchet work remains in Working while explicit human attention moves to Waiting (#1978)
+- Centralize workspace Git reads behind a shared, invalidation-aware snapshot cache (#1968)
+- Batch pull-request discovery by repository with bounded backoff, jitter, and non-overlapping scheduling (#1974)
+- Consolidate backend composition, service ownership, persistence boundaries, application errors, shared snapshot contracts, project issue loading, and child-workspace messaging (#1970, #1972, #1973, #1975, #1979, #1980, #1981)
+- Tighten backend dead-code coverage and remove unused dependencies and request-scoping residue (#1971)
+
+### Fixed
+
+- Harden ACP rendering, initialization cleanup, thinking-budget validation, completed tool-call persistence, and assistant-text streaming (#1925, #1927, #1930, #1938, #1954)
+- Preserve concurrent slash-command caches, reset reopened palette selection, and revalidate file mentions at the live cursor (#1926, #1929, #1935)
+- Preserve closed-session tabs, prevent dismissed setup-warning flashes, keep workspace links from changing selection, and prevent header overlap on smaller displays (#1928, #1931, #1933, #1937)
+- Use unsaved custom IDE commands during testing and preserve agent-selected Codex branch renames (#1939, #1940)
+- Prevent stale auto-iteration cleanup from deleting replacement loops (#1936)
+- Scope pull-request synchronization and Ratchet dispatch snapshots correctly across projects and pull requests (#1932, #1951)
+- Deliver child-workspace report-back instructions and surface actionable child-workspace errors (#1941, #1950)
+- Handle Kanban archive failures, suppress no-op snapshot fan-out, and bound archived-workspace caches (#1952, #1953, #1967)
+- Throttle hidden-workspace log updates while preserving bounded output and live status indicators (#1955)
+- Preserve live Ratchet fixer turns after ACP startup (#1977)
+
+### Documentation
+
+- Refresh the README and product screenshot, and correct chat-flow, child-message-delivery, and coverage documentation (#1934, #1964, #1965, #1966)
+
+## [0.4.0] - 2026-07-16
+
+### Added
+
+- Add child workspaces with cross-project spawning, live and persisted messaging, UI management, and archive safeguards (#1706, #1708, #1713, #1718, #1892)
+- Add Fable to the default Claude model options (#1845, #1846)
+- Add project default branch detection (#1824)
+- Add WebSocket output backpressure handling (#1882)
+
+### Changed
+
+- Consolidate WebSocket consumers and handlers around shared transport and topic broadcasting (#1879, #1881, #1883)
+- Strengthen ratchet dispatch and reconciliation with explicit dispatch records, resolved-thread filtering, bounded checks, and compare-and-set transitions (#1857, #1858, #1863, #1864, #1865, #1866, #1894)
+- Bound resource-intensive searches, pagination, output buffers, and shell execution (#1776, #1782, #1784, #1786, #1797, #1800, #1802, #1805, #1806, #1850)
+- Migrate the interface icon set to Phosphor (#1878)
+- Enforce test coverage minimums (#1880)
+
+### Fixed
+
+- Harden session startup, shutdown, recovery, and failed-exit persistence (#1740, #1791, #1794, #1826, #1829, #1830, #1831, #1832, #1833, #1835)
+- Preserve run-script exit state and retry terminal process cleanup (#1767, #1855, #1856)
+- Prevent lost periodic-task dispatches and overlapping terminal resource scans (#1798, #1799)
+- Keep workspace, Kanban, pull-request, review-badge, and snapshot state synchronized across concurrent transitions (#1783, #1789, #1790, #1803, #1828, #1891, #1893)
+- Make branch rename metadata atomic and clear stale automatic-rename state (#1775, #1804, #1822, #1849)
+- Fix workspace slash-command isolation, precedence, and non-file command filtering (#1719, #1834, #1848)
+- Fix workspace cleanup, deletion, and archive rollback behavior (#1787, #1793, #1825)
+- Fix chat hydration, attachment autosave warnings, rejected-message replay, and empty tool-result history (#1788, #1792, #1823, #1829)
+- Fix CORS and port binding for explicit, wildcard, and all-interface hosts (#1721, #1795, #1827, #1854)
+- Make the first user-settings read atomic (#1781)
+- Resolve nested configuration path variables (#1852)
+- Deduplicate persisted workspace notifications (#1851)
+- Shut down cleanly on unhandled rejections (#1853)
+- Prevent parent/child workspace messages from being lost during delivery (#1892)
+
+### Security
+
+- Restrict executable tRPC mutations and authorize terminal WebSocket replay (#1779, #1796)
+- Harden issue-start and branch-rename prompt context and worktree cleanup paths (#1775, #1777, #1778)
+- Apply trusted-local validation and guarded fan-out sends across WebSocket channels (#1875, #1876, #1877)
+
+### Documentation
+
+- Update child-workspace, session lifecycle, service ownership, dependency, and CI documentation (#1696, #1704, #1705, #1708, #1837, #1838, #1839, #1847)
+
+## [0.3.21] - 2026-06-22
+
+### Added
+
+- Open workspace file links in chat (#1674)
+
+### Changed
+
+- Sync export schema provider enums (#1668)
+- Simplify issue intake launch flow (#1670)
+- Backfill missing Codex tool calls (#1672)
+- Honor default Codex reasoning effort after plan approval (#1675)
+- Unify workspace status reason (#1671)
+- Make GitHub issue start prompt editable (#1681)
+- Clean up CI log warnings (#1703)
+
+### Fixed
+
+- Fix chat test message id lookup (#1667)
+- Fix rewind capability checks (#1666)
+- Handle wrapped base64 attachments (#1669)
+- Fix ratchet handling of review summaries (#1673)
+- Fix session history hydration race (#1679, #1685)
+- Fix recovered plan approval workflow (#1678, #1684)
+- Fix stale ratchet review summaries (#1680, #1683)
+- Fix markdown workspace middle-clicks (#1677, #1682)
+- Handle file lock restore failures (#1676, #1686)
+- Filter stale changes-requested after approve-then-comment (#1688, #1691)
+- Skip enqueueing cleared initial prompts (#1689, #1690)
+- Fix slash commands not appearing in workspace chat window (#1698)
+- Fix multi-instance WebSocket origin propagation from the CLI (#1699)
+- Update workspace branch names when PRs are on a different branch (#1700)
+
+### Security
+
+- Fix Dependabot dependency alerts (#1687, #1701)
+- Add CodeQL workflow with merge_group trigger (#1694)
+- Fix CodeQL advanced workflow triggers (#1702)
+
+## [0.3.20] - 2026-05-29
+
+### Added
+
+- Add default provider effort settings (#1651)
+
+### Changed
+
+- Emit rejected state for validation failures (#1637)
+- Track startup script PID during provisioning (#1640)
+- Refactor single writer test fixtures (#1649)
+- Scope untracked Prisma drift files (#1648)
+- Harden rejected chat recovery (#1656)
+
+### Fixed
+
+- Fix ACP permission bridge reuse (#1639)
+- Treat blank optional env vars as unset (#1638)
+- Respect empty initial session prompts (#1647)
+- Fix auto-iteration resume race (#1650)
+- Prevent rejected chat recovery session leak (#1641)
+- Preserve completed session status on stop (#1645)
+- Clean up failed session starts (#1644)
+- Reject malformed attachment dispatches (#1643)
+- Prevent stale lock cleanup from deleting valid locks (#1642)
+- Fix Electron server restart after stop failure (#1653)
+- Fix queued dispatch after init retry (#1655)
+- Fix signal-killed run script wait (#1654)
+- Fix ACP prompt timeout cleanup (#1657)
+- Validate websocket origins (#1658)
+- Fix duplicate linked issues in Todo (#1659)
+- Fix Codex tool call transcript rendering (#1664)
+
+### Security
+
+- Fix Dependabot dependency alerts (#1652)
+- Fix CodeQL findings in websocket tests (#1646)
+
+### Documentation
+
+- Update Prisma workflow guidance for generated-output guardrail (#1621)
+- Add runScriptPostRunCommand to state-ownership-matrix (#1620)
+- Correct stale periodic task recovery notes (#1619)
+- Fix stale docs after initScriptPid addition (#1663)
+- Correct WebSocket origin validation coverage in CONCERNS.md (#1661)
+- Update WebSocket origin check and CLI structure docs (#1662)
+
+## [0.3.19] - 2026-05-20
+
+### Changed
+
+- Add Prisma generated drift guardrail (#1614)
+- Require workspace field ownership policies (#1617)
+- Extract runtime orchestration collaborators (#1616)
+
+### Fixed
+
+- Hide periodic task workspace controls (#1612)
+- Fix monthly periodic task timezone scheduling (#1609)
+- Fix PR detection MCP false positives (#1608)
+- Fix plan approval prompt autofocus (#1607)
+- Fix ratchet active session cleanup (#1606)
+- Preserve monthly periodic task day (#1610)
+- Recover stuck periodic task executions (#1613)
+- Fix periodic task DST scheduling (#1611)
+
+### Documentation
+
+- Add time-of-day scheduling to Periodic Tasks feature note in AGENTS.md (#1615)
+
+## [0.3.18] - 2026-05-20
+
+### Added
+
+- Add time-of-day scheduling for periodic tasks (#1597)
+
+### Changed
+
+- Persist CLI setup banner dismissal (#1590)
+- Guard Prisma generated imports (#1589)
+- Add missing guardrails to standard checks (#1588)
+- Validate auto-iteration JSON at runtime boundaries (#1593)
+- Split large orchestration and runtime modules (#1592)
+
+### Fixed
+
+- Fix ACP busy-turn retry loop after sleep (#1587)
+- Fix plan approval scrolling (#1591)
+
+### Documentation
+
+- Map existing codebase (#1586)
+- Fix stale pnpm check references after guardrail consolidation (#1596)
+- Update stale large-module file reference in CONCERNS.md (#1595)
+- Document @prisma-gen/* public entrypoint restriction in CONVENTIONS (#1594)
+
+## [0.3.17] - 2026-05-14
+
+### Changed
+
+- Detect PRs created through GitHub MCP (#1583)
+
+### Fixed
+
+- Fix npm publish release version output (#1581)
+- Fix session restart after stop (#1582)
+
+### Security
+
+- Add CodeQL scanning and fix findings (#1584)
+
+## [0.3.16] - 2026-05-14
+
+### Added
+
+- Add manual PR association for workspaces (#1561)
+- Add periodic tasks feature (#1572)
+
+### Changed
+
+- Persist init warning dismissal (#1562)
+- Finalize tool calls on session exit (#1563)
+- Clarify workspace runtime activity checks (#1567)
+
+### Fixed
+
+- Fix new project header navigation (#1564)
+- Fix stale workspace working state after restart (#1565)
+- Fix nested transaction crash on workspace creation (#1574)
+- Back off busy ACP chat dispatches (#1575)
+
+### Security
+
+- Fix security dependency alerts (#1568)
+
+### Documentation
+
+- Refresh codebase map (#1556)
+- Update ratchet active session semantics references (#1557)
+- Correct ACP permission bridge behavior in design doc (#1558)
+- Update line number references in auto-iteration resilience docs (#1559)
+- Update backend structure in CONTRIBUTING.md (#1560)
+- Register periodic-task service capsule in AGENTS.md and planning docs (#1578)
+- Remove stale flowState.isWorking references from workspaces.md (#1577)
+
+## [0.3.15] - 2026-04-29
+
+### Added
+
+- Add ACP stale exit regression test (#1548)
+
+### Changed
+
+- Make PR status sync non-blocking on app load (#1496)
+- Stop archived workspace sessions (#1498)
+- Retry auto-iteration on prompt timeout and allow resume from failed state (#1500)
+- Resolve Dependabot dependency alerts (#1499, #1505)
+- Optimize terminal output buffering (#1509)
+- Correct ratchet active session and terminal buffer documentation (#1515, #1516)
+- Accept draft PR merge state (#1536)
+- Allow ratchet when sessions are idle (#1547)
+
+### Fixed
+
+- Fix init failure banner layout (#1497)
+- Drop stale WebSocket events (#1501)
+- Fix ACP permission question handling (#1502)
+- Fix ratchet active session detection (#1503)
+- Validate setup terminal WebSocket origins and require Origin headers (#1504, #1533)
+- Handle terminal CI check outcomes (#1508)
+- Guard stopped ACP exits (#1510)
+- Fix active session limit checks and UI (#1511, #1537)
+- Clean up unregistered init worktrees (#1512)
+- Resolve CLI database paths absolutely (#1513)
+- Serialize ACP prompts per session (#1507)
+- Retry workspace init through the orchestration layer (#1506)
+- Handle Codex exit during active prompts (#1552)
+- Preserve auto-iteration backup config (#1544)
+- Fix ACP single-quote command parsing (#1549)
+- Persist ratchet transcript before cleanup (#1550)
+- Fix ratchet review comment placeholders (#1546)
+- Fix starting run script stop (#1545)
+- Preserve rejected chat message recovery (#1543)
+- Fix terminal cleanup on session persist failure (#1542)
+- Handle startup failure CI and ratchet snapshots (#1534, #1540)
+- Fix live kanban column filtering (#1539)
+- Clear queued ACP prompts on exit (#1535)
+- Fix Electron fatal error shutdown (#1541)
+- Recover stale archiving workspaces (#1554)
+- Correlate terminal create responses (#1553)
+- Fail closed for missing ACP permission bridge (#1551)
+
+### Documentation
+
+- Update PostCSS version in STACK.md (#1514)
+
 ## [0.3.14] - 2026-04-09
 
 ### Added

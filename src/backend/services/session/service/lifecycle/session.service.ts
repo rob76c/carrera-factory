@@ -1,10 +1,12 @@
 import type { ContentBlock, SessionConfigOption } from '@agentclientprotocol/sdk';
+import pLimit, { type LimitFunction } from 'p-limit';
 import { createLogger } from '@/backend/services/logger.service';
 import type { AgentSessionRecord } from '@/backend/services/session/resources/agent-session.accessor';
 import type { AcpRuntimeManager } from '@/backend/services/session/service/acp';
 import { acpRuntimeManager } from '@/backend/services/session/service/acp';
 import type {
   SessionAutoIterationExitBridge,
+  SessionLifecycleMessageQueueBridge,
   SessionLifecycleWorkspaceBridge,
 } from '@/backend/services/session/service/bridges';
 import type { SessionDomainService } from '@/backend/services/session/service/session-domain.service';
@@ -16,6 +18,7 @@ import type {
   HistoryMessage,
 } from '@/shared/acp-protocol';
 import type { ChatBarCapabilities } from '@/shared/chat-capabilities';
+import type { WorkspaceStatus } from '@/shared/core';
 import type { SessionRuntimeState } from '@/shared/session-runtime';
 import { AcpEventProcessor } from './acp-event-processor';
 import { SessionConfigService } from './session.config.service';
@@ -30,7 +33,13 @@ import { sessionRepository } from './session.repository';
 import { SessionRetryService } from './session.retry.service';
 
 const logger = createLogger('session');
+const DEFAULT_USER_PROMPT_TIMEOUT_MS = 60 * 60 * 1000;
+const TURN_ALREADY_IN_PROGRESS_REASON = 'A turn is already in progress for this session';
 type SessionStartupModePreset = 'non_interactive' | 'plan';
+type StartSessionOptions = {
+  initialPrompt?: string;
+  startupModePreset?: SessionStartupModePreset;
+};
 type PromptTurnCompleteHandler = (sessionId: string) => Promise<void> | void;
 
 export type SessionServiceDependencies = {
@@ -50,6 +59,7 @@ export class SessionService {
   private readonly promptTurnCompletionService: SessionPromptTurnCompletionService;
   private readonly retryService: SessionRetryService;
   private readonly lifecycleService: SessionLifecycleService;
+  private readonly acpPromptLimiters = new Map<string, LimitFunction>();
   /** Cross-domain bridge for workspace activity (injected by orchestration layer) */
   private workspaceBridge: SessionLifecycleWorkspaceBridge | null = null;
 
@@ -110,6 +120,12 @@ export class SessionService {
       acpEventProcessor: this.acpEventProcessor,
       promptTurnCompletionService: this.promptTurnCompletionService,
       retryService: this.retryService,
+      onBeforeStopSession: (sessionId) => {
+        this.clearQueuedAcpPrompts(sessionId);
+      },
+      onSessionExit: (sessionId) => {
+        this.clearQueuedAcpPrompts(sessionId);
+      },
     });
   }
 
@@ -118,6 +134,7 @@ export class SessionService {
    */
   configure(bridges: {
     workspace: SessionLifecycleWorkspaceBridge;
+    messageQueue?: SessionLifecycleMessageQueueBridge;
     autoIterationExit?: SessionAutoIterationExitBridge;
   }): void {
     this.workspaceBridge = bridges.workspace;
@@ -128,13 +145,7 @@ export class SessionService {
     this.promptTurnCompletionService.setHandler(handler);
   }
 
-  async startSession(
-    sessionId: string,
-    options?: {
-      initialPrompt?: string;
-      startupModePreset?: SessionStartupModePreset;
-    }
-  ): Promise<void> {
+  async startSession(sessionId: string, options?: StartSessionOptions): Promise<void> {
     await this.lifecycleService.startSession(
       sessionId,
       (id, content) => this.sendSessionMessage(id, content),
@@ -149,14 +160,26 @@ export class SessionService {
     await this.lifecycleService.stopSession(sessionId, options);
   }
 
-  async restartSession(sessionId: string): Promise<void> {
-    await this.lifecycleService.restartSession(sessionId, (id, content) =>
-      this.sendSessionMessage(id, content)
+  async restartSession(sessionId: string, options?: StartSessionOptions): Promise<void> {
+    await this.lifecycleService.restartSession(
+      sessionId,
+      (id, content) => this.sendSessionMessage(id, content),
+      options
     );
   }
 
   async stopWorkspaceSessions(workspaceId: string): Promise<void> {
     await this.lifecycleService.stopWorkspaceSessions(workspaceId);
+  }
+
+  async recoverStaleSessionStates(): Promise<number> {
+    const recoveredCount = await this.repository.recoverStaleRunningSessions();
+    if (recoveredCount > 0) {
+      logger.info('Recovered stale agent session states on startup', {
+        recoveredCount,
+      });
+    }
+    return recoveredCount;
   }
 
   getOrCreateSessionClient(
@@ -197,10 +220,8 @@ export class SessionService {
     await this.sessionConfigService.setSessionModel(sessionId, model);
   }
 
-  setSessionReasoningEffort(sessionId: string, _effort: string | null): void {
-    // ACP sessions do not support reasoning effort as a separate control.
-    // Reasoning is managed via config options when available.
-    logger.debug('setSessionReasoningEffort is a no-op for ACP sessions', { sessionId });
+  async setSessionReasoningEffort(sessionId: string, effort: string | null): Promise<void> {
+    await this.sessionConfigService.setSessionReasoningEffort(sessionId, effort);
   }
 
   async setSessionThinkingBudget(sessionId: string, maxTokens: number | null): Promise<void> {
@@ -218,13 +239,21 @@ export class SessionService {
         typeof content === 'string'
           ? [{ type: 'text', text: content }]
           : this.toContentBlocks(content, acpClient.supportsImages());
-      return this.sendAcpMessage(sessionId, prompt)
+      return this.sendAcpMessage(sessionId, prompt, DEFAULT_USER_PROMPT_TIMEOUT_MS)
         .then(() => undefined)
         .catch((error) => {
-          logger.error('ACP prompt failed', {
-            sessionId,
-            error: toErrorMessage(error),
-          });
+          const errorMessage = toErrorMessage(error);
+          if (this.isTurnAlreadyInProgressError(error)) {
+            logger.debug('ACP prompt deferred because a turn is already in progress', {
+              sessionId,
+              error: errorMessage,
+            });
+          } else {
+            logger.error('ACP prompt failed', {
+              sessionId,
+              error: errorMessage,
+            });
+          }
           throw error;
         });
     }
@@ -277,12 +306,62 @@ export class SessionService {
    * The prompt() call blocks until the turn completes; streaming events arrive
    * concurrently via the AcpClientHandler.sessionUpdate callback.
    */
-  async sendAcpMessage(
+  sendAcpMessage(sessionId: string, prompt: ContentBlock[], timeoutMs?: number): Promise<string> {
+    return this.withSerializedAcpPrompt(sessionId, () =>
+      this.executeAcpMessage(sessionId, prompt, timeoutMs)
+    );
+  }
+
+  private withSerializedAcpPrompt<T>(sessionId: string, task: () => Promise<T>): Promise<T> {
+    const limiter = this.getAcpPromptLimiter(sessionId);
+    const result = limiter(task);
+    const cleanup = () => this.deleteAcpPromptLimiterIfDrained(sessionId, limiter);
+    result.then(cleanup, cleanup);
+    return result;
+  }
+
+  private clearQueuedAcpPrompts(sessionId: string): void {
+    const limiter = this.acpPromptLimiters.get(sessionId);
+    if (!limiter) {
+      return;
+    }
+    limiter.clearQueue();
+    // A stop can kill the ACP process while the active prompt promise never
+    // settles. Drop the limiter so a later restart is not queued behind that
+    // stale in-flight turn.
+    this.acpPromptLimiters.delete(sessionId);
+  }
+
+  private deleteAcpPromptLimiterIfDrained(sessionId: string, limiter: LimitFunction): void {
+    if (
+      this.acpPromptLimiters.get(sessionId) === limiter &&
+      limiter.activeCount === 0 &&
+      limiter.pendingCount === 0
+    ) {
+      this.acpPromptLimiters.delete(sessionId);
+    }
+  }
+
+  private getAcpPromptLimiter(sessionId: string): LimitFunction {
+    const existing = this.acpPromptLimiters.get(sessionId);
+    if (existing) {
+      return existing;
+    }
+    const limiter = pLimit({ concurrency: 1, rejectOnClear: true });
+    this.acpPromptLimiters.set(sessionId, limiter);
+    return limiter;
+  }
+
+  private async executeAcpMessage(
     sessionId: string,
     prompt: ContentBlock[],
     timeoutMs?: number
   ): Promise<string> {
     const workspaceId = this.acpEventProcessor.getWorkspaceId(sessionId);
+    let workspaceActivityGeneration: number | undefined;
+    let promptCompleted = false;
+    let promptError: unknown;
+    let promptErrorSet = false;
     // Scope orphan detection to each prompt turn.
     this.acpEventProcessor.beginPromptTurn(sessionId);
 
@@ -294,11 +373,13 @@ export class SessionService {
     });
 
     if (workspaceId && this.workspaceBridge) {
-      this.workspaceBridge.markSessionRunning(workspaceId, sessionId);
+      workspaceActivityGeneration = this.workspaceBridge.markSessionRunning(workspaceId, sessionId);
     }
 
     try {
       const result = await this.runtimeManager.sendPrompt(sessionId, prompt, timeoutMs);
+      promptCompleted = true;
+      this.acpEventProcessor.finishPromptTurn(sessionId);
       this.acpEventProcessor.finalizeOrphanedToolCalls(
         sessionId,
         `stop_reason:${result.stopReason}`
@@ -311,6 +392,9 @@ export class SessionService {
       });
       return result.stopReason;
     } catch (error) {
+      promptError = error;
+      promptErrorSet = true;
+      this.acpEventProcessor.finishPromptTurn(sessionId);
       this.acpEventProcessor.finalizeOrphanedToolCalls(sessionId, 'prompt_error');
       this.sessionDomainService.setRuntimeSnapshot(sessionId, {
         phase: 'error',
@@ -322,10 +406,23 @@ export class SessionService {
       throw error;
     } finally {
       if (workspaceId && this.workspaceBridge) {
-        this.workspaceBridge.markSessionIdle(workspaceId, sessionId);
+        if (workspaceActivityGeneration === undefined) {
+          this.workspaceBridge.markSessionIdle(workspaceId, sessionId);
+        } else {
+          this.workspaceBridge.markSessionIdle(workspaceId, sessionId, workspaceActivityGeneration);
+        }
       }
-      this.promptTurnCompletionService.schedule(sessionId);
+      if (
+        (promptCompleted || (promptErrorSet && !this.isTurnAlreadyInProgressError(promptError))) &&
+        !this.isSessionStopping(sessionId)
+      ) {
+        this.promptTurnCompletionService.schedule(sessionId);
+      }
     }
+  }
+
+  private isTurnAlreadyInProgressError(error: unknown): boolean {
+    return toErrorMessage(error).includes(TURN_ALREADY_IN_PROGRESS_REASON);
   }
 
   /**
@@ -412,6 +509,14 @@ export class SessionService {
     return this.runtimeManager.isSessionRunning(sessionId);
   }
 
+  isSessionStopping(sessionId: string): boolean {
+    return this.lifecycleService.isSessionStopping(sessionId);
+  }
+
+  getStopGeneration(sessionId: string): number {
+    return this.lifecycleService.getStopGeneration(sessionId);
+  }
+
   /**
    * Check if a session is actively working (not just alive, but processing)
    */
@@ -431,6 +536,7 @@ export class SessionService {
     resumeProviderSessionId: string | undefined;
     systemPrompt: string | undefined;
     model: string;
+    workspaceStatus: WorkspaceStatus;
   } | null> {
     return this.lifecycleService.getSessionOptions(sessionId);
   }

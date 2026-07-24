@@ -4,12 +4,40 @@
  * The ratchet domain never imports from other domains directly.
  */
 
-import type { CIStatus } from '@/shared/core';
+import type {
+  CIStatus,
+  SessionProvider,
+  SessionStatus,
+  WorkspaceProviderSelection,
+} from '@/shared/core';
 
 // --- Session bridge ---
 
 /** Session capabilities needed by ratchet domain */
+export interface RatchetSessionSummary {
+  id: string;
+  workflow: string;
+  status: SessionStatus;
+  provider: SessionProvider;
+  createdAt: Date;
+}
+
+export type RatchetFixerSessionAcquisition =
+  | { outcome: 'existing'; sessionId: string; status: SessionStatus }
+  | { outcome: 'limit_reached' }
+  | { outcome: 'created'; sessionId: string };
+
 export interface RatchetSessionBridge {
+  findSessionById(sessionId: string): Promise<RatchetSessionSummary | null>;
+  findSessionsByWorkspaceId(workspaceId: string): Promise<RatchetSessionSummary[]>;
+  acquireFixerSession(input: {
+    workspaceId: string;
+    workflow: string;
+    sessionName: string;
+    maxSessions: number;
+    provider?: SessionProvider;
+    providerProjectPath: string | null;
+  }): Promise<RatchetFixerSessionAcquisition>;
   isSessionRunning(sessionId: string): boolean;
   isSessionWorking(sessionId: string): boolean;
   stopSession(sessionId: string): Promise<void>;
@@ -17,8 +45,26 @@ export interface RatchetSessionBridge {
     sessionId: string,
     opts: { initialPrompt?: string; startupModePreset?: 'non_interactive' | 'plan' }
   ): Promise<void>;
+  restartSession(
+    sessionId: string,
+    opts: { initialPrompt?: string; startupModePreset?: 'non_interactive' | 'plan' }
+  ): Promise<void>;
   sendSessionMessage(sessionId: string, message: string): Promise<void>;
   injectCommittedUserMessage(sessionId: string, message: string): void;
+}
+
+export interface RatchetWorkspaceBridge {
+  findFixerContext(workspaceId: string): Promise<{
+    id: string;
+    worktreePath: string | null;
+    defaultSessionProvider: WorkspaceProviderSelection;
+    ratchetSessionProvider: WorkspaceProviderSelection;
+  } | null>;
+  recordSessionEnd(
+    workspaceId: string,
+    sessionId: string,
+    outcome: 'COMPLETED' | 'DIED'
+  ): Promise<boolean>;
 }
 
 // --- GitHub bridge ---
@@ -27,9 +73,16 @@ export interface RatchetSessionBridge {
 export interface RatchetPRFullDetails {
   state: string;
   number: number;
+  url: string;
   reviewDecision: string | null;
   mergeStateStatus?: string;
-  reviews: Array<{ submittedAt: string | null; author: { login: string } }>;
+  reviews: Array<{
+    submittedAt: string | null;
+    author: { login: string };
+    state?: string;
+    body?: string;
+    url?: string;
+  }>;
   comments: Array<{ updatedAt: string; author: { login: string } }>;
   statusCheckRollup: Array<{
     name?: string;
@@ -44,6 +97,7 @@ export interface RatchetPRFullDetails {
 
 /** Review comment as returned by the GitHub bridge */
 export interface RatchetReviewComment {
+  id: number;
   author: { login: string };
   body: string;
   path: string;
@@ -83,23 +137,37 @@ export interface RatchetPRSnapshotBridge {
   recordReviewCheck(workspaceId: string, checkedAt?: Date | null): Promise<void>;
 }
 
-// --- Workspace bridge ---
-
-/** Workspace capabilities needed by ratchet domain */
-export interface RatchetWorkspaceBridge {
-  markFailed(workspaceId: string, reason: string): Promise<void>;
-  initializeWorktree(
-    workspaceId: string,
-    options?: { branchName?: string; useExistingBranch?: boolean }
-  ): Promise<void>;
-}
-
 /** GitHub capabilities needed by ratchet domain */
 export interface RatchetGitHubBridge {
   extractPRInfo(prUrl: string): { owner: string; repo: string; number?: number } | null;
-  getPRFullDetails(repo: string, prNumber: number): Promise<RatchetPRFullDetails>;
-  getReviewComments(repo: string, prNumber: number): Promise<RatchetReviewComment[]>;
+  getPRFullDetails(
+    repo: string,
+    prNumber: number,
+    signal?: AbortSignal
+  ): Promise<RatchetPRFullDetails>;
+  getReviewComments(
+    repo: string,
+    prNumber: number,
+    since?: Date,
+    signal?: AbortSignal
+  ): Promise<RatchetReviewComment[]>;
+  /** REST ids of review comments that belong to resolved review threads. */
+  getResolvedReviewCommentIds(
+    repo: string,
+    prNumber: number,
+    signal?: AbortSignal
+  ): Promise<Set<number>>;
   computeCIStatus(statusChecks: RatchetStatusCheckInput[] | null): CIStatus;
-  getAuthenticatedUsername(): Promise<string | null>;
+  getAuthenticatedUsername(signal?: AbortSignal): Promise<string | null>;
   fetchAndComputePRState(prUrl: string): Promise<RatchetPRStateSnapshot | null>;
+  /** True when another service has an in-flight or recent PR fetch for this workspace. */
+  isRecentlyFetched(workspaceId: string): boolean;
+  /** True only while another service's PR fetch is actively in flight for this workspace. */
+  isFetchInFlight(workspaceId: string): boolean;
+  /** Claim this workspace as in-flight before starting an async fetch (dedup optimization). */
+  startFetch(workspaceId: string): number;
+  /** Record that a PR fetch completed successfully for this workspace (dedup optimization). */
+  registerFetch(workspaceId: string, claimToken: number): void;
+  /** Release an in-flight claim without recording a successful fetch (call on failure). */
+  cancelFetch(workspaceId: string, claimToken: number): void;
 }

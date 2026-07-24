@@ -26,6 +26,9 @@ const HOP_BY_HOP_HEADERS = new Set([
   'upgrade',
 ]);
 
+const VALID_COOKIE_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const BLOCKED_COOKIE_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
+
 export interface ProxySession {
   id: string;
   signature: string;
@@ -86,8 +89,10 @@ export function verifySessionValue(value: string | undefined, secret: Buffer): b
 }
 
 export function parseCookieHeader(cookieHeader: string | undefined): Record<string, string> {
+  const cookies = Object.create(null) as Record<string, string>;
+
   if (!cookieHeader) {
-    return {};
+    return cookies;
   }
 
   return cookieHeader
@@ -102,12 +107,12 @@ export function parseCookieHeader(cookieHeader: string | undefined): Record<stri
 
       const key = part.slice(0, separator).trim();
       const value = part.slice(separator + 1).trim();
-      if (key) {
+      if (key && VALID_COOKIE_NAME.test(key) && !BLOCKED_COOKIE_NAMES.has(key.toLowerCase())) {
         acc[key] = value;
       }
 
       return acc;
-    }, {});
+    }, cookies);
 }
 
 export function mergeSetCookieValues(
@@ -218,6 +223,44 @@ export function authenticateRequest(params: {
   };
 }
 
+/**
+ * Headers that claim to carry the original client address. The authenticated
+ * proxy is the trust boundary for remote clients, so these must not reach the
+ * upstream server: the backend rejects WebSocket upgrades that carry them
+ * (see validateTrustedLocalWebSocketRequest), and tunnels like cloudflared
+ * add them to every request.
+ */
+export const FORWARDED_CLIENT_ADDRESS_HEADERS = [
+  'forwarded',
+  'x-forwarded-for',
+  'x-real-ip',
+  'x-client-ip',
+  'cf-connecting-ip',
+  'true-client-ip',
+] as const;
+
+const FORWARDED_CLIENT_ADDRESS_HEADER_SET: ReadonlySet<string> = new Set(
+  FORWARDED_CLIENT_ADDRESS_HEADERS
+);
+
+/**
+ * Builds the header set an authenticated proxy forwards upstream: strips
+ * hop-by-hop headers, the proxy's own session cookie, and client-address
+ * headers added by tunnels or the remote client.
+ */
+export function buildAuthenticatedProxyHeaders(
+  headers: IncomingHttpHeaders,
+  sessionCookieName?: string
+): Record<string, string | string[] | undefined> {
+  const cleaned = removeHopByHopHeaders(headers, sessionCookieName);
+  for (const key of Object.keys(cleaned)) {
+    if (FORWARDED_CLIENT_ADDRESS_HEADER_SET.has(key.toLowerCase())) {
+      delete cleaned[key];
+    }
+  }
+  return cleaned;
+}
+
 export function removeHopByHopHeaders(
   headers: IncomingHttpHeaders,
   sessionCookieName?: string
@@ -293,7 +336,10 @@ export function proxyAuthenticatedHttpRequest(params: {
     );
   }
 
-  const upstreamHeaders = removeHopByHopHeaders(params.req.headers, params.sessionCookieName);
+  const upstreamHeaders = buildAuthenticatedProxyHeaders(
+    params.req.headers,
+    params.sessionCookieName
+  );
 
   const upstreamRequest = httpRequest(
     {
@@ -356,7 +402,7 @@ export function proxyAuthenticatedWebSocketUpgrade(params: {
 
   const upstreamSocket = createConnection(params.upstreamPort, localHost, () => {
     const headers: Record<string, string | string[] | undefined> = {
-      ...removeHopByHopHeaders(params.req.headers, params.sessionCookieName),
+      ...buildAuthenticatedProxyHeaders(params.req.headers, params.sessionCookieName),
       host: `localhost:${params.upstreamPort}`,
       connection: 'Upgrade',
       upgrade: params.req.headers.upgrade,

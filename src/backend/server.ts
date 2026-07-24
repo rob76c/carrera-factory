@@ -13,31 +13,20 @@
  * - NODE_ENV: Environment (development/production)
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import type { Server as HttpServer } from 'node:http';
 import { createServer as createHttpServer } from 'node:http';
 import { join } from 'node:path';
 import { createExpressMiddleware } from '@trpc/server/adapters/express';
 import express from 'express';
 import { WebSocketServer } from 'ws';
-import { type AppContext, createAppContext } from './app-context';
-import { prisma } from './db';
-import { registerInterceptors, startInterceptors, stopInterceptors } from './interceptors';
+import type { Application } from './app-context';
 import { toError } from './lib/error-utils';
 import {
   createCorsMiddleware,
   createRequestLoggerMiddleware,
   securityMiddleware,
 } from './middleware';
-import { configureDomainBridges } from './orchestration/domain-bridges.orchestrator';
-import {
-  configureEventCollector,
-  stopEventCollector,
-} from './orchestration/event-collector.orchestrator';
-import {
-  configureSnapshotReconciliation,
-  snapshotReconciliationService,
-} from './orchestration/snapshot-reconciliation.orchestrator';
 import { createHealthRouter } from './routers/health.router';
 import {
   createChatUpgradeHandler,
@@ -46,54 +35,164 @@ import {
   createSetupTerminalUpgradeHandler,
   createSnapshotsUpgradeHandler,
   createTerminalUpgradeHandler,
+  disposeChatTransportForApplication,
+  disposeSnapshotsHandlerState,
 } from './routers/websocket';
-import { reconciliationService } from './services/ratchet';
-import { runScriptStateMachine } from './services/run-script';
-import { workspaceAccessor } from './services/workspace';
 import { appRouter, createContext } from './trpc/index';
 import type { ServerInstance } from './types/server-instance';
 
+export { createApplication, disposeApplication } from './app-context';
 export type { ServerInstance };
 
 /**
  * Create and configure the backend server.
  * Environment variables must be set before calling this function.
  *
+ * @param application - Fully composed application graph
  * @param requestedPort - Port to listen on (default: from BACKEND_PORT env or 3001)
  * @returns ServerInstance with start/stop methods
  */
-export function createServer(requestedPort?: number, appContext?: AppContext): ServerInstance {
-  const context = appContext ?? createAppContext();
+export function createServer(application: Application, requestedPort?: number): ServerInstance {
+  const { lifecycle, services } = application;
   const {
     acpTraceLogger,
     configService,
     createLogger,
-    findAvailablePort,
+    periodicTaskService,
     ratchetService,
     rateLimiter,
+    reconciliationService,
+    runScriptStateMachine,
     schedulerService,
     sessionFileLogger,
     sessionService,
     terminalService,
-  } = context.services;
+    workspaceAutoIterationService,
+    workspaceGitStateService,
+  } = services;
+  const {
+    database,
+    eventCollector,
+    interceptors,
+    recoverStaleArchivingWorkspaces,
+    snapshotReconciliation,
+  } = lifecycle;
 
   const logger = createLogger('server');
   const REQUESTED_PORT = requestedPort ?? configService.getBackendPort();
   const REQUESTED_HOST = configService.getBackendHost();
   const ENDPOINT_HOST = REQUESTED_HOST ?? 'localhost';
+  const PORT_BIND_MAX_ATTEMPTS = 10;
   let actualPort: number = REQUESTED_PORT;
+  let explicitStartupStarted = false;
+  let startupComplete = false;
+  let cleanupStarted = false;
+  let cleanupPromise: Promise<void> | null = null;
 
   const app = express();
 
   // Create HTTP server and WebSocket server
   const server = createHttpServer(app);
   const wss = new WebSocketServer({ noServer: true });
-  const chatUpgradeHandler = createChatUpgradeHandler(context);
-  const terminalUpgradeHandler = createTerminalUpgradeHandler(context);
-  const setupTerminalUpgradeHandler = createSetupTerminalUpgradeHandler(context);
-  const devLogsUpgradeHandler = createDevLogsUpgradeHandler(context);
-  const postRunLogsUpgradeHandler = createPostRunLogsUpgradeHandler(context);
-  const snapshotsUpgradeHandler = createSnapshotsUpgradeHandler(context);
+  const chatUpgradeHandler = createChatUpgradeHandler(application);
+  const terminalUpgradeHandler = createTerminalUpgradeHandler(application);
+  const setupTerminalUpgradeHandler = createSetupTerminalUpgradeHandler(application);
+  const devLogsUpgradeHandler = createDevLogsUpgradeHandler(application);
+  const postRunLogsUpgradeHandler = createPostRunLogsUpgradeHandler(application);
+  const snapshotsUpgradeHandler = createSnapshotsUpgradeHandler(application);
+  const websocketUpgradeHandlers = new Map<string, typeof chatUpgradeHandler>([
+    ['/chat', chatUpgradeHandler],
+    ['/terminal', terminalUpgradeHandler],
+    ['/setup-terminal', setupTerminalUpgradeHandler],
+    ['/dev-logs', devLogsUpgradeHandler],
+    ['/post-run-logs', postRunLogsUpgradeHandler],
+    ['/snapshots', snapshotsUpgradeHandler],
+  ]);
+
+  const isAddressInUseError = (error: unknown): error is NodeJS.ErrnoException =>
+    error instanceof Error && (error as NodeJS.ErrnoException).code === 'EADDRINUSE';
+
+  const listenOnPort = (port: number): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const onError = (error: Error) => {
+        server.off('listening', onListening);
+        reject(error);
+      };
+      const onListening = () => {
+        server.off('error', onError);
+        resolve();
+      };
+
+      server.once('error', onError);
+      server.once('listening', onListening);
+
+      try {
+        server.listen(port, REQUESTED_HOST);
+      } catch (error) {
+        server.off('error', onError);
+        server.off('listening', onListening);
+        reject(error);
+      }
+    });
+
+  const bindServerWithPortFallback = async (): Promise<void> => {
+    let lastAddressInUseError: NodeJS.ErrnoException | undefined;
+
+    for (let attempt = 0; attempt < PORT_BIND_MAX_ATTEMPTS; attempt++) {
+      const candidatePort = REQUESTED_PORT + attempt;
+
+      try {
+        await listenOnPort(candidatePort);
+        actualPort = candidatePort;
+
+        if (actualPort !== REQUESTED_PORT) {
+          logger.warn('Requested port in use, using alternative', {
+            requestedPort: REQUESTED_PORT,
+            actualPort,
+          });
+        }
+
+        return;
+      } catch (error) {
+        if (!isAddressInUseError(error)) {
+          throw error;
+        }
+
+        lastAddressInUseError = error;
+      }
+    }
+
+    const error = new Error(
+      `Could not bind server to an available port starting from ${REQUESTED_PORT}`
+    );
+    error.cause = lastAddressInUseError;
+    throw error;
+  };
+
+  const closeBoundServer = async (): Promise<void> => {
+    if (!server.listening) {
+      return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  };
+
+  const closeWebSocketServer = async (): Promise<void> => {
+    for (const ws of wss.clients) {
+      ws.terminate();
+    }
+    await new Promise<void>((resolve) => {
+      wss.close(() => resolve());
+    });
+  };
 
   // ============================================================================
   // WebSocket Heartbeat - Detect zombie connections
@@ -117,24 +216,36 @@ export function createServer(requestedPort?: number, appContext?: AppContext): S
   // Middleware
   // ============================================================================
   app.use(securityMiddleware);
-  app.use(createCorsMiddleware(context));
-  app.use(createRequestLoggerMiddleware(context));
+  app.use(createCorsMiddleware(application));
+  app.use(createRequestLoggerMiddleware(application));
   app.use(express.json({ limit: '10mb' }));
+  app.use((_req, res, next) => {
+    if (!explicitStartupStarted || startupComplete) {
+      next();
+      return;
+    }
+
+    res.set('Retry-After', '1');
+    res.status(503).json({
+      error: 'Service starting',
+      message: 'Backend startup is still completing. Please retry shortly.',
+    });
+  });
 
   // ============================================================================
   // Initialize Interceptors
   // ============================================================================
-  registerInterceptors();
+  interceptors.register();
 
   // ============================================================================
   // Mount HTTP Routes
   // ============================================================================
-  app.use('/health', createHealthRouter(context));
+  app.use('/health', createHealthRouter(application));
   app.use(
     '/api/trpc',
     createExpressMiddleware({
       router: appRouter,
-      createContext: createContext(context),
+      createContext: createContext(application),
     })
   );
 
@@ -142,8 +253,32 @@ export function createServer(requestedPort?: number, appContext?: AppContext): S
   // Static File Serving (Production Mode)
   // ============================================================================
   const frontendStaticPath = configService.getFrontendStaticPath();
+  let indexHtmlReloadInterval: NodeJS.Timeout | null = null;
   if (frontendStaticPath && existsSync(frontendStaticPath)) {
     logger.info('Serving static files from', { path: frontendStaticPath });
+    const indexHtmlPath = join(frontendStaticPath, 'index.html');
+    let indexHtml: string | null = null;
+    const loadStaticIndexHtml = (message: string) => {
+      try {
+        indexHtml = readFileSync(indexHtmlPath, 'utf8');
+        if (indexHtmlReloadInterval !== null) {
+          clearInterval(indexHtmlReloadInterval);
+          indexHtmlReloadInterval = null;
+        }
+      } catch (error) {
+        logger.debug(message, {
+          path: indexHtmlPath,
+          error: toError(error).message,
+        });
+      }
+    };
+    loadStaticIndexHtml('Failed to load static index.html for SPA fallback');
+    if (indexHtml === null) {
+      indexHtmlReloadInterval = setInterval(() => {
+        loadStaticIndexHtml('Failed to reload static index.html for SPA fallback');
+      }, 5000);
+      indexHtmlReloadInterval.unref?.();
+    }
 
     // Serve hashed assets (JS, CSS in /assets/) with long cache - they have content hashes
     app.use(
@@ -190,21 +325,15 @@ export function createServer(requestedPort?: number, appContext?: AppContext): S
       res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.set('Pragma', 'no-cache');
       res.set('Expires', '0');
-      // Express 5 requires the root option for sendFile to work correctly
-      res.sendFile('index.html', { root: frontendStaticPath }, (err) => {
-        if (err) {
-          // File not found or read error - log at debug level since this can happen
-          // during page refresh timing issues and is usually transient
-          logger.debug('Failed to serve index.html for SPA fallback', {
-            path: req.path,
-            error: err.message,
-          });
-          // Return 503 to indicate temporary unavailability (browser may retry)
-          if (!res.headersSent) {
-            res.status(503).send('Service temporarily unavailable. Please refresh the page.');
-          }
-        }
-      });
+      if (indexHtml === null) {
+        logger.debug('Failed to serve index.html for SPA fallback', {
+          path: req.path,
+          error: 'index.html was not loaded at startup',
+        });
+        res.status(503).send('Service temporarily unavailable. Please refresh the page.');
+        return;
+      }
+      res.type('html').send(indexHtml);
     });
   }
 
@@ -233,33 +362,17 @@ export function createServer(requestedPort?: number, appContext?: AppContext): S
       return;
     }
 
-    if (url.pathname === '/chat') {
-      chatUpgradeHandler(request, socket, head, url, wss, wsAliveMap);
+    if (explicitStartupStarted && !startupComplete) {
+      socket.write(
+        'HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 1\r\n\r\n'
+      );
+      socket.destroy();
       return;
     }
 
-    if (url.pathname === '/terminal') {
-      terminalUpgradeHandler(request, socket, head, url, wss, wsAliveMap);
-      return;
-    }
-
-    if (url.pathname === '/setup-terminal') {
-      setupTerminalUpgradeHandler(request, socket, head, url, wss, wsAliveMap);
-      return;
-    }
-
-    if (url.pathname === '/dev-logs') {
-      devLogsUpgradeHandler(request, socket, head, url, wss, wsAliveMap);
-      return;
-    }
-
-    if (url.pathname === '/post-run-logs') {
-      postRunLogsUpgradeHandler(request, socket, head, url, wss, wsAliveMap);
-      return;
-    }
-
-    if (url.pathname === '/snapshots') {
-      snapshotsUpgradeHandler(request, socket, head, url, wss, wsAliveMap);
+    const upgradeHandler = websocketUpgradeHandlers.get(url.pathname);
+    if (upgradeHandler) {
+      upgradeHandler(request, socket, head, url, wss, wsAliveMap);
       return;
     }
 
@@ -271,32 +384,76 @@ export function createServer(requestedPort?: number, appContext?: AppContext): S
   // ============================================================================
   const SHUTDOWN_TIMEOUT_MS = 5000;
 
-  const performCleanup = async () => {
-    logger.info('Starting graceful cleanup');
+  const runStartupTask = async (errorMessage: string, task: () => Promise<void>): Promise<void> => {
+    try {
+      await task();
+    } catch (error) {
+      logger.error(errorMessage, toError(error));
+    }
+  };
 
-    clearInterval(heartbeatInterval);
-    await stopInterceptors();
+  const recoverStaleArchivingOnStartup = async (): Promise<void> => {
+    const recovered = await recoverStaleArchivingWorkspaces(services);
+    if (recovered.archived.length > 0 || recovered.failed.length > 0) {
+      logger.info('Recovered stale archiving workspaces on startup', {
+        archived: recovered.archived,
+        failed: recovered.failed,
+      });
+    }
+  };
 
-    // Close WebSocket server
-    wss.close();
-    server.close();
+  const recoverStaleAutoIterationOnStartup = async (): Promise<void> => {
+    const recovered = await workspaceAutoIterationService.recoverStaleStatuses();
+    if (recovered.length > 0) {
+      logger.info('Recovered stale auto-iteration states on startup', {
+        count: recovered.length,
+        workspaceIds: recovered.map((w) => w.id),
+      });
+    }
+  };
 
-    // Stop all Claude clients via sessionService (unified lifecycle management)
-    await sessionService.stopAllClients(SHUTDOWN_TIMEOUT_MS);
+  const performCleanup = (): Promise<void> => {
+    if (cleanupPromise !== null) {
+      return cleanupPromise;
+    }
 
-    terminalService.cleanup();
-    sessionFileLogger.cleanup();
-    acpTraceLogger.cleanup();
-    await rateLimiter.stop();
+    cleanupStarted = true;
+    cleanupPromise = (async () => {
+      logger.info('Starting graceful cleanup');
 
-    await schedulerService.stop();
-    stopEventCollector();
-    await snapshotReconciliationService.stop();
-    await ratchetService.stop();
-    await reconciliationService.stopPeriodicCleanup();
-    await prisma.$disconnect();
+      clearInterval(heartbeatInterval);
+      if (indexHtmlReloadInterval !== null) {
+        clearInterval(indexHtmlReloadInterval);
+        indexHtmlReloadInterval = null;
+      }
+      await interceptors.stop();
 
-    logger.info('Graceful cleanup completed');
+      await closeWebSocketServer();
+      disposeChatTransportForApplication(application);
+      disposeSnapshotsHandlerState(application);
+      await closeBoundServer();
+
+      // Stop all Claude clients via sessionService (unified lifecycle management)
+      await sessionService.stopAllClients(SHUTDOWN_TIMEOUT_MS);
+
+      terminalService.cleanup();
+      sessionFileLogger.cleanup();
+      acpTraceLogger.cleanup();
+      await rateLimiter.stop();
+
+      await schedulerService.stop();
+      eventCollector.stop();
+      await snapshotReconciliation.stop();
+      workspaceGitStateService.stop();
+      await ratchetService.stop();
+      await periodicTaskService.stop();
+      await reconciliationService.stopPeriodicCleanup();
+      await database.$disconnect();
+
+      logger.info('Graceful cleanup completed');
+    })();
+
+    return cleanupPromise;
   };
 
   // ============================================================================
@@ -304,96 +461,98 @@ export function createServer(requestedPort?: number, appContext?: AppContext): S
   // ============================================================================
   return {
     async start(): Promise<string> {
+      if (cleanupStarted) {
+        throw new Error('Server has already been stopped');
+      }
+
+      if (explicitStartupStarted) {
+        throw new Error('Server startup has already been initiated');
+      }
+
+      explicitStartupStarted = true;
+      startupComplete = false;
+
       logger.info('Database path', {
         path: configService.getDatabasePath(),
         source: configService.getDatabasePathFromEnv() ? 'DATABASE_PATH env var' : 'default',
       });
 
-      actualPort = await findAvailablePort(REQUESTED_PORT);
-      if (actualPort !== REQUESTED_PORT) {
-        logger.warn('Requested port in use, using alternative', {
-          requestedPort: REQUESTED_PORT,
-          actualPort,
-        });
-      }
-
       const runStartupReconciliation = async (): Promise<void> => {
-        try {
-          await reconciliationService.cleanupOrphans();
-        } catch (error) {
-          logger.error('Failed to cleanup orphan sessions on startup', toError(error));
-        }
+        await runStartupTask('Failed to cleanup orphan sessions on startup', () =>
+          reconciliationService.cleanupOrphans()
+        );
+
+        // Reset agent sessions that were persisted as RUNNING by a prior process.
+        // Live ACP runtimes are in-memory only, so after a backend restart these
+        // records must not drive workspace "Working" state.
+        await runStartupTask('Failed to recover stale agent sessions on startup', async () => {
+          await sessionService.recoverStaleSessionStates();
+        });
 
         // Reconcile workspaces that may have been left in inconsistent states
         // (e.g., stuck in PROVISIONING due to server crash)
-        try {
-          await reconciliationService.reconcile();
-        } catch (error) {
-          logger.error('Failed to reconcile workspaces on startup', toError(error));
-        }
+        await runStartupTask('Failed to reconcile workspaces on startup', () =>
+          reconciliationService.reconcile()
+        );
 
         // Reset run script states left in transient STARTING/STOPPING by a prior crash
-        try {
-          await runScriptStateMachine.recoverStaleStates();
-        } catch (error) {
-          logger.error('Failed to recover stale run script states on startup', toError(error));
-        }
+        await runStartupTask('Failed to recover stale run script states on startup', () =>
+          runScriptStateMachine.recoverStaleStates()
+        );
+
+        // Resume workspace archives abandoned by a prior process exit.
+        await runStartupTask(
+          'Failed to recover stale archiving workspaces on startup',
+          recoverStaleArchivingOnStartup
+        );
 
         // Reset auto-iteration states left in RUNNING by a prior crash
-        try {
-          const recovered = await workspaceAccessor.resetStaleAutoIterationStatuses();
-          if (recovered.length > 0) {
-            logger.info('Recovered stale auto-iteration states on startup', {
-              count: recovered.length,
-              workspaceIds: recovered.map((w) => w.id),
-            });
-          }
-        } catch (error) {
-          logger.error('Failed to recover stale auto-iteration states on startup', toError(error));
-        }
+        await runStartupTask(
+          'Failed to recover stale auto-iteration states on startup',
+          recoverStaleAutoIterationOnStartup
+        );
       };
 
-      return new Promise((resolve, reject) => {
-        server.listen(actualPort, REQUESTED_HOST, async () => {
-          logger.info('Backend server started', {
-            port: actualPort,
-            environment: configService.getEnvironment(),
-          });
-          if (configService.isRunScriptProxyEnabled()) {
-            process.stdout.write(`BACKEND_PORT:${actualPort}\n`);
-          }
+      try {
+        await bindServerWithPortFallback();
+        await runStartupReconciliation();
 
-          configureDomainBridges(context.services);
-          configureEventCollector(context.services);
-          configureSnapshotReconciliation(context.services);
+        snapshotReconciliation.start();
 
-          await runStartupReconciliation();
+        logger.info('Backend server started', {
+          port: actualPort,
+          environment: configService.getEnvironment(),
+        });
+        if (configService.isRunScriptProxyEnabled()) {
+          process.stdout.write(`BACKEND_PORT:${actualPort}\n`);
+        }
 
-          sessionFileLogger.cleanupOldLogs();
-          acpTraceLogger.cleanupOldLogs();
-          await startInterceptors();
-          reconciliationService.startPeriodicCleanup();
-          rateLimiter.start();
-          schedulerService.start();
-          ratchetService.start();
+        sessionFileLogger.cleanupOldLogs();
+        acpTraceLogger.cleanupOldLogs();
+        await interceptors.start();
+        reconciliationService.startPeriodicCleanup();
+        rateLimiter.start();
+        schedulerService.start();
+        ratchetService.start();
+        periodicTaskService.start();
+        startupComplete = true;
 
-          logger.info('Server endpoints available', {
-            server: `http://${ENDPOINT_HOST}:${actualPort}`,
-            health: `http://${ENDPOINT_HOST}:${actualPort}/health`,
-            healthAll: `http://${ENDPOINT_HOST}:${actualPort}/health/all`,
-            trpc: `http://${ENDPOINT_HOST}:${actualPort}/api/trpc`,
-            wsChat: `ws://${ENDPOINT_HOST}:${actualPort}/chat`,
-            wsTerminal: `ws://${ENDPOINT_HOST}:${actualPort}/terminal`,
-            wsSnapshots: `ws://${ENDPOINT_HOST}:${actualPort}/snapshots`,
-          });
-
-          resolve(`http://${ENDPOINT_HOST}:${actualPort}`);
+        logger.info('Server endpoints available', {
+          server: `http://${ENDPOINT_HOST}:${actualPort}`,
+          health: `http://${ENDPOINT_HOST}:${actualPort}/health`,
+          healthAll: `http://${ENDPOINT_HOST}:${actualPort}/health/all`,
+          trpc: `http://${ENDPOINT_HOST}:${actualPort}/api/trpc`,
+          wsChat: `ws://${ENDPOINT_HOST}:${actualPort}/chat`,
+          wsTerminal: `ws://${ENDPOINT_HOST}:${actualPort}/terminal`,
+          wsSnapshots: `ws://${ENDPOINT_HOST}:${actualPort}/snapshots`,
         });
 
-        server.on('error', (error) => {
-          reject(error);
-        });
-      });
+        return `http://${ENDPOINT_HOST}:${actualPort}`;
+      } catch (error) {
+        startupComplete = false;
+        await performCleanup();
+        throw error;
+      }
     },
 
     async stop(): Promise<void> {

@@ -9,6 +9,13 @@ import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 
 /**
+ * Get default base directory
+ */
+export function getDefaultBaseDir(): string {
+  return join(homedir(), 'factory-factory');
+}
+
+/**
  * Expand environment variables in a string.
  * Handles $VAR and ${VAR} syntax.
  *
@@ -16,10 +23,13 @@ import { basename, join } from 'node:path';
  * expandEnvVars('$HOME/data') // '/Users/john/data'
  * expandEnvVars('${USER}') // 'john'
  */
-export function expandEnvVars(value: string, _depth = 0): string {
+export function expandEnvVars(
+  value: string,
+  env: Record<string, string | undefined> = process.env
+): string {
   return value.replace(/\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)/gi, (match, braced, bare) => {
     const varName = braced || bare;
-    const envValue = process.env[varName];
+    const envValue = env[varName];
     if (envValue !== undefined) {
       return envValue;
     }
@@ -43,13 +53,15 @@ export function expandEnvVars(value: string, _depth = 0): string {
  * before importing this module.
  */
 export function getDatabasePath(): string {
-  if (process.env.DATABASE_PATH) {
-    return expandEnvVars(process.env.DATABASE_PATH);
-  }
-
   // Default development path - expand any env vars in BASE_DIR (e.g., $USER)
   const rawBaseDir = process.env.BASE_DIR;
-  const baseDir = rawBaseDir ? expandEnvVars(rawBaseDir) : join(homedir(), 'factory-factory');
+  const baseDir = rawBaseDir ? expandEnvVars(rawBaseDir) : getDefaultBaseDir();
+  const expandedEnv = { ...process.env, BASE_DIR: baseDir };
+
+  if (process.env.DATABASE_PATH) {
+    return expandEnvVars(process.env.DATABASE_PATH, expandedEnv);
+  }
+
   return join(baseDir, 'data.db');
 }
 

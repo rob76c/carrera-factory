@@ -35,6 +35,7 @@ vi.mock('@/backend/services/logger.service', () => ({
 // Import after mocks are set up
 import { execFile } from 'node:child_process';
 import { deriveCiStatusFromCheckRollup } from '@/shared/core';
+import { classifyError } from './github-cli/errors';
 import { githubCLIService } from './github-cli.service';
 
 vi.mocked(execFile).mockImplementation(mockExecFile as never);
@@ -56,8 +57,6 @@ describe('GitHubCLIService', () => {
         state: 'OPEN',
         isDraft: false,
         reviewDecision: 'APPROVED',
-        mergedAt: null,
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: [],
       };
 
@@ -73,8 +72,6 @@ describe('GitHubCLIService', () => {
         state: 'OPEN',
         isDraft: false,
         reviewDecision: 'APPROVED',
-        mergedAt: null,
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: [],
       });
     });
@@ -196,8 +193,6 @@ describe('GitHubCLIService', () => {
         state: 'MERGED' as const,
         isDraft: false,
         reviewDecision: null,
-        mergedAt: '2024-01-01T00:00:00Z',
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: null,
       };
 
@@ -212,8 +207,6 @@ describe('GitHubCLIService', () => {
         state: 'CLOSED' as const,
         isDraft: false,
         reviewDecision: null,
-        mergedAt: null,
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: null,
       };
 
@@ -228,8 +221,6 @@ describe('GitHubCLIService', () => {
         state: 'OPEN' as const,
         isDraft: true,
         reviewDecision: null,
-        mergedAt: null,
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: null,
       };
 
@@ -244,8 +235,6 @@ describe('GitHubCLIService', () => {
         state: 'OPEN' as const,
         isDraft: false,
         reviewDecision: 'APPROVED' as const,
-        mergedAt: null,
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: null,
       };
 
@@ -260,8 +249,6 @@ describe('GitHubCLIService', () => {
         state: 'OPEN' as const,
         isDraft: false,
         reviewDecision: 'CHANGES_REQUESTED' as const,
-        mergedAt: null,
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: null,
       };
 
@@ -276,8 +263,6 @@ describe('GitHubCLIService', () => {
         state: 'OPEN' as const,
         isDraft: false,
         reviewDecision: null,
-        mergedAt: null,
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: null,
       };
 
@@ -294,10 +279,10 @@ describe('GitHubCLIService', () => {
       expect(result).toBe('UNKNOWN');
     });
 
-    it('should return UNKNOWN when statusCheckRollup is empty', () => {
+    it('should return SUCCESS when statusCheckRollup is empty', () => {
       const result = githubCLIService.computeCIStatus([]);
 
-      expect(result).toBe('UNKNOWN');
+      expect(result).toBe('SUCCESS');
     });
 
     it('should return FAILURE when any check fails', () => {
@@ -336,14 +321,14 @@ describe('GitHubCLIService', () => {
       expect(result).toBe('SUCCESS');
     });
 
-    it('should treat CANCELLED or NEUTRAL as non-blocking when a passing check exists', () => {
+    it('should treat CANCELLED as failure even when passing checks exist', () => {
       const result = githubCLIService.computeCIStatus([
         { status: 'COMPLETED', conclusion: 'SUCCESS' },
         { status: 'COMPLETED', conclusion: 'NEUTRAL' },
         { status: 'COMPLETED', conclusion: 'CANCELLED' },
       ]);
 
-      expect(result).toBe('SUCCESS');
+      expect(result).toBe('FAILURE');
     });
   });
 
@@ -398,6 +383,18 @@ describe('GitHubCLIService', () => {
         error: 'GitHub CLI (gh) is not installed. Install from https://cli.github.com/',
         errorType: 'cli_not_installed',
       });
+    });
+  });
+
+  describe('classifyError', () => {
+    it('classifies bad credentials and auth refresh hints as auth_required', () => {
+      expect(
+        classifyError(
+          new Error(
+            'HTTP 401: Bad credentials (https://api.github.com/graphql)\nTry authenticating with:  gh auth refresh -h github.com'
+          )
+        )
+      ).toBe('auth_required');
     });
   });
 
@@ -507,33 +504,6 @@ describe('GitHubCLIService', () => {
       });
     });
 
-    describe('findPRForBranch with malformed data', () => {
-      it('should return null and log error when PR list items have wrong structure', async () => {
-        const malformedData = [
-          {
-            number: 123,
-            url: 'https://github.com/owner/repo/pull/123',
-            // missing state and createdAt fields
-          },
-        ];
-
-        mockExecFile.mockResolvedValue({
-          stdout: JSON.stringify(malformedData),
-          stderr: '',
-        });
-
-        const result = await githubCLIService.findPRForBranch('owner', 'repo', 'test-branch');
-
-        expect(result).toBeNull();
-        expect(mockLoggerError).toHaveBeenCalledWith(
-          'Invalid gh CLI JSON response',
-          expect.objectContaining({
-            context: 'findPRForBranch',
-          })
-        );
-      });
-    });
-
     describe('getReviewComments with malformed data', () => {
       it('should throw error when comment structure is invalid', async () => {
         const malformedData = [
@@ -560,6 +530,39 @@ describe('GitHubCLIService', () => {
     });
 
     describe('getPRFullDetails with malformed data', () => {
+      it('accepts DRAFT mergeStateStatus for draft PRs', async () => {
+        const fullPRData = {
+          number: 123,
+          title: 'Draft PR',
+          url: 'https://github.com/owner/repo/pull/123',
+          author: { login: 'octocat' },
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-02T00:00:00Z',
+          isDraft: true,
+          state: 'OPEN',
+          reviewDecision: null,
+          statusCheckRollup: null,
+          reviews: [],
+          comments: [],
+          labels: [],
+          additions: 10,
+          deletions: 2,
+          changedFiles: 1,
+          headRefName: 'feature-branch',
+          baseRefName: 'main',
+          mergeStateStatus: 'DRAFT',
+        };
+
+        mockExecFile.mockResolvedValue({
+          stdout: JSON.stringify(fullPRData),
+          stderr: '',
+        });
+
+        const result = await githubCLIService.getPRFullDetails('owner/repo', 123);
+
+        expect(result.mergeStateStatus).toBe('DRAFT');
+      });
+
       it('normalizes status check casing in statusCheckRollup entries', async () => {
         const fullPRData = {
           number: 123,
@@ -737,22 +740,22 @@ describe('GitHubCLIService', () => {
       expect(result).toBe('FAILURE');
     });
 
-    it('should return UNKNOWN when all checks are CANCELLED', () => {
+    it('should return FAILURE when all checks are CANCELLED', () => {
       const result = githubCLIService.computeCIStatus([
         { status: 'COMPLETED', conclusion: 'CANCELLED' },
         { status: 'COMPLETED', conclusion: 'CANCELLED' },
       ]);
-      expect(result).toBe('UNKNOWN');
+      expect(result).toBe('FAILURE');
     });
 
-    it('should return SUCCESS for mixed SUCCESS/SKIPPED/NEUTRAL/CANCELLED checks', () => {
+    it('should return FAILURE for mixed SUCCESS/SKIPPED/NEUTRAL/CANCELLED checks', () => {
       const result = githubCLIService.computeCIStatus([
         { status: 'COMPLETED', conclusion: 'SUCCESS' },
         { status: 'COMPLETED', conclusion: 'SKIPPED' },
         { status: 'COMPLETED', conclusion: 'NEUTRAL' },
         { status: 'COMPLETED', conclusion: 'CANCELLED' },
       ]);
-      expect(result).toBe('SUCCESS');
+      expect(result).toBe('FAILURE');
     });
 
     it('should prefer the latest run attempt for the same check identity', () => {
@@ -833,14 +836,12 @@ describe('GitHubCLIService', () => {
   });
 
   describe('computePRState edge cases', () => {
-    it('should return MERGED when mergedAt is set even if state is OPEN', () => {
+    it('should return MERGED when state is MERGED', () => {
       const status = {
         number: 1,
-        state: 'OPEN' as const,
+        state: 'MERGED' as const,
         isDraft: false,
         reviewDecision: null,
-        mergedAt: '2024-01-01T00:00:00Z',
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: null,
       };
       expect(githubCLIService.computePRState(status)).toBe('MERGED');
@@ -852,8 +853,6 @@ describe('GitHubCLIService', () => {
         state: 'OPEN' as const,
         isDraft: false,
         reviewDecision: 'REVIEW_REQUIRED' as const,
-        mergedAt: null,
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: null,
       };
       expect(githubCLIService.computePRState(status)).toBe('OPEN');
@@ -865,8 +864,6 @@ describe('GitHubCLIService', () => {
         state: 'OPEN' as const,
         isDraft: true,
         reviewDecision: 'APPROVED' as const,
-        mergedAt: null,
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: null,
       };
       // Draft takes priority over review decision
@@ -892,8 +889,6 @@ describe('GitHubCLIService', () => {
         state: 'OPEN',
         isDraft: false,
         reviewDecision: '',
-        mergedAt: null,
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: null,
       };
 
@@ -907,86 +902,108 @@ describe('GitHubCLIService', () => {
     });
   });
 
-  describe('findPRForBranch', () => {
-    it('should return open PR when created after workspace', async () => {
-      const workspaceCreatedAt = new Date('2024-01-01T00:00:00Z');
+  describe('listOpenPRs', () => {
+    const page = (
+      nodes: Array<{
+        number: number;
+        url: string;
+        createdAt: string;
+        headRefName?: string;
+      }>,
+      pageInfo: { hasNextPage: boolean; endCursor: string | null }
+    ) =>
+      JSON.stringify({
+        data: {
+          repository: {
+            pullRequests: { nodes, pageInfo },
+          },
+        },
+      });
+
+    it('lists open pull requests through the repository connection', async () => {
       const prs = [
         {
           number: 11,
-          url: 'https://github.com/o/r/pull/11',
-          state: 'OPEN',
+          url: 'https://github.com/Owner/Repo/pull/11',
           createdAt: '2024-01-02T00:00:00Z',
+          headRefName: 'feature/one',
         },
       ];
+      mockExecFile.mockResolvedValue({
+        stdout: page(prs, { hasNextPage: false, endCursor: null }),
+        stderr: '',
+      });
 
-      mockExecFile.mockResolvedValue({ stdout: JSON.stringify(prs), stderr: '' });
-
-      const result = await githubCLIService.findPRForBranch(
-        'o',
-        'r',
-        'feature',
-        workspaceCreatedAt
+      await expect(githubCLIService.listOpenPRs('Owner', 'Repo')).resolves.toEqual(prs);
+      expect(mockExecFile).toHaveBeenCalledTimes(1);
+      expect(mockExecFile).toHaveBeenCalledWith(
+        'gh',
+        [
+          'api',
+          'graphql',
+          '-f',
+          expect.stringContaining('repository(owner: "Owner", name: "Repo")'),
+        ],
+        expect.objectContaining({ timeout: expect.any(Number) })
       );
-      expect(result).toEqual({ url: 'https://github.com/o/r/pull/11', number: 11 });
     });
 
-    it('should filter out PRs created before workspace', async () => {
-      const workspaceCreatedAt = new Date('2024-01-15T00:00:00Z');
-      const prs = [
-        {
-          number: 10,
-          url: 'https://github.com/o/r/pull/10',
-          state: 'OPEN',
-          createdAt: '2024-01-01T00:00:00Z',
-        },
-      ];
+    it('continues paging beyond 1,000 open pull requests', async () => {
+      for (let pageIndex = 0; pageIndex < 11; pageIndex++) {
+        const prs = Array.from({ length: 100 }, (_, itemIndex) => {
+          const number = pageIndex * 100 + itemIndex + 1;
+          return {
+            number,
+            url: `https://github.com/owner/repo/pull/${number}`,
+            createdAt: '2024-01-02T00:00:00Z',
+            headRefName: `feature/${number}`,
+          };
+        });
+        mockExecFile.mockResolvedValueOnce({
+          stdout: page(prs, {
+            hasNextPage: pageIndex < 10,
+            endCursor: pageIndex < 10 ? `cursor-${pageIndex + 1}` : null,
+          }),
+          stderr: '',
+        });
+      }
 
-      mockExecFile.mockResolvedValue({ stdout: JSON.stringify(prs), stderr: '' });
+      const result = await githubCLIService.listOpenPRs('owner', 'repo');
 
-      const result = await githubCLIService.findPRForBranch(
-        'o',
-        'r',
-        'feature',
-        workspaceCreatedAt
+      expect(result).toHaveLength(1100);
+      expect(result.at(-1)).toMatchObject({ number: 1100, headRefName: 'feature/1100' });
+      expect(mockExecFile).toHaveBeenCalledTimes(11);
+      expect(mockExecFile).toHaveBeenLastCalledWith(
+        'gh',
+        ['api', 'graphql', '-f', expect.stringContaining('after: "cursor-10"')],
+        expect.objectContaining({ timeout: expect.any(Number) })
       );
-      expect(result).toBeNull();
     });
 
-    it('should return null when no open PRs exist (empty result from --state open)', async () => {
-      mockExecFile.mockResolvedValue({ stdout: JSON.stringify([]), stderr: '' });
+    it('rejects malformed repository pull request data', async () => {
+      mockExecFile.mockResolvedValue({
+        stdout: page(
+          [
+            {
+              number: 11,
+              url: 'https://github.com/owner/repo/pull/11',
+              createdAt: '2024-01-02T00:00:00Z',
+            },
+          ],
+          { hasNextPage: false, endCursor: null }
+        ),
+        stderr: '',
+      });
 
-      const result = await githubCLIService.findPRForBranch('o', 'r', 'feature');
-      expect(result).toBeNull();
+      await expect(githubCLIService.listOpenPRs('owner', 'repo')).rejects.toThrow();
     });
 
-    it('should return null when no PRs exist for the branch', async () => {
-      mockExecFile.mockResolvedValue({ stdout: JSON.stringify([]), stderr: '' });
+    it('propagates repository listing failures', async () => {
+      mockExecFile.mockRejectedValue(new Error('repository unavailable'));
 
-      const result = await githubCLIService.findPRForBranch('o', 'r', 'feature');
-      expect(result).toBeNull();
-    });
-
-    it('should return null when CLI error is not auth-related', async () => {
-      mockExecFile.mockRejectedValue(new Error('some random error'));
-
-      const result = await githubCLIService.findPRForBranch('o', 'r', 'feature');
-      expect(result).toBeNull();
-    });
-
-    it('should work without workspace createdAt parameter', async () => {
-      const prs = [
-        {
-          number: 11,
-          url: 'https://github.com/o/r/pull/11',
-          state: 'OPEN',
-          createdAt: '2024-01-02T00:00:00Z',
-        },
-      ];
-
-      mockExecFile.mockResolvedValue({ stdout: JSON.stringify(prs), stderr: '' });
-
-      const result = await githubCLIService.findPRForBranch('o', 'r', 'feature');
-      expect(result).toEqual({ url: 'https://github.com/o/r/pull/11', number: 11 });
+      await expect(githubCLIService.listOpenPRs('owner', 'repo')).rejects.toThrow(
+        'repository unavailable'
+      );
     });
   });
 
@@ -1053,6 +1070,163 @@ describe('GitHubCLIService', () => {
     });
   });
 
+  describe('getResolvedReviewCommentIds', () => {
+    function makeCommentsConnection(
+      commentIds: Array<number | null>,
+      pageInfo: { hasNextPage: boolean; endCursor: string | null } = {
+        hasNextPage: false,
+        endCursor: null,
+      }
+    ) {
+      return {
+        pageInfo,
+        nodes: commentIds.map((id) => ({
+          fullDatabaseId: id === null ? null : String(id),
+        })),
+      };
+    }
+
+    function makeReviewThreadsResponse(
+      threads: Array<{
+        isResolved: boolean;
+        commentIds: Array<number | null>;
+        commentsPageInfo?: { hasNextPage: boolean; endCursor: string | null };
+      }>,
+      pageInfo: { hasNextPage: boolean; endCursor: string | null } = {
+        hasNextPage: false,
+        endCursor: null,
+      }
+    ) {
+      return {
+        data: {
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                pageInfo,
+                nodes: threads.map((thread, index) => ({
+                  id: `thread-${index}`,
+                  isResolved: thread.isResolved,
+                  comments: makeCommentsConnection(thread.commentIds, thread.commentsPageInfo),
+                })),
+              },
+            },
+          },
+        },
+      };
+    }
+
+    it('returns comment ids from resolved threads only', async () => {
+      mockExecFile.mockResolvedValue({
+        stdout: JSON.stringify(
+          makeReviewThreadsResponse([
+            { isResolved: true, commentIds: [1, 2] },
+            { isResolved: false, commentIds: [3] },
+            { isResolved: true, commentIds: [3_590_714_831, null] },
+          ])
+        ),
+        stderr: '',
+      });
+
+      const result = await githubCLIService.getResolvedReviewCommentIds('owner/repo', 123);
+      expect(result).toEqual(new Set([1, 2, 3_590_714_831]));
+    });
+
+    it('paginates review threads until hasNextPage is false', async () => {
+      mockExecFile
+        .mockResolvedValueOnce({
+          stdout: JSON.stringify(
+            makeReviewThreadsResponse([{ isResolved: true, commentIds: [1] }], {
+              hasNextPage: true,
+              endCursor: 'cursor-1',
+            })
+          ),
+          stderr: '',
+        })
+        .mockResolvedValueOnce({
+          stdout: JSON.stringify(
+            makeReviewThreadsResponse([{ isResolved: true, commentIds: [2] }])
+          ),
+          stderr: '',
+        });
+
+      const result = await githubCLIService.getResolvedReviewCommentIds('owner/repo', 123);
+      expect(result).toEqual(new Set([1, 2]));
+      expect(mockExecFile).toHaveBeenCalledTimes(2);
+      const secondQuery = mockExecFile.mock.calls[1]?.[1]?.join(' ');
+      expect(secondQuery).toContain('after: "cursor-1"');
+    });
+
+    it('pages through a resolved thread with more than one page of comments', async () => {
+      mockExecFile
+        .mockResolvedValueOnce({
+          stdout: JSON.stringify(
+            makeReviewThreadsResponse([
+              {
+                isResolved: true,
+                commentIds: [1],
+                commentsPageInfo: { hasNextPage: true, endCursor: 'comment-cursor-1' },
+              },
+              { isResolved: false, commentIds: [2] },
+            ])
+          ),
+          stderr: '',
+        })
+        .mockResolvedValueOnce({
+          stdout: JSON.stringify({
+            data: {
+              node: {
+                comments: makeCommentsConnection([3], {
+                  hasNextPage: true,
+                  endCursor: 'comment-cursor-2',
+                }),
+              },
+            },
+          }),
+          stderr: '',
+        })
+        .mockResolvedValueOnce({
+          stdout: JSON.stringify({
+            data: { node: { comments: makeCommentsConnection([4]) } },
+          }),
+          stderr: '',
+        });
+
+      const result = await githubCLIService.getResolvedReviewCommentIds('owner/repo', 123);
+      expect(result).toEqual(new Set([1, 3, 4]));
+      expect(mockExecFile).toHaveBeenCalledTimes(3);
+      const tailQuery = mockExecFile.mock.calls[1]?.[1]?.join(' ');
+      expect(tailQuery).toContain('node(id: "thread-0")');
+      expect(tailQuery).toContain('after: "comment-cursor-1"');
+      const secondTailQuery = mockExecFile.mock.calls[2]?.[1]?.join(' ');
+      expect(secondTailQuery).toContain('after: "comment-cursor-2"');
+    });
+
+    it('returns an empty set when the PR is not found', async () => {
+      mockExecFile.mockResolvedValue({
+        stdout: JSON.stringify({ data: { repository: { pullRequest: null } } }),
+        stderr: '',
+      });
+
+      const result = await githubCLIService.getResolvedReviewCommentIds('owner/repo', 123);
+      expect(result).toEqual(new Set());
+    });
+
+    it('throws when the gh CLI call fails', async () => {
+      mockExecFile.mockRejectedValue(new Error('network down'));
+
+      await expect(githubCLIService.getResolvedReviewCommentIds('owner/repo', 123)).rejects.toThrow(
+        'Failed to fetch resolved review threads: network down'
+      );
+    });
+
+    it('throws on an invalid repo format', async () => {
+      await expect(githubCLIService.getResolvedReviewCommentIds('bad-repo', 123)).rejects.toThrow(
+        'Invalid repo format'
+      );
+      expect(mockExecFile).not.toHaveBeenCalled();
+    });
+  });
+
   describe('checkHealth edge cases', () => {
     it('should return generic error for non-installation failures', async () => {
       mockExecFile.mockRejectedValue(new Error('something weird'));
@@ -1082,8 +1256,6 @@ describe('GitHubCLIService', () => {
         state: 'OPEN',
         isDraft: false,
         reviewDecision: 'REVIEW_REQUIRED',
-        mergedAt: null,
-        updatedAt: '2026-02-01T00:00:00Z',
         statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }],
       });
 
@@ -1096,6 +1268,7 @@ describe('GitHubCLIService', () => {
         prNumber: 77,
         prReviewState: 'REVIEW_REQUIRED',
         prCiStatus: 'SUCCESS',
+        headRefName: null,
       });
 
       getStatusSpy.mockRestore();
@@ -1109,31 +1282,32 @@ describe('GitHubCLIService', () => {
       getStatusSpy.mockRestore();
     });
 
-    it('lists review requests and enriches with per-PR details', async () => {
-      mockExecFile
-        .mockResolvedValueOnce({
-          stdout: JSON.stringify([
-            {
-              number: 12,
-              title: 'Fix bug',
-              url: 'https://github.com/o/r/pull/12',
-              repository: { nameWithOwner: 'o/r' },
-              author: { login: 'alice' },
-              createdAt: '2026-01-10T00:00:00Z',
-              isDraft: false,
+    it('lists review requests via single GraphQL call', async () => {
+      mockExecFile.mockResolvedValueOnce({
+        stdout: JSON.stringify({
+          data: {
+            search: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                {
+                  number: 12,
+                  title: 'Fix bug',
+                  url: 'https://github.com/o/r/pull/12',
+                  repository: { nameWithOwner: 'o/r' },
+                  author: { login: 'alice' },
+                  createdAt: '2026-01-10T00:00:00Z',
+                  isDraft: false,
+                  reviewDecision: 'APPROVED',
+                  additions: 10,
+                  deletions: 3,
+                  changedFiles: 2,
+                },
+              ],
             },
-          ]),
-          stderr: '',
-        })
-        .mockResolvedValueOnce({
-          stdout: JSON.stringify({
-            reviewDecision: 'APPROVED',
-            additions: 10,
-            deletions: 3,
-            changedFiles: 2,
-          }),
-          stderr: '',
-        });
+          },
+        }),
+        stderr: '',
+      });
 
       await expect(githubCLIService.listReviewRequests()).resolves.toEqual([
         {
@@ -1150,39 +1324,183 @@ describe('GitHubCLIService', () => {
           changedFiles: 2,
         },
       ]);
+
+      // Only one execFile call — no N+1
+      expect(mockExecFile).toHaveBeenCalledTimes(1);
     });
 
-    it('falls back to default details when per-PR detail lookup fails', async () => {
+    it('paginates review requests until GitHub search has no next page', async () => {
       mockExecFile
         .mockResolvedValueOnce({
-          stdout: JSON.stringify([
-            {
-              number: 13,
-              title: 'Fallback test',
-              url: 'https://github.com/o/r/pull/13',
-              repository: { nameWithOwner: 'o/r' },
-              author: { login: 'bob' },
-              createdAt: '2026-01-11T00:00:00Z',
-              isDraft: true,
+          stdout: JSON.stringify({
+            data: {
+              search: {
+                pageInfo: { hasNextPage: true, endCursor: 'cursor-1' },
+                nodes: [
+                  {
+                    number: 50,
+                    title: 'Boundary PR',
+                    url: 'https://github.com/o/r/pull/50',
+                    repository: { nameWithOwner: 'o/r' },
+                    author: { login: 'alice' },
+                    createdAt: '2026-01-10T00:00:00Z',
+                    isDraft: false,
+                    reviewDecision: null,
+                    additions: 1,
+                    deletions: 2,
+                    changedFiles: 3,
+                  },
+                ],
+              },
             },
-          ]),
+          }),
           stderr: '',
         })
-        .mockRejectedValueOnce(new Error('gh pr view failed'));
+        .mockResolvedValueOnce({
+          stdout: JSON.stringify({
+            data: {
+              search: {
+                pageInfo: { hasNextPage: false, endCursor: 'cursor-2' },
+                nodes: [
+                  {
+                    number: 51,
+                    title: 'Overflow PR',
+                    url: 'https://github.com/o/r/pull/51',
+                    repository: { nameWithOwner: 'o/r' },
+                    author: null,
+                    createdAt: '2026-01-11T00:00:00Z',
+                    isDraft: true,
+                  },
+                ],
+              },
+            },
+          }),
+          stderr: '',
+        });
 
       await expect(githubCLIService.listReviewRequests()).resolves.toEqual([
         {
-          number: 13,
-          title: 'Fallback test',
-          url: 'https://github.com/o/r/pull/13',
+          number: 50,
+          title: 'Boundary PR',
+          url: 'https://github.com/o/r/pull/50',
           repository: { nameWithOwner: 'o/r' },
-          author: { login: 'bob' },
+          author: { login: 'alice' },
+          createdAt: '2026-01-10T00:00:00Z',
+          isDraft: false,
+          reviewDecision: null,
+          additions: 1,
+          deletions: 2,
+          changedFiles: 3,
+        },
+        {
+          number: 51,
+          title: 'Overflow PR',
+          url: 'https://github.com/o/r/pull/51',
+          repository: { nameWithOwner: 'o/r' },
+          author: { login: '' },
           createdAt: '2026-01-11T00:00:00Z',
           isDraft: true,
           reviewDecision: null,
           additions: 0,
           deletions: 0,
           changedFiles: 0,
+        },
+      ]);
+
+      expect(mockExecFile).toHaveBeenCalledTimes(2);
+      expect(mockExecFile.mock.calls[1]?.[1]).toEqual(
+        expect.arrayContaining([expect.stringContaining('after: "cursor-1"')])
+      );
+    });
+
+    it('caps review request pagination at 20 pages', async () => {
+      const continuingPage = {
+        stdout: JSON.stringify({
+          data: {
+            search: {
+              pageInfo: { hasNextPage: true, endCursor: 'repeated-cursor' },
+              nodes: [],
+            },
+          },
+        }),
+        stderr: '',
+      };
+
+      for (let page = 0; page < 20; page++) {
+        mockExecFile.mockResolvedValueOnce(continuingPage);
+      }
+      mockExecFile.mockRejectedValueOnce(new Error('unexpected 21st page request'));
+
+      try {
+        await expect(githubCLIService.listReviewRequests()).resolves.toEqual([]);
+
+        expect(mockExecFile).toHaveBeenCalledTimes(20);
+        expect(mockLoggerWarn).toHaveBeenCalledWith(
+          'listReviewRequests: reached MAX_PAGES limit, results may be incomplete',
+          {
+            totalFetched: 0,
+            maxPages: 20,
+          }
+        );
+      } finally {
+        mockExecFile.mockReset();
+      }
+    });
+
+    it('falls back to empty array when GraphQL response is malformed', async () => {
+      mockExecFile.mockResolvedValueOnce({
+        stdout: JSON.stringify({ data: { search: { nodes: 'not-an-array' } } }),
+        stderr: '',
+      });
+
+      await expect(githubCLIService.listReviewRequests()).resolves.toEqual([]);
+    });
+
+    it('keeps fetched review requests when a later GraphQL page is malformed', async () => {
+      mockExecFile
+        .mockResolvedValueOnce({
+          stdout: JSON.stringify({
+            data: {
+              search: {
+                pageInfo: { hasNextPage: true, endCursor: 'cursor-1' },
+                nodes: [
+                  {
+                    number: 50,
+                    title: 'Boundary PR',
+                    url: 'https://github.com/o/r/pull/50',
+                    repository: { nameWithOwner: 'o/r' },
+                    author: { login: 'alice' },
+                    createdAt: '2026-01-10T00:00:00Z',
+                    isDraft: false,
+                    reviewDecision: null,
+                    additions: 1,
+                    deletions: 2,
+                    changedFiles: 3,
+                  },
+                ],
+              },
+            },
+          }),
+          stderr: '',
+        })
+        .mockResolvedValueOnce({
+          stdout: JSON.stringify({ data: { search: { nodes: 'not-an-array' } } }),
+          stderr: '',
+        });
+
+      await expect(githubCLIService.listReviewRequests()).resolves.toEqual([
+        {
+          number: 50,
+          title: 'Boundary PR',
+          url: 'https://github.com/o/r/pull/50',
+          repository: { nameWithOwner: 'o/r' },
+          author: { login: 'alice' },
+          createdAt: '2026-01-10T00:00:00Z',
+          isDraft: false,
+          reviewDecision: null,
+          additions: 1,
+          deletions: 2,
+          changedFiles: 3,
         },
       ]);
     });
@@ -1337,14 +1655,161 @@ describe('GitHubCLIService', () => {
   });
 
   describe('centralized exec - singleflight dedup', () => {
+    it('passes abort signals to authenticated-user lookups', async () => {
+      const controller = new AbortController();
+      mockExecFile.mockResolvedValue({ stdout: 'octocat\n', stderr: '' });
+
+      await expect(githubCLIService.getAuthenticatedUsername(controller.signal)).resolves.toBe(
+        'octocat'
+      );
+
+      expect(mockExecFile).toHaveBeenCalledWith(
+        'gh',
+        ['api', 'user', '--jq', '.login'],
+        expect.objectContaining({ signal: controller.signal })
+      );
+    });
+
+    it('passes abort signals to PR detail child processes', async () => {
+      const controller = new AbortController();
+      mockExecFile.mockResolvedValue({
+        stdout: JSON.stringify({
+          number: 42,
+          title: 'PR',
+          url: 'https://github.com/owner/repo/pull/42',
+          author: { login: 'author' },
+          createdAt: '2026-01-01T00:00:00Z',
+          updatedAt: '2026-01-01T00:00:00Z',
+          isDraft: false,
+          state: 'OPEN',
+          reviewDecision: null,
+          statusCheckRollup: [],
+          reviews: [],
+          comments: [],
+          labels: [],
+          additions: 0,
+          deletions: 0,
+          changedFiles: 0,
+          headRefName: 'feature',
+          baseRefName: 'main',
+          mergeStateStatus: 'CLEAN',
+        }),
+        stderr: '',
+      });
+
+      await githubCLIService.getPRFullDetails('owner/repo', 42, controller.signal);
+
+      expect(mockExecFile).toHaveBeenCalledWith(
+        'gh',
+        expect.any(Array),
+        expect.objectContaining({ signal: controller.signal })
+      );
+    });
+
+    it('passes abort signals to review comment child processes', async () => {
+      const controller = new AbortController();
+      mockExecFile.mockResolvedValue({ stdout: '[]', stderr: '' });
+
+      await githubCLIService.getReviewComments('owner/repo', 42, undefined, controller.signal);
+
+      expect(mockExecFile).toHaveBeenCalledWith(
+        'gh',
+        expect.any(Array),
+        expect.objectContaining({ signal: controller.signal })
+      );
+    });
+
+    it('does not singleflight identical signal-bound PR reads', async () => {
+      const first = new AbortController();
+      const second = new AbortController();
+      const prDetails = {
+        number: 42,
+        title: 'PR',
+        url: 'https://github.com/owner/repo/pull/42',
+        author: { login: 'author' },
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:00Z',
+        isDraft: false,
+        state: 'OPEN',
+        reviewDecision: null,
+        statusCheckRollup: [],
+        reviews: [],
+        comments: [],
+        labels: [],
+        additions: 0,
+        deletions: 0,
+        changedFiles: 0,
+        headRefName: 'feature',
+        baseRefName: 'main',
+        mergeStateStatus: 'CLEAN',
+      };
+      mockExecFile.mockResolvedValue({ stdout: JSON.stringify(prDetails), stderr: '' });
+
+      await Promise.all([
+        githubCLIService.getPRFullDetails('owner/repo', 42, first.signal),
+        githubCLIService.getPRFullDetails('owner/repo', 42, second.signal),
+      ]);
+
+      expect(mockExecFile).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not spawn a signal-bound read that is cancelled while queued', async () => {
+      const prDetails = {
+        number: 42,
+        title: 'PR',
+        url: 'https://github.com/owner/repo/pull/42',
+        author: { login: 'author' },
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:00Z',
+        isDraft: false,
+        state: 'OPEN',
+        reviewDecision: null,
+        statusCheckRollup: [],
+        reviews: [],
+        comments: [],
+        labels: [],
+        additions: 0,
+        deletions: 0,
+        changedFiles: 0,
+        headRefName: 'feature',
+        baseRefName: 'main',
+        mergeStateStatus: 'CLEAN',
+      };
+      const releases: Array<() => void> = [];
+      mockExecFile.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            releases.push(() => resolve({ stdout: JSON.stringify(prDetails), stderr: '' }));
+          })
+      );
+
+      const blockers = Array.from({ length: 5 }, (_, index) => {
+        const controller = new AbortController();
+        return githubCLIService.getPRFullDetails('owner/repo', index + 1, controller.signal);
+      });
+      await vi.waitFor(() => expect(mockExecFile).toHaveBeenCalledTimes(5));
+
+      const queuedController = new AbortController();
+      const abortReason = new Error('queued request cancelled');
+      const queued = githubCLIService.getPRFullDetails('owner/repo', 99, queuedController.signal);
+      queuedController.abort(abortReason);
+      releases.shift()?.();
+
+      await expect(queued).rejects.toBe(abortReason);
+      expect(mockExecFile).toHaveBeenCalledTimes(5);
+
+      for (const release of releases) {
+        release();
+      }
+      await Promise.all(blockers);
+    });
+
     it('deduplicates identical concurrent read calls', async () => {
       const mockPRData = {
         number: 42,
         state: 'OPEN',
         isDraft: false,
         reviewDecision: null,
-        mergedAt: null,
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: [],
       };
 
@@ -1373,8 +1838,6 @@ describe('GitHubCLIService', () => {
         state: 'OPEN',
         isDraft: false,
         reviewDecision: null,
-        mergedAt: null,
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: [],
       });
 
@@ -1398,8 +1861,6 @@ describe('GitHubCLIService', () => {
         state: 'OPEN',
         isDraft: false,
         reviewDecision: null,
-        mergedAt: null,
-        updatedAt: '2024-01-01T00:00:00Z',
         statusCheckRollup: [],
       };
 

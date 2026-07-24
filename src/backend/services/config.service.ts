@@ -7,7 +7,7 @@
 
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { expandEnvVars } from '@/backend/lib/env';
+import { expandEnvVars, getDefaultBaseDir } from '@/backend/lib/env';
 import { ConfigEnvSchema } from './env-schemas';
 import { createLogger } from './logger.service';
 
@@ -69,6 +69,14 @@ export interface NotificationConfig {
  */
 export interface CorsConfig {
   allowedOrigins: string[];
+  trustedLocalCidrs?: string[];
+  /**
+   * When true, WebSocket upgrades carrying client-address headers
+   * (x-forwarded-for, cf-connecting-ip, etc.) are accepted instead of
+   * rejected. Enable only when the backend sits behind a trusted reverse
+   * proxy that is the sole path to it (e.g. nginx -> 127.0.0.1).
+   */
+  trustProxyHeaders?: boolean;
 }
 
 /**
@@ -83,6 +91,14 @@ export interface DebugConfig {
  */
 export interface CompressionConfig {
   enabled: boolean;
+}
+
+/**
+ * Pull request discovery configuration
+ */
+export interface PRDiscoveryLimits {
+  candidateLimit: number;
+  repositoryLimit: number;
 }
 
 /**
@@ -119,6 +135,9 @@ interface SystemConfig {
 
   // Session limits
   maxSessionsPerWorkspace: number;
+
+  // Pull request discovery limits
+  prDiscovery: PRDiscoveryLimits;
 
   // Logger settings
   logger: LoggerConfig;
@@ -238,18 +257,19 @@ function buildNotificationConfig(env: ConfigEnv): NotificationConfig {
  */
 function buildCorsConfig(env: ConfigEnv): CorsConfig {
   const originsEnv = env.CORS_ALLOWED_ORIGINS;
+  const trustedCidrsEnv = env.TRUSTED_LOCAL_CIDRS;
   const defaultOrigins = ['http://localhost:3000', 'http://localhost:3001'];
 
   return {
     allowedOrigins: originsEnv ? originsEnv.split(',').map((o) => o.trim()) : defaultOrigins,
+    trustedLocalCidrs: trustedCidrsEnv
+      ? trustedCidrsEnv
+          .split(',')
+          .map((cidr) => cidr.trim())
+          .filter(Boolean)
+      : [],
+    trustProxyHeaders: env.TRUST_PROXY_HEADERS,
   };
-}
-
-/**
- * Get default base directory
- */
-function getDefaultBaseDir(): string {
-  return join(homedir(), 'factory-factory');
 }
 
 /**
@@ -260,24 +280,29 @@ function loadSystemConfig(): SystemConfig {
   // Expand any environment variables in BASE_DIR (e.g., $USER, $HOME)
   const rawBaseDir = env.BASE_DIR;
   const baseDir = rawBaseDir ? expandEnvVars(rawBaseDir) : getDefaultBaseDir();
+  const expandedEnv = { ...process.env, BASE_DIR: baseDir };
 
   // Expand any environment variables in WORKTREE_BASE_DIR
   const rawWorktreeDir = env.WORKTREE_BASE_DIR;
   const worktreeBaseDir = rawWorktreeDir
-    ? expandEnvVars(rawWorktreeDir)
+    ? expandEnvVars(rawWorktreeDir, expandedEnv)
     : join(baseDir, 'worktrees');
 
   const nodeEnv = env.NODE_ENV;
   const debugLogDir = join(baseDir, 'debug');
   const acpTraceLogsEnabled = env.ACP_TRACE_LOGS_ENABLED ?? nodeEnv === 'development';
-  const databasePathFromEnv = env.DATABASE_PATH ? expandEnvVars(env.DATABASE_PATH) : undefined;
-  const migrationsPath = env.MIGRATIONS_PATH ? expandEnvVars(env.MIGRATIONS_PATH) : undefined;
+  const databasePathFromEnv = env.DATABASE_PATH
+    ? expandEnvVars(env.DATABASE_PATH, expandedEnv)
+    : undefined;
+  const migrationsPath = env.MIGRATIONS_PATH
+    ? expandEnvVars(env.MIGRATIONS_PATH, expandedEnv)
+    : undefined;
 
   const config: SystemConfig = {
     // Directory paths
     baseDir,
     worktreeBaseDir,
-    reposDir: env.REPOS_DIR ? expandEnvVars(env.REPOS_DIR) : join(baseDir, 'repos'),
+    reposDir: env.REPOS_DIR ? expandEnvVars(env.REPOS_DIR, expandedEnv) : join(baseDir, 'repos'),
     debugLogDir,
     acpTraceLogsPath: env.ACP_TRACE_LOGS_PATH ?? join(debugLogDir, 'acp-events'),
     claudeConfigDir: env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'),
@@ -304,6 +329,12 @@ function loadSystemConfig(): SystemConfig {
 
     // Session limits
     maxSessionsPerWorkspace: env.MAX_SESSIONS_PER_WORKSPACE,
+
+    // Pull request discovery limits
+    prDiscovery: {
+      candidateLimit: env.PR_DISCOVERY_CANDIDATE_LIMIT,
+      repositoryLimit: env.PR_DISCOVERY_REPOSITORY_LIMIT,
+    },
 
     // Logger settings
     logger: buildLoggerConfig(nodeEnv, env),
@@ -516,6 +547,13 @@ class ConfigService {
   }
 
   /**
+   * Get pull request discovery limits
+   */
+  getPRDiscoveryLimits(): PRDiscoveryLimits {
+    return { ...this.config.prDiscovery };
+  }
+
+  /**
    * Get available model options
    */
   getAvailableModels(): { alias: string; model: string }[] {
@@ -547,7 +585,11 @@ class ConfigService {
    * Get CORS configuration
    */
   getCorsConfig(): CorsConfig {
-    return { ...this.config.cors };
+    return {
+      allowedOrigins: [...this.config.cors.allowedOrigins],
+      trustedLocalCidrs: [...(this.config.cors.trustedLocalCidrs ?? [])],
+      trustProxyHeaders: this.config.cors.trustProxyHeaders,
+    };
   }
 
   /**

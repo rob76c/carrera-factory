@@ -1,11 +1,11 @@
-import { insertMessageByOrder } from '@/components/chat/reducer/helpers';
+import { applyRendererMessages, insertMessageByOrder } from '@/components/chat/reducer/helpers';
 import type { ChatAction, ChatState } from '@/components/chat/reducer/types';
 import type { ChatMessage } from '@/lib/chat-protocol';
 
 export function reduceMessageQueueSlice(state: ChatState, action: ChatAction): ChatState {
   switch (action.type) {
     case 'USER_MESSAGE_SENT':
-      return { ...state, messages: [...state.messages, action.payload] };
+      return applyRendererMessages(state, [...state.messages, action.payload]);
     case 'ADD_TO_QUEUE': {
       const newQueuedMessages = new Map(state.queuedMessages);
       newQueuedMessages.set(action.payload.id, action.payload);
@@ -15,9 +15,9 @@ export function reduceMessageQueueSlice(state: ChatState, action: ChatAction): C
       };
     }
     case 'MESSAGE_SENDING': {
-      const { id, text, attachments } = action.payload;
+      const { id, text, attachments, sessionId } = action.payload;
       const newPendingMessages = new Map(state.pendingMessages);
-      newPendingMessages.set(id, { text, attachments });
+      newPendingMessages.set(id, { text, attachments, sessionId });
       return {
         ...state,
         pendingMessages: newPendingMessages,
@@ -51,8 +51,7 @@ export function reduceMessageQueueSlice(state: ChatState, action: ChatAction): C
       };
 
       return {
-        ...state,
-        messages: insertMessageByOrder(state.messages, userMessage),
+        ...applyRendererMessages(state, insertMessageByOrder(state.messages, userMessage)),
         pendingMessages: newPendingMessages,
         pendingRequest: { type: 'none' },
       };

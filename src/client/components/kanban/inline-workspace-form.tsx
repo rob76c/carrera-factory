@@ -1,5 +1,11 @@
+import {
+  ArrowsClockwiseIcon,
+  CalendarIcon,
+  CaretDownIcon,
+  PaperclipIcon,
+  SpinnerGapIcon,
+} from '@phosphor-icons/react';
 import type { inferRouterOutputs } from '@trpc/server';
-import { ChevronDown, Loader2, Paperclip, RefreshCw } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import type { AppRouter } from '@/client/lib/trpc';
@@ -9,7 +15,9 @@ import { AttachmentPreview } from '@/components/chat/attachment-preview';
 import { collectAttachments } from '@/components/chat/chat-input/hooks/attachment-file-conversion';
 import { usePasteDropHandler } from '@/components/chat/chat-input/hooks/use-paste-drop-handler';
 import { useProjectFileMentions } from '@/components/chat/chat-input/hooks/use-project-file-mentions';
+import { useSlashCommands } from '@/components/chat/chat-input/hooks/use-slash-commands';
 import { FileMentionPalette } from '@/components/chat/file-mention-palette';
+import { SlashCommandPalette } from '@/components/chat/slash-command-palette';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -38,6 +46,35 @@ import {
   generateWorkspaceNameFromPrompt,
 } from '@/shared/workspace-words';
 
+function handleFormKeyDown(
+  e: React.KeyboardEvent,
+  opts: {
+    delegateToSlashMenu: (key: string) => string;
+    delegateToFileMentionMenu: (key: string) => string;
+    isCreating: boolean;
+    onCancel: () => void;
+    onLaunch: () => void;
+  }
+) {
+  if (opts.delegateToSlashMenu(e.key) === 'handled') {
+    e.preventDefault();
+    return;
+  }
+  if (opts.delegateToFileMentionMenu(e.key) === 'handled') {
+    e.preventDefault();
+    return;
+  }
+  if (!opts.isCreating) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      opts.onCancel();
+    } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      opts.onLaunch();
+    }
+  }
+}
+
 interface InlineWorkspaceFormProps {
   projectId: string;
   existingNames?: string[];
@@ -47,6 +84,26 @@ interface InlineWorkspaceFormProps {
 
 const ATTACHMENT_ACCEPT_TYPES = [...SUPPORTED_IMAGE_TYPES, ...SUPPORTED_TEXT_EXTENSIONS].join(',');
 const MAX_PROMPT_TEXTAREA_HEIGHT_PX = 240;
+
+async function processFileInput(event: React.ChangeEvent<HTMLInputElement>) {
+  const files = event.target.files;
+  if (!files || files.length === 0) {
+    return null;
+  }
+  const { attachments: newAttachments, errors } = await collectAttachments(files);
+  if (errors.length > 0) {
+    const formattedErrors = errors.map(({ fileName, message }) => `${fileName}: ${message}`);
+    toast.error(`Could not add ${errors.length} file(s): ${formattedErrors.join('; ')}`);
+  }
+  event.target.value = '';
+  return { newAttachments };
+}
+
+const launchButtonLabels: Record<string, string> = {
+  STANDARD: 'Launch',
+  AUTO_ITERATION: 'Launch (auto-iterate)',
+  PERIODIC_TASK: 'Create Periodic Task',
+};
 
 type RouterOutputs = inferRouterOutputs<AppRouter>;
 type KanbanWorkspace = RouterOutputs['workspace']['listWithKanbanState'][number];
@@ -83,6 +140,7 @@ function createOptimisticWorkingWorkspace(params: {
     initOutput: null,
     initStartedAt: null,
     initCompletedAt: null,
+    initScriptPid: null,
     initRetryCount: 0,
     runScriptCommand: null,
     runScriptPostRunCommand: null,
@@ -92,6 +150,9 @@ function createOptimisticWorkingWorkspace(params: {
     runScriptStartedAt: null,
     runScriptStatus: 'IDLE',
     prUrl: null,
+    prDiscoveryLastCheckedAt: null,
+    prDiscoveryRetryCount: 0,
+    prDiscoveryNextCheckAt: null,
     githubIssueNumber: null,
     githubIssueUrl: null,
     linearIssueId: null,
@@ -115,14 +176,18 @@ function createOptimisticWorkingWorkspace(params: {
     ratchetLastCheckedAt: null,
     ratchetActiveSessionId: null,
     ratchetLastCiRunId: null,
+    ratchetDispatchOutcome: null,
+    ratchetDispatchRetryCount: 0,
     hasHadSessions: false,
     cachedKanbanColumn: 'WORKING',
     stateComputedAt: null,
-    mode: (params.mode ?? 'STANDARD') as 'STANDARD' | 'AUTO_ITERATION',
+    mode: params.mode ?? 'STANDARD',
     autoIterationStatus: null,
     autoIterationConfig: null,
     autoIterationProgress: null,
     autoIterationSessionId: null,
+    periodicTaskId: null,
+    parentWorkspaceId: null,
     agentSessions: [],
     terminalSessions: [],
     kanbanColumn: 'WORKING',
@@ -130,9 +195,215 @@ function createOptimisticWorkingWorkspace(params: {
     ratchetButtonAnimated: false,
     flowPhase: 'NO_PR',
     ciObservation: 'NOT_FETCHED',
+    statusReason: {
+      code: 'SETTING_UP',
+      label: 'Setting up workspace',
+      tone: 'working',
+      needsUser: false,
+    },
     isArchived: false,
     pendingRequestType: null,
   };
+}
+
+function ModeConfigPanel({
+  mode,
+  cadence,
+  setCadence,
+  scheduledTime,
+  setScheduledTime,
+  isCreating,
+  testCommand,
+  setTestCommand,
+  targetDescription,
+  setTargetDescription,
+  maxIterations,
+  setMaxIterations,
+  unlimitedIterations,
+  setUnlimitedIterations,
+  testTimeoutSeconds,
+  setTestTimeoutSeconds,
+  baseBranch,
+  setBaseBranch,
+}: {
+  mode: 'STANDARD' | 'AUTO_ITERATION' | 'PERIODIC_TASK';
+  cadence: 'EVERY_MINUTE' | 'EVERY_FIVE_MINUTES' | 'DAILY' | 'WEEKLY' | 'MONTHLY';
+  setCadence: (v: 'EVERY_MINUTE' | 'EVERY_FIVE_MINUTES' | 'DAILY' | 'WEEKLY' | 'MONTHLY') => void;
+  scheduledTime: string;
+  setScheduledTime: (v: string) => void;
+  isCreating: boolean;
+  testCommand: string;
+  setTestCommand: (v: string) => void;
+  targetDescription: string;
+  setTargetDescription: (v: string) => void;
+  maxIterations: number;
+  setMaxIterations: (v: number) => void;
+  unlimitedIterations: boolean;
+  setUnlimitedIterations: (v: boolean) => void;
+  testTimeoutSeconds: number;
+  setTestTimeoutSeconds: (v: number) => void;
+  baseBranch: string;
+  setBaseBranch: (v: string) => void;
+}) {
+  if (mode === 'PERIODIC_TASK') {
+    return (
+      <PeriodicTaskConfigPanel
+        cadence={cadence}
+        setCadence={setCadence}
+        scheduledTime={scheduledTime}
+        setScheduledTime={setScheduledTime}
+        isCreating={isCreating}
+      />
+    );
+  }
+  if (mode === 'AUTO_ITERATION') {
+    return (
+      <div className="space-y-2 rounded-md border border-dashed border-primary/40 bg-primary/5 p-3">
+        <div className="flex items-center gap-1.5 text-xs font-medium text-primary">
+          <ArrowsClockwiseIcon className="h-3 w-3" />
+          Auto-iteration config
+        </div>
+        <div className="space-y-1.5">
+          <Label className="text-xs text-muted-foreground">Test command</Label>
+          <Input
+            className="h-7 text-xs font-mono"
+            placeholder="e.g. pnpm test"
+            value={testCommand}
+            onChange={(e) => setTestCommand(e.target.value)}
+            disabled={isCreating}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label className="text-xs text-muted-foreground">Target description</Label>
+          <Input
+            className="h-7 text-xs"
+            placeholder="e.g. All tests pass with no regressions"
+            value={targetDescription}
+            onChange={(e) => setTargetDescription(e.target.value)}
+            disabled={isCreating}
+          />
+        </div>
+        <div className="flex items-center gap-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs text-muted-foreground">Max iterations</Label>
+            <Input
+              className="h-7 w-20 text-xs"
+              type="number"
+              min={1}
+              value={unlimitedIterations ? '' : maxIterations}
+              onChange={(e) => {
+                if (e.target.value === '') {
+                  return;
+                }
+                const val = Number(e.target.value);
+                setMaxIterations(Number.isNaN(val) ? 25 : Math.max(1, val));
+              }}
+              disabled={isCreating || unlimitedIterations}
+              placeholder="25"
+            />
+          </div>
+          <label className="mt-4 flex items-center gap-1.5 text-xs text-muted-foreground">
+            <Checkbox
+              checked={unlimitedIterations}
+              onCheckedChange={(checked) => setUnlimitedIterations(checked === true)}
+              disabled={isCreating}
+              className="h-3.5 w-3.5"
+            />
+            Unlimited
+          </label>
+          <div className="space-y-1.5">
+            <Label className="text-xs text-muted-foreground">Test timeout (s)</Label>
+            <Input
+              className="h-7 w-20 text-xs"
+              type="number"
+              min={1}
+              value={testTimeoutSeconds}
+              onChange={(e) => {
+                if (e.target.value === '') {
+                  return;
+                }
+                const val = Number(e.target.value);
+                setTestTimeoutSeconds(Number.isNaN(val) ? 300 : Math.max(1, val));
+              }}
+              disabled={isCreating}
+            />
+          </div>
+        </div>
+        <div className="space-y-1.5">
+          <Label className="text-xs text-muted-foreground">Base branch (optional)</Label>
+          <Input
+            className="h-7 text-xs font-mono"
+            placeholder="defaults to project default branch"
+            value={baseBranch}
+            onChange={(e) => setBaseBranch(e.target.value)}
+            disabled={isCreating}
+          />
+        </div>
+      </div>
+    );
+  }
+  return null;
+}
+
+function PeriodicTaskConfigPanel({
+  cadence,
+  setCadence,
+  scheduledTime,
+  setScheduledTime,
+  isCreating,
+}: {
+  cadence: 'EVERY_MINUTE' | 'EVERY_FIVE_MINUTES' | 'DAILY' | 'WEEKLY' | 'MONTHLY';
+  setCadence: (v: 'EVERY_MINUTE' | 'EVERY_FIVE_MINUTES' | 'DAILY' | 'WEEKLY' | 'MONTHLY') => void;
+  scheduledTime: string;
+  setScheduledTime: (v: string) => void;
+  isCreating: boolean;
+}) {
+  const isLongCadence = cadence === 'DAILY' || cadence === 'WEEKLY' || cadence === 'MONTHLY';
+  return (
+    <div className="space-y-2 rounded-md border border-dashed border-primary/40 bg-primary/5 p-3">
+      <div className="flex items-center gap-1.5 text-xs font-medium text-primary">
+        <CalendarIcon className="h-3 w-3" />
+        Periodic task config
+      </div>
+      <div className="space-y-1.5">
+        <Label className="text-xs text-muted-foreground">Cadence</Label>
+        <Select
+          value={cadence}
+          onValueChange={(v) =>
+            setCadence(v as 'EVERY_MINUTE' | 'EVERY_FIVE_MINUTES' | 'DAILY' | 'WEEKLY' | 'MONTHLY')
+          }
+          disabled={isCreating}
+        >
+          <SelectTrigger className="h-7 text-xs">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="EVERY_MINUTE">Every minute (testing)</SelectItem>
+            <SelectItem value="EVERY_FIVE_MINUTES">Every 5 minutes (testing)</SelectItem>
+            <SelectItem value="DAILY">Daily</SelectItem>
+            <SelectItem value="WEEKLY">Weekly</SelectItem>
+            <SelectItem value="MONTHLY">Monthly</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      {isLongCadence && (
+        <div className="space-y-1.5">
+          <Label className="text-xs text-muted-foreground">Run time (optional)</Label>
+          <Input
+            type="time"
+            className="h-7 text-xs"
+            value={scheduledTime}
+            onChange={(e) => setScheduledTime(e.target.value)}
+            disabled={isCreating}
+          />
+        </div>
+      )}
+      <p className="text-[10px] text-muted-foreground">
+        Creates a new workspace on this schedule. The first run starts immediately.
+        {isLongCadence && scheduledTime ? ' Subsequent runs will use the time above.' : ''}
+      </p>
+    </div>
+  );
 }
 
 export function InlineWorkspaceForm({
@@ -158,7 +429,11 @@ export function InlineWorkspaceForm({
   const [startupModePreset, setStartupModePreset] = useState<'non_interactive' | 'plan'>(
     'non_interactive'
   );
-  const [mode, setMode] = useState<'STANDARD' | 'AUTO_ITERATION'>('STANDARD');
+  const [mode, setMode] = useState<'STANDARD' | 'AUTO_ITERATION' | 'PERIODIC_TASK'>('STANDARD');
+  const [cadence, setCadence] = useState<
+    'EVERY_MINUTE' | 'EVERY_FIVE_MINUTES' | 'DAILY' | 'WEEKLY' | 'MONTHLY'
+  >('DAILY');
+  const [scheduledTime, setScheduledTime] = useState('');
   const [testCommand, setTestCommand] = useState('');
   const [targetDescription, setTargetDescription] = useState('');
   const [maxIterations, setMaxIterations] = useState(25);
@@ -177,13 +452,30 @@ export function InlineWorkspaceForm({
     }
   }, []);
 
-  const fileMentions = useProjectFileMentions({
-    projectId,
-    inputRef: textareaRef,
-    onChange: (value) => {
+  const onPromptChange = useCallback(
+    (value: string) => {
       setInitialPrompt(value);
       autoResize();
     },
+    [autoResize]
+  );
+
+  const fileMentions = useProjectFileMentions({
+    projectId,
+    inputRef: textareaRef,
+    onChange: onPromptChange,
+  });
+
+  const { data: slashCommandsData, isFetched: slashCommandsFetched } =
+    trpc.project.listSlashCommands.useQuery({ projectId }, { staleTime: 60_000 });
+  const projectCommands = slashCommandsData?.commands ?? [];
+
+  const slashCommands = useSlashCommands({
+    enabled: true,
+    slashCommands: projectCommands,
+    commandsLoaded: slashCommandsFetched,
+    inputRef: textareaRef,
+    onChange: onPromptChange,
   });
 
   // Initialize defaults from user settings once loaded
@@ -256,30 +548,37 @@ export function InlineWorkspaceForm({
     },
   });
 
-  const isCreating = createWorkspaceMutation.isPending;
+  const createPeriodicTaskMutation = trpc.periodicTask.create.useMutation({
+    onSuccess: (task) => {
+      toast.success(`Periodic task "${task.name}" created`);
+      utils.periodicTask.list.invalidate({ projectId });
+      onCancel();
+    },
+    onError: (error) => {
+      toast.error(`Failed to create periodic task: ${error.message}`);
+    },
+  });
+
+  const isCreating = createWorkspaceMutation.isPending || createPeriodicTaskMutation.isPending;
+  const supportsWorkspaceOptions = mode !== 'PERIODIC_TASK';
+  const isLaunchDisabled =
+    isCreating || isLoadingSettings || (shouldFetchExistingNames && isLoadingWorkspaceList);
 
   const pasteDropHandler = usePasteDropHandler({
     setAttachments,
-    disabled: isCreating,
+    disabled: isCreating || !supportsWorkspaceOptions,
   });
 
   const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = event.target.files;
-    if (!files || files.length === 0) {
+    if (!supportsWorkspaceOptions) {
+      event.target.value = '';
       return;
     }
-
-    const { attachments: newAttachments, errors } = await collectAttachments(files);
-    if (newAttachments.length > 0) {
-      setAttachments((prev) => [...prev, ...newAttachments]);
+    const result = await processFileInput(event);
+    const newFiles = result?.newAttachments ?? [];
+    if (newFiles.length > 0) {
+      setAttachments((prev) => [...prev, ...newFiles]);
     }
-
-    if (errors.length > 0) {
-      const formattedErrors = errors.map(({ fileName, message }) => `${fileName}: ${message}`);
-      toast.error(`Could not add ${errors.length} file(s): ${formattedErrors.join('; ')}`);
-    }
-
-    event.target.value = '';
   };
 
   const buildAutoIterationConfig = () => ({
@@ -294,15 +593,29 @@ export function InlineWorkspaceForm({
     return trimmed || undefined;
   };
 
-  const handleLaunch = (launchMode: 'STANDARD' | 'AUTO_ITERATION' = mode) => {
-    if (launchMode === 'AUTO_ITERATION' && !(testCommand.trim() && targetDescription.trim())) {
-      toast.error('Auto-iteration requires a test command and target description.');
+  const launchPeriodicTask = (trimmedPrompt: string) => {
+    if (!trimmedPrompt) {
+      toast.error('Periodic task requires a prompt.');
       return;
     }
-    const trimmedPrompt = initialPrompt.trim();
+    const name = generateWorkspaceNameFromPrompt(trimmedPrompt, availableWorkspaceNames);
+    const isLongCadence = cadence === 'DAILY' || cadence === 'WEEKLY' || cadence === 'MONTHLY';
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    createPeriodicTaskMutation.mutate({
+      projectId,
+      name,
+      prompt: trimmedPrompt,
+      cadence,
+      scheduledTime: isLongCadence && scheduledTime ? scheduledTime : null,
+      timezone: isLongCadence && scheduledTime ? timezone : null,
+    });
+  };
+
+  const launchWorkspace = (trimmedPrompt: string, launchMode: 'STANDARD' | 'AUTO_ITERATION') => {
     const name = trimmedPrompt
       ? generateWorkspaceNameFromPrompt(trimmedPrompt, availableWorkspaceNames)
       : generateUniqueWorkspaceName(availableWorkspaceNames);
+    const isAutoIterate = launchMode === 'AUTO_ITERATION';
     createWorkspaceMutation.mutate({
       type: 'MANUAL',
       projectId,
@@ -313,40 +626,54 @@ export function InlineWorkspaceForm({
       ratchetEnabled,
       provider,
       mode: launchMode,
-      autoIterationConfig: launchMode === 'AUTO_ITERATION' ? buildAutoIterationConfig() : undefined,
-      branchName: launchMode === 'AUTO_ITERATION' ? getAutoIterationBranchName() : undefined,
+      autoIterationConfig: isAutoIterate ? buildAutoIterationConfig() : undefined,
+      branchName: isAutoIterate ? getAutoIterationBranchName() : undefined,
     });
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Delegate to file mention menu first
-    const mentionResult = fileMentions.delegateToFileMentionMenu(e.key);
-    if (mentionResult === 'handled') {
-      e.preventDefault();
+  const handleLaunch = (launchMode: 'STANDARD' | 'AUTO_ITERATION' | 'PERIODIC_TASK' = mode) => {
+    if (launchMode === 'AUTO_ITERATION' && !(testCommand.trim() && targetDescription.trim())) {
+      toast.error('Auto-iteration requires a test command and target description.');
       return;
     }
-
-    if (e.key === 'Escape' && !isCreating) {
-      e.preventDefault();
-      onCancel();
-    }
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !isCreating) {
-      e.preventDefault();
-      handleLaunch(mode);
+    const trimmedPrompt = initialPrompt.trim();
+    if (launchMode === 'PERIODIC_TASK') {
+      launchPeriodicTask(trimmedPrompt);
+    } else {
+      launchWorkspace(trimmedPrompt, launchMode);
     }
   };
 
+  const handleKeyDown = (e: React.KeyboardEvent) =>
+    handleFormKeyDown(e, {
+      delegateToSlashMenu: slashCommands.delegateToSlashMenu,
+      delegateToFileMentionMenu: fileMentions.delegateToFileMentionMenu,
+      isCreating,
+      onCancel,
+      onLaunch: () => handleLaunch(mode),
+    });
+
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const newValue = e.target.value;
-    setInitialPrompt(newValue);
+    slashCommands.handleInputChange(e);
+    fileMentions.detectFileMention(e.target.value);
     autoResize();
-    fileMentions.detectFileMention(newValue);
   };
 
   return (
     <Card className="shrink-0 border-dashed border-primary/50">
       <CardContent className="p-3 space-y-3" onKeyDown={handleKeyDown}>
         <div className="relative">
+          <SlashCommandPalette
+            commands={projectCommands}
+            isOpen={slashCommands.slashMenuOpen}
+            isLoading={!slashCommands.commandsReady}
+            onClose={slashCommands.handleSlashMenuClose}
+            onSelect={slashCommands.handleSlashCommandSelect}
+            filter={slashCommands.slashFilter}
+            anchorRef={textareaRef as React.RefObject<HTMLElement | null>}
+            paletteRef={slashCommands.paletteRef}
+            placement="below"
+          />
           <FileMentionPalette
             files={fileMentions.files}
             isOpen={fileMentions.fileMentionMenuOpen}
@@ -375,7 +702,7 @@ export function InlineWorkspaceForm({
             disabled={isCreating}
           />
         </div>
-        {attachments.length > 0 ? (
+        {supportsWorkspaceOptions && attachments.length > 0 ? (
           <AttachmentPreview
             attachments={attachments}
             onRemove={(id) =>
@@ -383,147 +710,87 @@ export function InlineWorkspaceForm({
             }
           />
         ) : null}
-        {mode === 'AUTO_ITERATION' && (
-          <div className="space-y-2 rounded-md border border-dashed border-primary/40 bg-primary/5 p-3">
-            <div className="flex items-center gap-1.5 text-xs font-medium text-primary">
-              <RefreshCw className="h-3 w-3" />
-              Auto-iteration config
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs text-muted-foreground">Test command</Label>
-              <Input
-                className="h-7 text-xs font-mono"
-                placeholder="e.g. pnpm test"
-                value={testCommand}
-                onChange={(e) => setTestCommand(e.target.value)}
-                disabled={isCreating}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs text-muted-foreground">Target description</Label>
-              <Input
-                className="h-7 text-xs"
-                placeholder="e.g. All tests pass with no regressions"
-                value={targetDescription}
-                onChange={(e) => setTargetDescription(e.target.value)}
-                disabled={isCreating}
-              />
-            </div>
-            <div className="flex items-center gap-3">
-              <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">Max iterations</Label>
-                <Input
-                  className="h-7 w-20 text-xs"
-                  type="number"
-                  min={1}
-                  value={unlimitedIterations ? '' : maxIterations}
-                  onChange={(e) => {
-                    if (e.target.value === '') {
-                      return;
-                    }
-                    const val = Number(e.target.value);
-                    setMaxIterations(Number.isNaN(val) ? 25 : Math.max(1, val));
-                  }}
-                  disabled={isCreating || unlimitedIterations}
-                  placeholder="25"
-                />
-              </div>
-              <label className="mt-4 flex items-center gap-1.5 text-xs text-muted-foreground">
-                <Checkbox
-                  checked={unlimitedIterations}
-                  onCheckedChange={(checked) => setUnlimitedIterations(checked === true)}
-                  disabled={isCreating}
-                  className="h-3.5 w-3.5"
-                />
-                Unlimited
-              </label>
-              <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">Test timeout (s)</Label>
-                <Input
-                  className="h-7 w-20 text-xs"
-                  type="number"
-                  min={1}
-                  value={testTimeoutSeconds}
-                  onChange={(e) => {
-                    if (e.target.value === '') {
-                      return;
-                    }
-                    const val = Number(e.target.value);
-                    setTestTimeoutSeconds(Number.isNaN(val) ? 300 : Math.max(1, val));
-                  }}
-                  disabled={isCreating}
-                />
-              </div>
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs text-muted-foreground">Base branch (optional)</Label>
-              <Input
-                className="h-7 text-xs font-mono"
-                placeholder="defaults to project default branch"
-                value={baseBranch}
-                onChange={(e) => setBaseBranch(e.target.value)}
-                disabled={isCreating}
-              />
-            </div>
-          </div>
-        )}
+        <ModeConfigPanel
+          mode={mode}
+          cadence={cadence}
+          setCadence={setCadence}
+          scheduledTime={scheduledTime}
+          setScheduledTime={setScheduledTime}
+          isCreating={isCreating}
+          testCommand={testCommand}
+          setTestCommand={setTestCommand}
+          targetDescription={targetDescription}
+          setTargetDescription={setTargetDescription}
+          maxIterations={maxIterations}
+          setMaxIterations={setMaxIterations}
+          unlimitedIterations={unlimitedIterations}
+          setUnlimitedIterations={setUnlimitedIterations}
+          testTimeoutSeconds={testTimeoutSeconds}
+          setTestTimeoutSeconds={setTestTimeoutSeconds}
+          baseBranch={baseBranch}
+          setBaseBranch={setBaseBranch}
+        />
         <div className="space-y-2">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <div className="flex items-center gap-1.5">
-              <RatchetToggleButton
-                enabled={ratchetEnabled}
-                state="IDLE"
-                className="h-5 w-5"
-                onToggle={setRatchetEnabled}
-                disabled={isLoadingSettings || isCreating}
-              />
-            </div>
-            <Select
-              value={provider}
-              onValueChange={(v) => setProvider(v as 'CLAUDE' | 'CODEX')}
-              disabled={isLoadingSettings || isCreating}
-            >
-              <SelectTrigger className="h-7 w-24 text-xs">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="CLAUDE">Claude</SelectItem>
-                <SelectItem value="CODEX">Codex</SelectItem>
-              </SelectContent>
-            </Select>
-            <Select
-              value={startupModePreset}
-              onValueChange={(v) => setStartupModePreset(v as 'non_interactive' | 'plan')}
-              disabled={isCreating}
-            >
-              <SelectTrigger className="h-7 w-24 text-xs">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="non_interactive">Default</SelectItem>
-                <SelectItem value="plan">Plan</SelectItem>
-              </SelectContent>
-            </Select>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-7 w-7 shrink-0 px-0"
-              aria-label="Attach files"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={isCreating}
-            >
-              <Paperclip className="h-3.5 w-3.5" />
-            </Button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              accept={ATTACHMENT_ACCEPT_TYPES}
-              onChange={handleFileSelect}
-              className="hidden"
-              aria-label="Attach files"
-            />
+            {supportsWorkspaceOptions ? (
+              <>
+                <div className="flex items-center gap-1.5">
+                  <RatchetToggleButton
+                    enabled={ratchetEnabled}
+                    state="IDLE"
+                    className="h-5 w-5"
+                    onToggle={setRatchetEnabled}
+                    disabled={isLoadingSettings || isCreating}
+                  />
+                </div>
+                <Select
+                  value={provider}
+                  onValueChange={(v) => setProvider(v as 'CLAUDE' | 'CODEX')}
+                  disabled={isLoadingSettings || isCreating}
+                >
+                  <SelectTrigger className="h-7 w-24 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="CLAUDE">Claude</SelectItem>
+                    <SelectItem value="CODEX">Codex</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Select
+                  value={startupModePreset}
+                  onValueChange={(v) => setStartupModePreset(v as 'non_interactive' | 'plan')}
+                  disabled={isCreating}
+                >
+                  <SelectTrigger className="h-7 w-24 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="non_interactive">Default</SelectItem>
+                    <SelectItem value="plan">Plan</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 w-7 shrink-0 px-0"
+                  aria-label="Attach files"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={isCreating}
+                >
+                  <PaperclipIcon className="h-3.5 w-3.5" />
+                </Button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  accept={ATTACHMENT_ACCEPT_TYPES}
+                  onChange={handleFileSelect}
+                  className="hidden"
+                  aria-label="Attach files"
+                />
+              </>
+            ) : null}
           </div>
           <div className="flex justify-end gap-2">
             <Button
@@ -540,30 +807,22 @@ export function InlineWorkspaceForm({
                 size="sm"
                 className={cn(
                   'h-7 text-xs whitespace-nowrap rounded-r-none',
-                  mode === 'AUTO_ITERATION' && 'bg-primary/90'
+                  mode !== 'STANDARD' && 'bg-primary/90'
                 )}
                 onClick={() => handleLaunch(mode)}
-                disabled={
-                  isCreating ||
-                  isLoadingSettings ||
-                  (shouldFetchExistingNames && isLoadingWorkspaceList)
-                }
+                disabled={isLaunchDisabled}
               >
-                {isCreating ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : null}
-                {mode === 'AUTO_ITERATION' ? 'Launch (auto-iterate)' : 'Launch'}
+                {isCreating ? <SpinnerGapIcon className="h-3 w-3 animate-spin mr-1" /> : null}
+                {launchButtonLabels[mode]}
               </Button>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button
                     size="sm"
                     className="h-7 rounded-l-none border-l border-primary-foreground/20 px-1.5"
-                    disabled={
-                      isCreating ||
-                      isLoadingSettings ||
-                      (shouldFetchExistingNames && isLoadingWorkspaceList)
-                    }
+                    disabled={isLaunchDisabled}
                   >
-                    <ChevronDown className="h-3 w-3" />
+                    <CaretDownIcon className="h-3 w-3" />
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="text-xs">
@@ -571,8 +830,12 @@ export function InlineWorkspaceForm({
                     Launch as Standard Workspace
                   </DropdownMenuItem>
                   <DropdownMenuItem className="text-xs" onClick={() => setMode('AUTO_ITERATION')}>
-                    <RefreshCw className="mr-1.5 h-3 w-3" />
+                    <ArrowsClockwiseIcon className="mr-1.5 h-3 w-3" />
                     Launch as Auto-Iteration Workspace
+                  </DropdownMenuItem>
+                  <DropdownMenuItem className="text-xs" onClick={() => setMode('PERIODIC_TASK')}>
+                    <CalendarIcon className="mr-1.5 h-3 w-3" />
+                    Create Periodic Task
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>

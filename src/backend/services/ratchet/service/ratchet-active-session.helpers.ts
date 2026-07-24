@@ -1,42 +1,26 @@
-import type { SessionProvider } from '@prisma-gen/client';
-import type { createLogger } from '@/backend/services/logger.service';
-import { agentSessionAccessor } from '@/backend/services/session';
+import type { RatchetDispatchOutcome, SessionProvider } from '@prisma-gen/client';
+import { createLogger } from '@/backend/services/logger.service';
 import { SessionStatus } from '@/shared/core';
-import type { RatchetPRSnapshotBridge, RatchetSessionBridge } from './bridges';
-import type { RatchetAction, WorkspaceWithPR } from './ratchet.types';
+import type { RatchetSessionBridge, RatchetWorkspaceBridge } from './bridges';
+import type { ActiveFixerCheckResult, WorkspaceWithPR } from './ratchet.types';
 import { ratchetProviderResolverService } from './ratchet-provider-resolver.service';
 
-type Logger = ReturnType<typeof createLogger>;
-
-async function clearFailedRatchetDispatch(params: {
-  workspace: WorkspaceWithPR;
-  snapshotBridge: RatchetPRSnapshotBridge;
-  resetDispatchState: (workspaceId: string) => Promise<void>;
-  reason: string;
-  logger: Logger;
-}): Promise<void> {
-  const { workspace, snapshotBridge, resetDispatchState, reason, logger } = params;
-  logger.info('Clearing failed ratchet dispatch, resetting state for retry', {
-    workspaceId: workspace.id,
-    sessionId: workspace.ratchetActiveSessionId,
-    reason,
-  });
-
-  await resetDispatchState(workspace.id);
-  await snapshotBridge.recordReviewCheck(workspace.id, null);
-}
+const logger = createLogger('ratchet');
 
 async function safeStopSession(params: {
   sessionBridge: RatchetSessionBridge;
   sessionId: string;
   warningMessage: string;
   warningContext: Record<string, unknown>;
-  logger: Logger;
+  signal?: AbortSignal;
 }): Promise<void> {
-  const { sessionBridge, sessionId, warningMessage, warningContext, logger } = params;
+  const { sessionBridge, sessionId, warningMessage, warningContext, signal } = params;
   try {
+    signal?.throwIfAborted();
     await sessionBridge.stopSession(sessionId);
+    signal?.throwIfAborted();
   } catch (error) {
+    signal?.throwIfAborted();
     logger.warn(warningMessage, {
       ...warningContext,
       error: error instanceof Error ? error.message : String(error),
@@ -48,7 +32,7 @@ async function stopCompletedRatchetSession(params: {
   workspaceId: string;
   sessionId: string;
   sessionBridge: RatchetSessionBridge;
-  logger: Logger;
+  signal?: AbortSignal;
 }): Promise<void> {
   await safeStopSession({
     sessionBridge: params.sessionBridge,
@@ -58,7 +42,7 @@ async function stopCompletedRatchetSession(params: {
       workspaceId: params.workspaceId,
       sessionId: params.sessionId,
     },
-    logger: params.logger,
+    signal: params.signal,
   });
 }
 
@@ -68,7 +52,7 @@ async function stopSessionForProviderMismatch(params: {
   expectedProvider: SessionProvider;
   actualProvider: SessionProvider;
   sessionBridge: RatchetSessionBridge;
-  logger: Logger;
+  signal?: AbortSignal;
 }): Promise<void> {
   await safeStopSession({
     sessionBridge: params.sessionBridge,
@@ -80,107 +64,126 @@ async function stopSessionForProviderMismatch(params: {
       expectedProvider: params.expectedProvider,
       actualProvider: params.actualProvider,
     },
-    logger: params.logger,
+    signal: params.signal,
   });
 }
 
-export async function getActiveRatchetSession(params: {
+/**
+ * Verify the recorded fixer session pointer against the actual session, and
+ * settle the dispatch record if the session has ended. Settling is conditional
+ * on the pointer still naming the session (see recordSessionEnd), so if the
+ * session ends normally while this check is in flight, the lifecycle hook wins
+ * and this returns 'ended_concurrently' instead of misreporting a death.
+ */
+export async function checkActiveFixerSession(params: {
   workspace: WorkspaceWithPR;
   sessionBridge: RatchetSessionBridge;
-  snapshotBridge: RatchetPRSnapshotBridge;
-  resetDispatchState: (workspaceId: string) => Promise<void>;
-  clearActiveSession: (workspaceId: string) => Promise<void>;
-  logger: Logger;
-}): Promise<RatchetAction | null> {
-  const {
-    workspace,
-    sessionBridge,
-    snapshotBridge,
-    resetDispatchState,
-    clearActiveSession,
-    logger,
-  } = params;
+  workspaceBridge: Pick<RatchetWorkspaceBridge, 'recordSessionEnd'>;
+  signal?: AbortSignal;
+  onDispatchChanged?: (event: { workspaceId: string }) => void;
+}): Promise<ActiveFixerCheckResult> {
+  const { workspace, sessionBridge, workspaceBridge, signal, onDispatchChanged } = params;
+  signal?.throwIfAborted();
 
-  if (!workspace.ratchetActiveSessionId) {
-    return null;
+  const sessionId = workspace.ratchetActiveSessionId;
+  if (!sessionId) {
+    return { kind: 'none' };
   }
 
+  const settle = async (
+    outcome: Exclude<RatchetDispatchOutcome, 'RUNNING'>,
+    reason: string
+  ): Promise<ActiveFixerCheckResult> => {
+    signal?.throwIfAborted();
+    const settled = await workspaceBridge.recordSessionEnd(workspace.id, sessionId, outcome);
+    if (settled) {
+      onDispatchChanged?.({
+        workspaceId: workspace.id,
+      });
+    }
+    signal?.throwIfAborted();
+    if (!settled) {
+      logger.debug('Ratchet dispatch record was settled concurrently', {
+        workspaceId: workspace.id,
+        sessionId,
+        reason,
+      });
+      return { kind: 'ended_concurrently' };
+    }
+    logger.info('Settled ratchet dispatch record for ended fixer session', {
+      workspaceId: workspace.id,
+      sessionId,
+      outcome,
+      reason,
+    });
+    return { kind: 'settled', outcome };
+  };
+
+  signal?.throwIfAborted();
   const resolvedRatchetProvider = await ratchetProviderResolverService.resolveRatchetProvider({
     workspaceId: workspace.id,
     workspace,
   });
-  const session = await agentSessionAccessor.findById(workspace.ratchetActiveSessionId);
+  signal?.throwIfAborted();
+  const session = await sessionBridge.findSessionById(sessionId);
+  signal?.throwIfAborted();
   if (!session) {
-    await clearFailedRatchetDispatch({
-      workspace,
-      snapshotBridge,
-      resetDispatchState,
-      reason: 'session not found in database',
-      logger,
-    });
-    return null;
+    // Transient ratchet session rows are deleted on normal exit, so a missing
+    // row is ambiguous — the conditional settle disambiguates: if the exit
+    // hook already recorded an outcome, this no-ops ('ended_concurrently').
+    return settle('DIED', 'session not found in database');
   }
 
   if (session.provider !== resolvedRatchetProvider) {
-    await clearFailedRatchetDispatch({
-      workspace,
-      snapshotBridge,
-      resetDispatchState,
-      reason: `provider mismatch: expected ${resolvedRatchetProvider}, got ${session.provider}`,
-      logger,
-    });
+    const result = await settle(
+      'DIED',
+      `provider mismatch: expected ${resolvedRatchetProvider}, got ${session.provider}`
+    );
     await stopSessionForProviderMismatch({
       workspaceId: workspace.id,
       sessionId: session.id,
       expectedProvider: resolvedRatchetProvider,
       actualProvider: session.provider,
       sessionBridge,
-      logger,
+      signal,
     });
-    return null;
+    return result;
   }
 
   if (session.status !== SessionStatus.RUNNING) {
-    await clearFailedRatchetDispatch({
-      workspace,
-      snapshotBridge,
-      resetDispatchState,
-      reason: `session status is ${session.status}`,
-      logger,
-    });
-    return null;
+    return settle(
+      session.status === SessionStatus.FAILED ? 'DIED' : 'COMPLETED',
+      `session status is ${session.status}`
+    );
   }
 
   if (!sessionBridge.isSessionRunning(session.id)) {
-    await clearFailedRatchetDispatch({
-      workspace,
-      snapshotBridge,
-      resetDispatchState,
-      reason: 'session process is not running',
-      logger,
-    });
-    return null;
+    return settle('DIED', 'session process is not running');
   }
 
-  // Ratchet session has completed its current unit of work: close it to avoid lingering idle agents.
+  // Ratchet session has completed its current unit of work: settle first so
+  // the stop's exit hook no-ops, then close it to avoid lingering idle agents.
   if (!sessionBridge.isSessionWorking(session.id)) {
-    await clearActiveSession(workspace.id);
+    const result = await settle('COMPLETED', 'session finished its unit of work');
     await stopCompletedRatchetSession({
       workspaceId: workspace.id,
       sessionId: session.id,
       sessionBridge,
-      logger,
+      signal,
     });
-    return null;
+    return result;
   }
 
-  return { type: 'FIXER_ACTIVE', sessionId: workspace.ratchetActiveSessionId };
+  return { kind: 'active', action: { type: 'FIXER_ACTIVE', sessionId } };
 }
 
 export async function hasActiveSession(
   workspaceId: string,
-  sessionBridge: RatchetSessionBridge
+  sessionBridge: RatchetSessionBridge,
+  signal?: AbortSignal
 ): Promise<boolean> {
-  const sessions = await agentSessionAccessor.findByWorkspaceId(workspaceId);
+  signal?.throwIfAborted();
+  const sessions = await sessionBridge.findSessionsByWorkspaceId(workspaceId);
+  signal?.throwIfAborted();
   return sessions.some((session) => sessionBridge.isSessionWorking(session.id));
 }

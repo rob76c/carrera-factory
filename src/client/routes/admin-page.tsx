@@ -1,22 +1,23 @@
 import {
-  CheckCircle2,
-  Download,
-  ExternalLink,
-  FileJson,
-  FileText,
-  Link2,
-  Pencil,
-  RefreshCw,
-  Terminal,
-} from 'lucide-react';
+  ArrowSquareOutIcon,
+  ArrowsClockwiseIcon,
+  CheckCircleIcon,
+  DownloadIcon,
+  FileCodeIcon,
+  FileTextIcon,
+  LinkIcon,
+  PencilIcon,
+  TerminalIcon,
+} from '@phosphor-icons/react';
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router';
+import { Link as RouterLink } from 'react-router';
 import { toast } from 'sonner';
 import { HeaderLeftExtraSlot, useAppHeader } from '@/client/components/app-header-context';
 import { Loading } from '@/client/components/loading';
 import { ProviderCliWarning } from '@/client/components/provider-cli-warning';
 import { useDownloadServerLog } from '@/client/hooks/use-download-server-log';
 import { downloadFile } from '@/client/lib/download-file';
+import { readSelectedProjectSlug, writeSelectedProjectSlug } from '@/client/lib/project-selection';
 import { trpc } from '@/client/lib/trpc';
 import { DataImportButton } from '@/components/data-import/data-import-button';
 import { FactoryConfigScripts } from '@/components/factory-config-scripts';
@@ -42,6 +43,7 @@ import { DevServerSetupPanel } from '@/components/workspace/dev-server-setup-pan
 import type { PublicIssueTrackerConfig } from '@/shared/schemas/issue-tracker-config.schema';
 import {
   ApiUsageSection,
+  PeriodicTasksSection,
   ProcessesSection,
   ProcessesSectionSkeleton,
   ProjectIssueTrackingCard,
@@ -128,12 +130,12 @@ function ProjectFactoryConfigCard({
             <h3 className="min-w-0 truncate font-semibold text-sm">{projectName}</h3>
             {factoryConfig ? (
               <Badge variant="default" className="bg-green-600 hover:bg-green-700">
-                <CheckCircle2 className="w-3 h-3 mr-1" />
+                <CheckCircleIcon className="w-3 h-3 mr-1" />
                 Configured
               </Badge>
             ) : (
               <Badge variant="secondary" className="bg-muted">
-                <FileJson className="w-3 h-3 mr-1" />
+                <FileCodeIcon className="w-3 h-3 mr-1" />
                 Not configured
               </Badge>
             )}
@@ -143,7 +145,7 @@ function ProjectFactoryConfigCard({
               className="h-7 w-7"
               onClick={() => setEditPanelOpen(true)}
             >
-              <Pencil className="w-3.5 h-3.5" />
+              <PencilIcon className="w-3.5 h-3.5" />
             </Button>
           </div>
           <Button
@@ -153,7 +155,9 @@ function ProjectFactoryConfigCard({
             disabled={refreshConfigs.isPending}
             className="w-full gap-2 sm:w-auto"
           >
-            <RefreshCw className={`w-4 h-4 ${refreshConfigs.isPending ? 'animate-spin' : ''}`} />
+            <ArrowsClockwiseIcon
+              className={`w-4 h-4 ${refreshConfigs.isPending ? 'animate-spin' : ''}`}
+            />
             Refresh Workspaces
           </Button>
         </div>
@@ -177,8 +181,6 @@ function ProjectFactoryConfigCard({
   );
 }
 
-const SELECTED_PROJECT_KEY = 'factoryfactory_selected_project_slug';
-
 function resolveSelectedProjectSlug(
   projects: Array<{ slug: string }> | undefined
 ): string | undefined {
@@ -186,7 +188,7 @@ function resolveSelectedProjectSlug(
     return undefined;
   }
 
-  const storedSlug = localStorage.getItem(SELECTED_PROJECT_KEY);
+  const storedSlug = readSelectedProjectSlug();
   if (storedSlug && projects.some((project) => project.slug === storedSlug)) {
     return storedSlug;
   }
@@ -206,10 +208,15 @@ function ProjectSettingsSection({
   }>;
 }) {
   const [selectedSlug, setSelectedSlug] = useState<string>(
-    () => localStorage.getItem(SELECTED_PROJECT_KEY) || projects[0]?.slug || ''
+    () => readSelectedProjectSlug() || projects[0]?.slug || ''
   );
 
   const selectedProject = projects.find((p) => p.slug === selectedSlug) ?? projects[0];
+
+  const handleProjectChange = (slug: string) => {
+    setSelectedSlug(slug);
+    writeSelectedProjectSlug(slug);
+  };
 
   if (!selectedProject) {
     return <p className="text-sm text-muted-foreground">No projects found.</p>;
@@ -218,7 +225,7 @@ function ProjectSettingsSection({
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-3">
-        <Select value={selectedProject.slug} onValueChange={setSelectedSlug}>
+        <Select value={selectedProject.slug} onValueChange={handleProjectChange}>
           <SelectTrigger className="w-auto max-w-xs">
             <SelectValue placeholder="Select a project" />
           </SelectTrigger>
@@ -235,7 +242,7 @@ function ProjectSettingsSection({
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <FileJson className="w-5 h-5" />
+            <FileCodeIcon className="w-5 h-5" />
             Factory Configuration
           </CardTitle>
           <CardDescription>
@@ -264,7 +271,7 @@ function ProjectSettingsSection({
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Link2 className="w-5 h-5" />
+            <LinkIcon className="w-5 h-5" />
             Issue Tracking
           </CardTitle>
           <CardDescription>Configure the issue provider (GitHub Issues or Linear)</CardDescription>
@@ -382,12 +389,11 @@ function IdeSettingsSection() {
   };
 
   const handleTestCommand = () => {
-    const command = settings?.customIdeCommand;
-    if (!command) {
+    if (!localCustomCommand) {
       toast.error('Please enter a custom command first');
       return;
     }
-    testCommand.mutate({ customCommand: command });
+    testCommand.mutate({ customCommand: localCustomCommand });
   };
 
   if (isLoading) {
@@ -445,7 +451,7 @@ function IdeSettingsSection() {
               <Button
                 variant="outline"
                 onClick={handleTestCommand}
-                disabled={testCommand.isPending || !settings?.customIdeCommand}
+                disabled={testCommand.isPending || !localCustomCommand}
               >
                 {testCommand.isPending ? 'Testing...' : 'Test'}
               </Button>
@@ -464,6 +470,9 @@ function IdeSettingsSection() {
 
 function ChatProviderDefaultsSection() {
   const { data: settings, isLoading } = trpc.userSettings.get.useQuery();
+  const { data: providerOptions } = trpc.userSettings.getProviderOptions.useQuery(undefined, {
+    staleTime: 30_000,
+  });
   const utils = trpc.useUtils();
   const [localClaudeModel, setLocalClaudeModel] = useState('sonnet');
   const [localCodexModel, setLocalCodexModel] = useState('default');
@@ -499,7 +508,24 @@ function ChatProviderDefaultsSection() {
   const currentProvider = settings?.defaultSessionProvider ?? 'CLAUDE';
   const currentClaudeModel = settings?.defaultClaudeModel ?? 'sonnet';
   const currentCodexModel = settings?.defaultCodexModel ?? 'default';
+  const currentClaudeReasoningEffort = settings?.defaultClaudeReasoningEffort ?? null;
+  const currentCodexReasoningEffort = settings?.defaultCodexReasoningEffort ?? null;
   const currentWorkspacePermissions = settings?.defaultWorkspacePermissions ?? 'STRICT';
+  const providerDefaultValue = '__provider_default__';
+  const getModelOptions = (provider: 'CLAUDE' | 'CODEX', currentValue: string) => {
+    const options = providerOptions?.[provider]?.models ?? [];
+    if (options.some((option) => option.value === currentValue)) {
+      return options;
+    }
+    return [{ value: currentValue, label: currentValue }, ...options];
+  };
+  const getEffortOptions = (provider: 'CLAUDE' | 'CODEX', currentValue: string | null) => {
+    const options = providerOptions?.[provider]?.efforts ?? [];
+    if (!currentValue || options.some((option) => option.value === currentValue)) {
+      return options;
+    }
+    return [{ value: currentValue, label: currentValue }, ...options];
+  };
   const modelSettingsByProvider = {
     CLAUDE: {
       fallbackValue: 'sonnet',
@@ -507,6 +533,7 @@ function ChatProviderDefaultsSection() {
       localValue: localClaudeModel,
       setLocalValue: setLocalClaudeModel,
       buildPayload: (model: string) => ({ defaultClaudeModel: model }),
+      buildEffortPayload: (effort: string | null) => ({ defaultClaudeReasoningEffort: effort }),
     },
     CODEX: {
       fallbackValue: 'default',
@@ -514,6 +541,7 @@ function ChatProviderDefaultsSection() {
       localValue: localCodexModel,
       setLocalValue: setLocalCodexModel,
       buildPayload: (model: string) => ({ defaultCodexModel: model }),
+      buildEffortPayload: (effort: string | null) => ({ defaultCodexReasoningEffort: effort }),
     },
   } as const;
 
@@ -529,6 +557,11 @@ function ChatProviderDefaultsSection() {
     }
 
     updateSettings.mutate(providerSettings.buildPayload(normalizedValue));
+  };
+
+  const saveDefaultEffort = (provider: 'CLAUDE' | 'CODEX', value: string) => {
+    const effort = value === providerDefaultValue ? null : value;
+    updateSettings.mutate(modelSettingsByProvider[provider].buildEffortPayload(effort));
   };
 
   return (
@@ -562,20 +595,25 @@ function ChatProviderDefaultsSection() {
         <div className="grid gap-3 pt-1 sm:grid-cols-2">
           <div className="space-y-2">
             <Label htmlFor="default-claude-model">Default Claude model</Label>
-            <Input
-              id="default-claude-model"
+            <Select
               value={localClaudeModel}
-              onChange={(event) => setLocalClaudeModel(event.target.value)}
-              onBlur={() => saveDefaultModel('CLAUDE', localClaudeModel)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  event.preventDefault();
-                  saveDefaultModel('CLAUDE', localClaudeModel);
-                }
+              onValueChange={(value) => {
+                setLocalClaudeModel(value);
+                saveDefaultModel('CLAUDE', value);
               }}
-              placeholder="sonnet"
               disabled={updateSettings.isPending}
-            />
+            >
+              <SelectTrigger id="default-claude-model">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {getModelOptions('CLAUDE', currentClaudeModel).map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <p className="text-xs text-muted-foreground">
               Claude aliases like <code className="rounded bg-muted px-1">sonnet</code> and{' '}
               <code className="rounded bg-muted px-1">opus</code> are supported.
@@ -583,24 +621,70 @@ function ChatProviderDefaultsSection() {
           </div>
           <div className="space-y-2">
             <Label htmlFor="default-codex-model">Default Codex model</Label>
-            <Input
-              id="default-codex-model"
+            <Select
               value={localCodexModel}
-              onChange={(event) => setLocalCodexModel(event.target.value)}
-              onBlur={() => saveDefaultModel('CODEX', localCodexModel)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  event.preventDefault();
-                  saveDefaultModel('CODEX', localCodexModel);
-                }
+              onValueChange={(value) => {
+                setLocalCodexModel(value);
+                saveDefaultModel('CODEX', value);
               }}
-              placeholder="default"
               disabled={updateSettings.isPending}
-            />
+            >
+              <SelectTrigger id="default-codex-model">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {getModelOptions('CODEX', currentCodexModel).map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <p className="text-xs text-muted-foreground">
-              Use any Codex model id, for example{' '}
-              <code className="rounded bg-muted px-1">gpt-5-codex</code>.
+              Codex options are loaded from the CLI when available.
             </p>
+          </div>
+        </div>
+        <div className="grid gap-3 pt-1 sm:grid-cols-2">
+          <div className="space-y-2">
+            <Label htmlFor="default-claude-effort">Default Claude effort</Label>
+            <Select
+              value={currentClaudeReasoningEffort ?? providerDefaultValue}
+              onValueChange={(value) => saveDefaultEffort('CLAUDE', value)}
+              disabled={updateSettings.isPending}
+            >
+              <SelectTrigger id="default-claude-effort">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={providerDefaultValue}>Provider default</SelectItem>
+                {getEffortOptions('CLAUDE', currentClaudeReasoningEffort).map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="default-codex-effort">Default Codex effort</Label>
+            <Select
+              value={currentCodexReasoningEffort ?? providerDefaultValue}
+              onValueChange={(value) => saveDefaultEffort('CODEX', value)}
+              disabled={updateSettings.isPending}
+            >
+              <SelectTrigger id="default-codex-effort">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={providerDefaultValue}>Provider default</SelectItem>
+                {getEffortOptions('CODEX', currentCodexReasoningEffort).map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
         </div>
         <div className="space-y-2 pt-1">
@@ -645,7 +729,7 @@ function CliAuthSection() {
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
-          <Terminal className="w-5 h-5" />
+          <TerminalIcon className="w-5 h-5" />
           CLI Authentication
         </CardTitle>
         <CardDescription>
@@ -699,7 +783,7 @@ function AppInfoSection() {
             className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
           >
             GitHub
-            <ExternalLink className="h-3.5 w-3.5" />
+            <ArrowSquareOutIcon className="h-3.5 w-3.5" />
           </a>
         </div>
         <div className="space-y-2">
@@ -764,6 +848,7 @@ function RatchetSettingsSection() {
   }
 
   const currentRatchetPermissions = settings?.ratchetPermissions ?? 'YOLO';
+  const currentReviewTriggerMode = settings?.ratchetReviewTriggerMode ?? 'CHANGES_REQUESTED';
 
   return (
     <Card>
@@ -803,6 +888,33 @@ function RatchetSettingsSection() {
             }}
             disabled={updateSettings.isPending}
           />
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="ratchet-review-trigger">Review feedback trigger</Label>
+          <Select
+            value={currentReviewTriggerMode}
+            onValueChange={(value) => {
+              if (value === 'CHANGES_REQUESTED' || value === 'ALL_REVIEW_FEEDBACK') {
+                updateSettings.mutate({ ratchetReviewTriggerMode: value });
+              }
+            }}
+            disabled={updateSettings.isPending}
+          >
+            <SelectTrigger id="ratchet-review-trigger">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="CHANGES_REQUESTED">
+                Changes requested and unresolved threads
+              </SelectItem>
+              <SelectItem value="ALL_REVIEW_FEEDBACK">All review feedback</SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-xs text-muted-foreground">
+            All review feedback also lets top-level commented review summaries start sessions.
+            Ordinary PR conversation comments never trigger Ratchet.
+          </p>
         </div>
 
         <div className="space-y-2">
@@ -864,12 +976,12 @@ function RatchetSettingsSection() {
             >
               {triggerRatchetCheck.isPending ? (
                 <>
-                  <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+                  <ArrowsClockwiseIcon className="w-4 h-4 mr-2 animate-spin" />
                   Checking...
                 </>
               ) : (
                 <>
-                  <RefreshCw className="w-4 h-4 mr-2" />
+                  <ArrowsClockwiseIcon className="w-4 h-4 mr-2" />
                   Check All PRs Now
                 </>
               )}
@@ -911,7 +1023,7 @@ function DataBackupSection() {
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
-          <FileJson className="w-5 h-5" />
+          <FileCodeIcon className="w-5 h-5" />
           Data Backup
         </CardTitle>
         <CardDescription>
@@ -926,7 +1038,7 @@ function DataBackupSection() {
             variant="outline"
             className="w-full sm:w-auto"
           >
-            <Download className="w-4 h-4 mr-2" />
+            <DownloadIcon className="w-4 h-4 mr-2" />
             {isExporting ? 'Exporting...' : 'Export Data'}
           </Button>
           <DataImportButton variant="outline" className="w-full sm:w-auto" />
@@ -947,24 +1059,24 @@ function ServerLogsSection() {
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
-          <FileText className="w-5 h-5" />
+          <FileTextIcon className="w-5 h-5" />
           Server Logs
         </CardTitle>
         <CardDescription>View and search structured server log entries</CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-2 sm:flex-row sm:gap-3">
-        <Link to="/logs">
+        <RouterLink to="/logs">
           <Button variant="outline" className="w-full sm:w-auto">
             View Logs
           </Button>
-        </Link>
+        </RouterLink>
         <Button
           variant="outline"
           onClick={download}
           disabled={isDownloading}
           className="w-full sm:w-auto"
         >
-          <Download className="w-4 h-4 mr-2" />
+          <DownloadIcon className="w-4 h-4 mr-2" />
           {isDownloading ? 'Downloading...' : 'Download Log File'}
         </Button>
       </CardContent>
@@ -974,7 +1086,9 @@ function ServerLogsSection() {
 
 export default function AdminDashboardPage() {
   useAppHeader({ title: 'Settings' });
-  const [settingsTab, setSettingsTab] = useState<'general' | 'project'>('general');
+  const [settingsTab, setSettingsTab] = useState<'general' | 'project' | 'periodic-tasks'>(
+    'general'
+  );
 
   const {
     data: stats,
@@ -1017,7 +1131,9 @@ export default function AdminDashboardPage() {
       <div className="space-y-6 p-3 md:p-6">
         <Tabs
           value={settingsTab}
-          onValueChange={(value) => setSettingsTab(value as 'general' | 'project')}
+          onValueChange={(value) =>
+            setSettingsTab(value as 'general' | 'project' | 'periodic-tasks')
+          }
         >
           <TabsList className="w-full sm:w-auto">
             <TabsTrigger value="general" className="flex-1 sm:flex-initial">
@@ -1025,6 +1141,9 @@ export default function AdminDashboardPage() {
             </TabsTrigger>
             <TabsTrigger value="project" className="flex-1 sm:flex-initial">
               Project Settings
+            </TabsTrigger>
+            <TabsTrigger value="periodic-tasks" className="flex-1 sm:flex-initial">
+              Periodic Tasks
             </TabsTrigger>
           </TabsList>
 
@@ -1064,6 +1183,14 @@ export default function AdminDashboardPage() {
           <TabsContent value="project" className="mt-4">
             {projects ? (
               <ProjectSettingsSection projects={projects} />
+            ) : (
+              <p className="text-sm text-muted-foreground">Loading projects...</p>
+            )}
+          </TabsContent>
+
+          <TabsContent value="periodic-tasks" className="mt-4">
+            {projects ? (
+              <PeriodicTasksSection projects={projects} />
             ) : (
               <p className="text-sm text-muted-foreground">Loading projects...</p>
             )}

@@ -17,6 +17,28 @@ export const SessionStatus = {
 } as const;
 export type SessionStatus = (typeof SessionStatus)[keyof typeof SessionStatus];
 
+export const SessionProvider = {
+  CLAUDE: 'CLAUDE',
+  CODEX: 'CODEX',
+} as const;
+export type SessionProvider = (typeof SessionProvider)[keyof typeof SessionProvider];
+
+export const SessionPermissionPreset = {
+  STRICT: 'STRICT',
+  RELAXED: 'RELAXED',
+  YOLO: 'YOLO',
+} as const;
+export type SessionPermissionPreset =
+  (typeof SessionPermissionPreset)[keyof typeof SessionPermissionPreset];
+
+export const WorkspaceProviderSelection = {
+  WORKSPACE_DEFAULT: 'WORKSPACE_DEFAULT',
+  CLAUDE: 'CLAUDE',
+  CODEX: 'CODEX',
+} as const;
+export type WorkspaceProviderSelection =
+  (typeof WorkspaceProviderSelection)[keyof typeof WorkspaceProviderSelection];
+
 export const PRState = {
   NONE: 'NONE',
   DRAFT: 'DRAFT',
@@ -54,11 +76,20 @@ export const RatchetState = {
 } as const;
 export type RatchetState = (typeof RatchetState)[keyof typeof RatchetState];
 
+export const RatchetReviewTriggerMode = {
+  CHANGES_REQUESTED: 'CHANGES_REQUESTED',
+  ALL_REVIEW_FEEDBACK: 'ALL_REVIEW_FEEDBACK',
+} as const;
+export type RatchetReviewTriggerMode =
+  (typeof RatchetReviewTriggerMode)[keyof typeof RatchetReviewTriggerMode];
+
 export const WorkspaceCreationSource = {
   MANUAL: 'MANUAL',
   RESUME_BRANCH: 'RESUME_BRANCH',
   GITHUB_ISSUE: 'GITHUB_ISSUE',
   LINEAR_ISSUE: 'LINEAR_ISSUE',
+  PERIODIC_TASK: 'PERIODIC_TASK',
+  CHILD_WORKSPACE: 'CHILD_WORKSPACE',
 } as const;
 export type WorkspaceCreationSource =
   (typeof WorkspaceCreationSource)[keyof typeof WorkspaceCreationSource];
@@ -84,6 +115,24 @@ export const WorkspaceMode = {
   AUTO_ITERATION: 'AUTO_ITERATION',
 } as const;
 export type WorkspaceMode = (typeof WorkspaceMode)[keyof typeof WorkspaceMode];
+
+export const PeriodicTaskCadence = {
+  EVERY_MINUTE: 'EVERY_MINUTE',
+  EVERY_FIVE_MINUTES: 'EVERY_FIVE_MINUTES',
+  DAILY: 'DAILY',
+  WEEKLY: 'WEEKLY',
+  MONTHLY: 'MONTHLY',
+} as const;
+export type PeriodicTaskCadence = (typeof PeriodicTaskCadence)[keyof typeof PeriodicTaskCadence];
+
+export const PeriodicTaskExecutionStatus = {
+  RUNNING: 'RUNNING',
+  PR_CREATED: 'PR_CREATED',
+  FAILED: 'FAILED',
+  SKIPPED: 'SKIPPED',
+} as const;
+export type PeriodicTaskExecutionStatus =
+  (typeof PeriodicTaskExecutionStatus)[keyof typeof PeriodicTaskExecutionStatus];
 
 export const AutoIterationStatus = {
   IDLE: 'IDLE',

@@ -16,10 +16,12 @@ const mocks = vi.hoisted(() => ({
   toastErrorMock: vi.fn(),
 }));
 
-vi.mock('lucide-react', () => ({
-  CircleDot: () => null,
-  Play: () => null,
-  User: () => null,
+vi.mock('@phosphor-icons/react', () => ({
+  ArrowSquareOutIcon: () => null,
+  DotOutlineIcon: () => null,
+  PlayIcon: () => null,
+  UserIcon: () => null,
+  XIcon: () => null,
 }));
 
 vi.mock('@/client/lib/workspace-cache-helpers', () => ({
@@ -49,6 +51,17 @@ vi.mock('@/client/lib/trpc', () => ({
       get: {
         useQuery: () => ({
           data: { ratchetEnabled: false },
+          isLoading: false,
+        }),
+      },
+    },
+    project: {
+      getById: {
+        useQuery: () => ({
+          data: {
+            githubOwner: 'acme',
+            githubRepo: 'repo',
+          },
           isLoading: false,
         }),
       },
@@ -122,12 +135,27 @@ function renderCard(): { container: HTMLDivElement; root: Root } {
   return { container, root };
 }
 
+function openLaunchSheet(container: HTMLDivElement) {
+  const startButton = Array.from(container.querySelectorAll('button')).find((button) =>
+    button.textContent?.includes('Start')
+  );
+
+  if (!startButton) {
+    throw new Error('Start button not found');
+  }
+
+  flushSync(() => {
+    startButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  });
+}
+
 beforeEach(() => {
   Object.defineProperty(globalThis, 'IS_REACT_ACT_ENVIRONMENT', {
     configurable: true,
     writable: true,
     value: true,
   });
+  mocks.createWorkspaceMutationOptions = undefined;
 });
 
 afterEach(() => {
@@ -136,8 +164,23 @@ afterEach(() => {
 });
 
 describe('IssueCard', () => {
+  it('mounts the issue launch sheet only after starting an issue', () => {
+    const { container, root } = renderCard();
+
+    expect(mocks.createWorkspaceMutationOptions).toBeUndefined();
+
+    openLaunchSheet(container);
+
+    expect(mocks.createWorkspaceMutationOptions).toBeDefined();
+
+    root.unmount();
+    container.remove();
+  });
+
   it('invalidates sidebar project summary after creating a workspace from an issue', () => {
     const { container, root } = renderCard();
+
+    openLaunchSheet(container);
 
     const mutationOptions = mocks.createWorkspaceMutationOptions as {
       onSuccess: (workspace: { id: string }) => void;
@@ -160,6 +203,8 @@ describe('IssueCard', () => {
 
   it('shows a toast when creating a workspace from an issue fails', () => {
     const { container, root } = renderCard();
+
+    openLaunchSheet(container);
 
     const mutationOptions = mocks.createWorkspaceMutationOptions as {
       onError: (error: Error) => void;

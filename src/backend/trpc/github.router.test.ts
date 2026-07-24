@@ -6,9 +6,11 @@ const mockGithubCLIService = vi.hoisted(() => ({
   listIssues: vi.fn(),
   getIssue: vi.fn(),
 }));
+const mockClassifyGitHubCLIError = vi.hoisted(() => vi.fn());
 
 const mockWorkspaceDataService = vi.hoisted(() => ({
   findByIdWithProject: vi.fn(),
+  findByProjectId: vi.fn(),
 }));
 
 const mockProjectManagementService = vi.hoisted(() => ({
@@ -16,23 +18,28 @@ const mockProjectManagementService = vi.hoisted(() => ({
 }));
 
 vi.mock('@/backend/services/github', () => ({
-  githubCLIService: mockGithubCLIService,
-}));
-
-vi.mock('@/backend/services/workspace', () => ({
-  workspaceDataService: mockWorkspaceDataService,
-  projectManagementService: mockProjectManagementService,
+  classifyGitHubCLIError: mockClassifyGitHubCLIError,
 }));
 
 import { githubRouter } from './github.trpc';
 
 function createCaller() {
-  return githubRouter.createCaller({ appContext: { services: {} } } as never);
+  return githubRouter.createCaller({
+    appContext: {
+      services: {
+        githubCLIService: mockGithubCLIService,
+        projectManagementService: mockProjectManagementService,
+        workspaceDataService: mockWorkspaceDataService,
+      },
+    },
+  } as never);
 }
 
 describe('githubRouter', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockClassifyGitHubCLIError.mockReturnValue('unknown');
+    mockWorkspaceDataService.findByProjectId.mockResolvedValue([]);
   });
 
   it('checks health and project/repo availability', async () => {
@@ -102,6 +109,70 @@ describe('githubRouter', () => {
     await expect(caller.getIssue({ projectId: 'p1', issueNumber: 99 })).resolves.toEqual({
       issue: null,
       error: 'boom',
+    });
+  });
+
+  it('filters project issues that already have active workspaces', async () => {
+    const caller = createCaller();
+    mockGithubCLIService.checkHealth.mockResolvedValue({
+      isInstalled: true,
+      isAuthenticated: true,
+    });
+    mockProjectManagementService.findById.mockResolvedValue({
+      id: 'p1',
+      githubOwner: 'purplefish-ai',
+      githubRepo: 'factory-factory',
+    });
+    mockGithubCLIService.listIssues.mockResolvedValue([
+      { number: 55, title: 'Has workspace' },
+      { number: 56, title: 'No workspace' },
+      { number: 57, title: 'Archived workspace' },
+      { number: 58, title: 'Archiving workspace' },
+    ]);
+    mockWorkspaceDataService.findByProjectId.mockResolvedValue([
+      { githubIssueNumber: 55, status: 'READY' },
+      { githubIssueNumber: 57, status: 'ARCHIVED' },
+      { githubIssueNumber: 58, status: 'ARCHIVING' },
+    ]);
+
+    await expect(caller.listIssuesForProject({ projectId: 'p1' })).resolves.toEqual({
+      issues: [
+        { number: 56, title: 'No workspace' },
+        { number: 57, title: 'Archived workspace' },
+        { number: 58, title: 'Archiving workspace' },
+      ],
+      health: { isInstalled: true, isAuthenticated: true },
+      error: null,
+    });
+  });
+
+  it('returns unauthenticated health when issue listing hits bad gh credentials', async () => {
+    const caller = createCaller();
+    mockGithubCLIService.checkHealth.mockResolvedValue({
+      isInstalled: true,
+      isAuthenticated: true,
+      version: '2.20.0',
+    });
+    mockProjectManagementService.findById.mockResolvedValue({
+      id: 'p1',
+      githubOwner: 'purplefish-ai',
+      githubRepo: 'factory-factory',
+    });
+    mockGithubCLIService.listIssues.mockRejectedValueOnce(new Error('HTTP 401: Bad credentials'));
+    mockClassifyGitHubCLIError.mockReturnValueOnce('auth_required');
+
+    await expect(caller.listIssuesForProject({ projectId: 'p1' })).resolves.toEqual({
+      issues: [],
+      health: {
+        isInstalled: true,
+        isAuthenticated: false,
+        version: '2.20.0',
+        error:
+          'GitHub CLI authentication failed. Run `gh auth refresh -h github.com` or `gh auth login` to authenticate.',
+        errorType: 'auth_required',
+      },
+      error:
+        'GitHub CLI authentication failed. Run `gh auth refresh -h github.com` or `gh auth login` to authenticate.',
     });
   });
 });

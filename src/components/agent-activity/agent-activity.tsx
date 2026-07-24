@@ -1,4 +1,4 @@
-import { Copy, RotateCcw, X } from 'lucide-react';
+import { ArrowCounterClockwiseIcon, CopyIcon, XIcon } from '@phosphor-icons/react';
 import { memo } from 'react';
 import { AttachmentPreview } from '@/components/chat/attachment-preview';
 import type { ChatMessage, GroupedMessageItem } from '@/lib/chat-protocol';
@@ -6,6 +6,8 @@ import { extractTextFromMessage, isThinkingContent, isToolSequence } from '@/lib
 import { cn } from '@/lib/utils';
 import { CopyMessageButton } from './copy-message-button';
 import { AssistantMessageRenderer, MessageWrapper } from './message-renderers';
+import { ChildWorkspaceUpdateRenderer } from './message-renderers/child-workspace-update-renderer';
+import { ParentWorkspaceUpdateRenderer } from './message-renderers/parent-workspace-update-renderer';
 import { ToolSequenceGroup } from './tool-renderers';
 import {
   createToolCallExpansionKey,
@@ -61,6 +63,8 @@ export interface MessageItemProps {
   userMessageUuid?: string;
   /** Callback to initiate rewind to before this message */
   onRewindToMessage?: (uuid: string) => void;
+  resolveWorkspaceFileLink?: (href: string) => string | null;
+  onWorkspaceFileLink?: (path: string) => void;
 }
 
 export const MessageItem = memo(function MessageItem({
@@ -69,6 +73,8 @@ export const MessageItem = memo(function MessageItem({
   onRemove,
   userMessageUuid,
   onRewindToMessage,
+  resolveWorkspaceFileLink,
+  onWorkspaceFileLink,
 }: MessageItemProps) {
   // User messages
   if (message.source === 'user') {
@@ -108,7 +114,7 @@ export const MessageItem = memo(function MessageItem({
                 type="button"
                 aria-label="Copy message to clipboard"
               >
-                <Copy className="h-3.5 w-3.5 text-muted-foreground hover:text-foreground" />
+                <CopyIcon className="h-3.5 w-3.5 text-muted-foreground hover:text-foreground" />
               </button>
             )}
             {/* Rewind button for messages with tracked UUIDs */}
@@ -127,7 +133,7 @@ export const MessageItem = memo(function MessageItem({
                 type="button"
                 aria-label="Rewind files to before this message"
               >
-                <RotateCcw className="h-3.5 w-3.5 text-muted-foreground hover:text-amber-600 dark:hover:text-amber-400" />
+                <ArrowCounterClockwiseIcon className="h-3.5 w-3.5 text-muted-foreground hover:text-amber-600 dark:hover:text-amber-400" />
               </button>
             )}
             {/* Cancel button for queued messages */}
@@ -145,7 +151,7 @@ export const MessageItem = memo(function MessageItem({
                 type="button"
                 aria-label="Cancel queued message"
               >
-                <X className="h-3.5 w-3.5 text-muted-foreground hover:text-destructive" />
+                <XIcon className="h-3.5 w-3.5 text-muted-foreground hover:text-destructive" />
               </button>
             )}
           </div>
@@ -169,6 +175,24 @@ export const MessageItem = memo(function MessageItem({
     );
   }
 
+  // Child workspace update notifications
+  if (message.message?.type === 'child_workspace_update') {
+    return (
+      <MessageWrapper>
+        <ChildWorkspaceUpdateRenderer message={message.message} />
+      </MessageWrapper>
+    );
+  }
+
+  // Parent workspace update notifications
+  if (message.message?.type === 'parent_workspace_update') {
+    return (
+      <MessageWrapper>
+        <ParentWorkspaceUpdateRenderer message={message.message} />
+      </MessageWrapper>
+    );
+  }
+
   // Claude messages
   if (message.message) {
     const assistantText = getAssistantCopyText(message.message);
@@ -176,11 +200,21 @@ export const MessageItem = memo(function MessageItem({
       <MessageWrapper>
         {assistantText !== null ? (
           <div className="group relative">
-            <AssistantMessageRenderer message={message.message} messageId={message.id} />
+            <AssistantMessageRenderer
+              message={message.message}
+              messageId={message.id}
+              resolveWorkspaceFileLink={resolveWorkspaceFileLink}
+              onWorkspaceFileLink={onWorkspaceFileLink}
+            />
             <CopyMessageButton textContent={assistantText} />
           </div>
         ) : (
-          <AssistantMessageRenderer message={message.message} messageId={message.id} />
+          <AssistantMessageRenderer
+            message={message.message}
+            messageId={message.id}
+            resolveWorkspaceFileLink={resolveWorkspaceFileLink}
+            onWorkspaceFileLink={onWorkspaceFileLink}
+          />
         )}
       </MessageWrapper>
     );
@@ -203,6 +237,8 @@ export interface GroupedMessageItemRendererProps {
   userMessageUuid?: string;
   /** Callback to initiate rewind to before this message */
   onRewindToMessage?: (uuid: string) => void;
+  resolveWorkspaceFileLink?: (href: string) => string | null;
+  onWorkspaceFileLink?: (path: string) => void;
   /** Reads persisted expansion state by key */
   getToolExpansionState?: (key: string, defaultOpen: boolean) => boolean;
   /** Persists expansion state by key */
@@ -220,6 +256,8 @@ export const GroupedMessageItemRenderer = memo(function GroupedMessageItemRender
   onRemove,
   userMessageUuid,
   onRewindToMessage,
+  resolveWorkspaceFileLink,
+  onWorkspaceFileLink,
   getToolExpansionState,
   setToolExpansionState,
   toolExpansionToken: _toolExpansionToken,
@@ -260,6 +298,8 @@ export const GroupedMessageItemRenderer = memo(function GroupedMessageItemRender
       onRemove={onRemove}
       userMessageUuid={userMessageUuid}
       onRewindToMessage={onRewindToMessage}
+      resolveWorkspaceFileLink={resolveWorkspaceFileLink}
+      onWorkspaceFileLink={onWorkspaceFileLink}
     />
   );
 });

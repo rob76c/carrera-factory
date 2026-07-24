@@ -1,10 +1,11 @@
 import type { UserSettings, Workspace } from '@prisma-gen/client';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import * as gitOpsServiceModule from '@/backend/services/git-ops.service';
+import { ApplicationError } from '@/backend/lib/application-error';
 import type { createLogger } from '@/backend/services/logger.service';
-import * as userSettingsAccessorModule from '@/backend/services/settings';
+import * as userSettingsServiceModule from '@/backend/services/settings';
 import * as projectAccessorModule from '@/backend/services/workspace/resources/project.accessor';
 import * as workspaceAccessorModule from '@/backend/services/workspace/resources/workspace.accessor';
+import * as gitOpsServiceModule from '@/backend/services/workspace/service/worktree/git-ops.service';
 import * as worktreeLifecycleServiceModule from '@/backend/services/workspace/service/worktree/worktree-lifecycle.service';
 import { unsafeCoerce } from '@/test-utils/unsafe-coerce';
 import { WorkspaceCreationService, type WorkspaceCreationSource } from './creation.service';
@@ -15,7 +16,7 @@ type Logger = ReturnType<typeof createLogger>;
 vi.mock('@/backend/services/workspace/resources/project.accessor');
 vi.mock('@/backend/services/workspace/resources/workspace.accessor');
 vi.mock('@/backend/services/settings');
-vi.mock('@/backend/services/git-ops.service');
+vi.mock('@/backend/services/workspace/service/worktree/git-ops.service');
 vi.mock('@/backend/services/workspace/service/worktree/worktree-lifecycle.service');
 
 describe('WorkspaceCreationService', () => {
@@ -34,6 +35,9 @@ describe('WorkspaceCreationService', () => {
     creationSource: 'MANUAL',
     creationMetadata: null,
     prUrl: null,
+    prDiscoveryLastCheckedAt: null,
+    prDiscoveryRetryCount: 0,
+    prDiscoveryNextCheckAt: null,
     githubIssueNumber: null,
     githubIssueUrl: null,
     linearIssueId: null,
@@ -55,6 +59,8 @@ describe('WorkspaceCreationService', () => {
     ratchetLastCheckedAt: null,
     ratchetActiveSessionId: null,
     ratchetLastCiRunId: null,
+    ratchetDispatchOutcome: null,
+    ratchetDispatchRetryCount: 0,
     hasHadSessions: false,
     cachedKanbanColumn: 'WAITING',
     stateComputedAt: null,
@@ -62,6 +68,7 @@ describe('WorkspaceCreationService', () => {
     initOutput: null,
     initStartedAt: null,
     initCompletedAt: null,
+    initScriptPid: null,
     initRetryCount: 0,
     runScriptCommand: null,
     runScriptPostRunCommand: null,
@@ -75,6 +82,8 @@ describe('WorkspaceCreationService', () => {
     autoIterationConfig: null,
     autoIterationProgress: null,
     autoIterationSessionId: null,
+    periodicTaskId: null,
+    parentWorkspaceId: null,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
@@ -125,15 +134,18 @@ describe('WorkspaceCreationService', () => {
       cachedSlashCommands: null,
       ratchetEnabled: true,
       ratchetReplyToPrComments: true,
+      ratchetReviewTriggerMode: 'CHANGES_REQUESTED',
       defaultSessionProvider: 'CLAUDE',
       defaultClaudeModel: 'sonnet',
       defaultCodexModel: 'default',
+      defaultClaudeReasoningEffort: null,
+      defaultCodexReasoningEffort: null,
       defaultWorkspacePermissions: 'STRICT',
       ratchetPermissions: 'YOLO',
       createdAt: new Date(),
       updatedAt: new Date(),
     };
-    vi.spyOn(userSettingsAccessorModule.userSettingsAccessor, 'get').mockResolvedValue(
+    vi.spyOn(userSettingsServiceModule.userSettingsService, 'get').mockResolvedValue(
       mockUserSettings
     );
     vi.spyOn(workspaceAccessorModule.workspaceAccessor, 'create').mockResolvedValue(mockWorkspace);
@@ -184,7 +196,7 @@ describe('WorkspaceCreationService', () => {
           })
         );
         // resolveWorkspaceCreationDefaults always reads user settings for ratchet defaults.
-        expect(userSettingsAccessorModule.userSettingsAccessor.get).toHaveBeenCalled();
+        expect(userSettingsServiceModule.userSettingsService.get).toHaveBeenCalled();
       });
 
       it('should default to user settings ratchetEnabled when not provided', async () => {
@@ -199,15 +211,18 @@ describe('WorkspaceCreationService', () => {
           cachedSlashCommands: null,
           ratchetEnabled: false,
           ratchetReplyToPrComments: true,
+          ratchetReviewTriggerMode: 'CHANGES_REQUESTED',
           defaultSessionProvider: 'CLAUDE',
           defaultClaudeModel: 'sonnet',
           defaultCodexModel: 'default',
+          defaultClaudeReasoningEffort: null,
+          defaultCodexReasoningEffort: null,
           defaultWorkspacePermissions: 'STRICT',
           ratchetPermissions: 'YOLO',
           createdAt: new Date(),
           updatedAt: new Date(),
         };
-        vi.spyOn(userSettingsAccessorModule.userSettingsAccessor, 'get').mockResolvedValue(
+        vi.spyOn(userSettingsServiceModule.userSettingsService, 'get').mockResolvedValue(
           disabledSettings
         );
 
@@ -235,7 +250,7 @@ describe('WorkspaceCreationService', () => {
 
         await service.create(source);
 
-        expect(userSettingsAccessorModule.userSettingsAccessor.get).toHaveBeenCalledTimes(1);
+        expect(userSettingsServiceModule.userSettingsService.get).toHaveBeenCalledTimes(1);
       });
 
       it('persists initial prompt attachments in creation metadata', async () => {
@@ -285,6 +300,56 @@ describe('WorkspaceCreationService', () => {
             },
           })
         );
+      });
+
+      it('defaults and persists auto-iteration config for auto-iteration workspaces', async () => {
+        const source = unsafeCoerce<WorkspaceCreationSource>({
+          type: 'MANUAL',
+          projectId: 'proj-1',
+          name: 'Auto Iteration Workspace',
+          mode: 'AUTO_ITERATION',
+          autoIterationConfig: {
+            testCommand: 'pnpm test',
+            targetDescription: 'Improve coverage',
+          },
+        });
+
+        await service.create(source);
+
+        expect(workspaceAccessorModule.workspaceAccessor.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            mode: 'AUTO_ITERATION',
+            autoIterationConfig: {
+              testCommand: 'pnpm test',
+              targetDescription: 'Improve coverage',
+              maxIterations: 25,
+              testTimeoutSeconds: 600,
+              sessionRecycleInterval: 10,
+            },
+          })
+        );
+      });
+
+      it('rejects invalid auto-iteration config for auto-iteration workspaces', async () => {
+        const source = unsafeCoerce<WorkspaceCreationSource>({
+          type: 'MANUAL',
+          projectId: 'proj-1',
+          name: 'Auto Iteration Workspace',
+          mode: 'AUTO_ITERATION',
+          autoIterationConfig: {
+            testCommand: '',
+            targetDescription: 'Improve coverage',
+          },
+        });
+
+        const error = await service.create(source).catch((caught: unknown) => caught);
+
+        expect(error).toBeInstanceOf(ApplicationError);
+        expect(error).toMatchObject({
+          code: 'INVALID_INPUT',
+          message: expect.stringContaining('Invalid auto-iteration config'),
+        });
+        expect(workspaceAccessorModule.workspaceAccessor.create).not.toHaveBeenCalled();
       });
     });
 
@@ -340,7 +405,10 @@ describe('WorkspaceCreationService', () => {
           branchName: 'existing-branch',
         };
 
-        await expect(service.create(source)).rejects.toThrow('Project not found: proj-1');
+        const error = await service.create(source).catch((caught: unknown) => caught);
+
+        expect(error).toBeInstanceOf(ApplicationError);
+        expect(error).toMatchObject({ code: 'NOT_FOUND', message: 'Project not found: proj-1' });
       });
 
       it('should throw error when branch is already checked out', async () => {
@@ -352,9 +420,34 @@ describe('WorkspaceCreationService', () => {
           branchName: 'existing-branch',
         };
 
-        await expect(service.create(source)).rejects.toThrow(
-          "Branch 'existing-branch' is already checked out in another worktree."
-        );
+        const error = await service.create(source).catch((caught: unknown) => caught);
+
+        expect(error).toBeInstanceOf(ApplicationError);
+        expect(error).toMatchObject({
+          code: 'INVALID_INPUT',
+          message: "Branch 'existing-branch' is already checked out in another worktree.",
+        });
+      });
+    });
+
+    describe('PERIODIC_TASK source', () => {
+      it('creates through canonical defaults and persists the periodic task identity', async () => {
+        await service.create({
+          type: 'PERIODIC_TASK',
+          projectId: 'proj-1',
+          periodicTaskId: 'task-123',
+          name: 'Nightly maintenance',
+          initialPrompt: 'Update dependencies',
+        });
+
+        expect(workspaceAccessorModule.workspaceAccessor.create).toHaveBeenCalledWith({
+          projectId: 'proj-1',
+          periodicTaskId: 'task-123',
+          name: 'Nightly maintenance',
+          creationSource: 'PERIODIC_TASK',
+          creationMetadata: { initialPrompt: 'Update dependencies' },
+          ratchetEnabled: true,
+        });
       });
     });
 
@@ -420,6 +513,68 @@ describe('WorkspaceCreationService', () => {
               issueUrl: 'https://github.com/org/repo/issues/42',
               startupModePreset: 'plan',
             },
+          })
+        );
+      });
+
+      it('persists initial prompt in GitHub issue creation metadata', async () => {
+        const source: WorkspaceCreationSource = {
+          type: 'GITHUB_ISSUE',
+          projectId: 'proj-1',
+          issueNumber: 42,
+          issueUrl: 'https://github.com/org/repo/issues/42',
+          initialPrompt: 'Custom issue prompt',
+        };
+
+        await service.create(source);
+
+        expect(workspaceAccessorModule.workspaceAccessor.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            creationMetadata: {
+              issueNumber: 42,
+              issueUrl: 'https://github.com/org/repo/issues/42',
+              initialPrompt: 'Custom issue prompt',
+            },
+          })
+        );
+      });
+
+      it('persists empty initial prompt in GitHub issue creation metadata', async () => {
+        const source: WorkspaceCreationSource = {
+          type: 'GITHUB_ISSUE',
+          projectId: 'proj-1',
+          issueNumber: 42,
+          issueUrl: 'https://github.com/org/repo/issues/42',
+          initialPrompt: '',
+        };
+
+        await service.create(source);
+
+        expect(workspaceAccessorModule.workspaceAccessor.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            creationMetadata: {
+              issueNumber: 42,
+              issueUrl: 'https://github.com/org/repo/issues/42',
+              initialPrompt: '',
+            },
+          })
+        );
+      });
+
+      it('persists selected provider for GitHub issue workspaces', async () => {
+        const source: WorkspaceCreationSource = {
+          type: 'GITHUB_ISSUE',
+          projectId: 'proj-1',
+          issueNumber: 42,
+          issueUrl: 'https://github.com/org/repo/issues/42',
+          provider: 'CODEX',
+        };
+
+        await service.create(source);
+
+        expect(workspaceAccessorModule.workspaceAccessor.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            defaultSessionProvider: 'CODEX',
           })
         );
       });
@@ -493,6 +648,73 @@ describe('WorkspaceCreationService', () => {
               issueUrl: 'https://linear.app/team/issue/ENG-42',
               startupModePreset: 'plan',
             },
+          })
+        );
+      });
+
+      it('persists initial prompt in Linear issue creation metadata', async () => {
+        const source: WorkspaceCreationSource = {
+          type: 'LINEAR_ISSUE',
+          projectId: 'proj-1',
+          issueId: 'linear-uuid-123',
+          issueIdentifier: 'ENG-42',
+          issueUrl: 'https://linear.app/team/issue/ENG-42',
+          initialPrompt: 'Custom Linear issue prompt',
+        };
+
+        await service.create(source);
+
+        expect(workspaceAccessorModule.workspaceAccessor.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            creationMetadata: {
+              issueId: 'linear-uuid-123',
+              issueIdentifier: 'ENG-42',
+              issueUrl: 'https://linear.app/team/issue/ENG-42',
+              initialPrompt: 'Custom Linear issue prompt',
+            },
+          })
+        );
+      });
+
+      it('persists empty initial prompt in Linear issue creation metadata', async () => {
+        const source: WorkspaceCreationSource = {
+          type: 'LINEAR_ISSUE',
+          projectId: 'proj-1',
+          issueId: 'linear-uuid-123',
+          issueIdentifier: 'ENG-42',
+          issueUrl: 'https://linear.app/team/issue/ENG-42',
+          initialPrompt: '',
+        };
+
+        await service.create(source);
+
+        expect(workspaceAccessorModule.workspaceAccessor.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            creationMetadata: {
+              issueId: 'linear-uuid-123',
+              issueIdentifier: 'ENG-42',
+              issueUrl: 'https://linear.app/team/issue/ENG-42',
+              initialPrompt: '',
+            },
+          })
+        );
+      });
+
+      it('persists selected provider for Linear issue workspaces', async () => {
+        const source: WorkspaceCreationSource = {
+          type: 'LINEAR_ISSUE',
+          projectId: 'proj-1',
+          issueId: 'linear-uuid-123',
+          issueIdentifier: 'ENG-42',
+          issueUrl: 'https://linear.app/team/issue/ENG-42',
+          provider: 'CODEX',
+        };
+
+        await service.create(source);
+
+        expect(workspaceAccessorModule.workspaceAccessor.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            defaultSessionProvider: 'CODEX',
           })
         );
       });

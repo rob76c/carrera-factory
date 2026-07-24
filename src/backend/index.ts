@@ -13,18 +13,19 @@
  */
 
 import 'dotenv/config';
-import { createAppContext } from './app-context';
+import { createApplication } from './app-context';
+import { registerFatalErrorHandlers } from './fatal-error-handlers';
 import { toError } from './lib/error-utils';
 import { createServer } from './server';
 
-const appContext = createAppContext();
-const logger = appContext.services.createLogger('server');
+const application = createApplication();
+const logger = application.services.createLogger('server');
 
 // Create and start the server
-const serverInstance = createServer(undefined, appContext);
+const serverInstance = createServer(application);
 
 // Register the server instance globally for access by tRPC endpoints
-appContext.services.serverInstanceService.setInstance(serverInstance);
+application.services.serverInstanceService.setInstance(serverInstance);
 
 serverInstance.start().catch((error) => {
   logger.error('Failed to start server', toError(error));
@@ -44,24 +45,4 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-// Handle uncaught exceptions
-process.on('uncaughtException', async (error) => {
-  logger.error('Uncaught exception', error);
-  try {
-    await serverInstance.stop();
-  } catch {
-    // Ignore cleanup errors
-  }
-  process.exit(1);
-});
-
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (reason) => {
-  // Extract meaningful error information from reason
-  const errorInfo =
-    reason instanceof Error
-      ? { message: reason.message, stack: reason.stack, name: reason.name }
-      : { reason: String(reason) };
-
-  logger.error('Unhandled rejection at promise', errorInfo);
-});
+registerFatalErrorHandlers({ logger, process, server: serverInstance });

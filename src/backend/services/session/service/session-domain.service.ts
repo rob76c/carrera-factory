@@ -6,6 +6,7 @@ import type {
   QueuedMessage,
   SessionDeltaEvent,
 } from '@/shared/acp-protocol';
+import { MessageState } from '@/shared/acp-protocol';
 import type { PendingInteractiveRequest } from '@/shared/pending-request-types';
 import type { SessionRuntimeState } from '@/shared/session-runtime';
 import { handleProcessExit } from './store/session-process-exit';
@@ -29,12 +30,15 @@ import {
   commitSentUserMessageWithOrder,
   injectCommittedUserMessage,
   messageSort,
+  rebuildTranscriptIndex,
   removeTranscriptMessageById,
   setNextOrderFromTranscript,
   upsertTranscriptMessage,
 } from './store/session-transcript';
 
 const logger = createLogger('session-domain-service');
+const RECENT_REJECTION_TTL_MS = 60_000;
+const MAX_RECENT_REJECTIONS = 100;
 
 export class SessionDomainService extends EventEmitter {
   private readonly registry = new SessionStoreRegistry();
@@ -138,6 +142,31 @@ export class SessionDomainService extends EventEmitter {
 
   emitDelta(sessionId: string, event: SessionDeltaEvent): void {
     this.publisher.emitDelta(sessionId, event);
+  }
+
+  rejectMessage(sessionId: string, messageId: string, errorMessage: string): void {
+    const store = this.registry.getOrCreate(sessionId);
+    const now = Date.now();
+    store.recentRejections = store.recentRejections.filter(
+      (rejection) => rejection.expiresAt > now && rejection.id !== messageId
+    );
+    store.recentRejections.push({
+      id: messageId,
+      errorMessage,
+      rejectedAt: this.nowIso(),
+      expiresAt: now + RECENT_REJECTION_TTL_MS,
+    });
+
+    if (store.recentRejections.length > MAX_RECENT_REJECTIONS) {
+      store.recentRejections = store.recentRejections.slice(-MAX_RECENT_REJECTIONS);
+    }
+
+    this.publisher.emitDelta(sessionId, {
+      type: 'message_state_changed',
+      id: messageId,
+      newState: MessageState.REJECTED,
+      errorMessage,
+    });
   }
 
   setRuntimeSnapshot(sessionId: string, runtime: SessionRuntimeState, emitDelta = true): void {
@@ -454,6 +483,10 @@ export class SessionDomainService extends EventEmitter {
     return this.registry.getQueueLength(sessionId);
   }
 
+  hasQueuedMessage(sessionId: string, messageId: string): boolean {
+    return this.registry.getQueueSnapshot(sessionId).some((message) => message.id === messageId);
+  }
+
   getTranscriptSnapshot(sessionId: string): ChatMessage[] {
     const store = this.registry.getOrCreate(sessionId);
     return [...store.transcript].sort(messageSort);
@@ -462,6 +495,11 @@ export class SessionDomainService extends EventEmitter {
   isHistoryHydrated(sessionId: string): boolean {
     const store = this.registry.getOrCreate(sessionId);
     return store.historyHydrated === true;
+  }
+
+  getHistoryHydrationSource(sessionId: string): 'jsonl' | 'acp_fallback' | 'none' | undefined {
+    const store = this.registry.getOrCreate(sessionId);
+    return store.historyHydrationSource;
   }
 
   setHistoryRetryAt(sessionId: string, retryAt: number): void {
@@ -494,6 +532,7 @@ export class SessionDomainService extends EventEmitter {
   ): void {
     const store = this.registry.getOrCreate(sessionId);
     store.transcript = [...transcript].sort(messageSort);
+    rebuildTranscriptIndex(store);
     setNextOrderFromTranscript(store);
 
     if (options?.historySource) {

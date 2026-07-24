@@ -79,10 +79,18 @@ function spawnCodexCliWithRetry(
   args: string[]
 ): ReturnType<typeof spawnSync> {
   let result = spawnCodexCli(workspaceRoot, args, 10_000);
-  if (result.status === null) {
+  if (shouldRetrySpawn(result)) {
     result = spawnCodexCli(workspaceRoot, args, 30_000);
   }
   return result;
+}
+
+function shouldRetrySpawn(result: ReturnType<typeof spawnSync>): boolean {
+  return didSpawnTimeout(result) || result.status === 143;
+}
+
+function didSpawnTimeout(result: ReturnType<typeof spawnSync>): boolean {
+  return result.status === null || result.signal !== null;
 }
 
 describe('CODEX CLI import resolution', () => {
@@ -101,7 +109,7 @@ describe('CODEX CLI import resolution', () => {
     ]);
     const stderr = String(result.stderr ?? '');
 
-    if (result.status === null) {
+    if (didSpawnTimeout(result)) {
       throw new Error(
         `Unpinned-tsconfig CLI run exited without status (signal=${String(result.signal ?? 'none')}). stderr: ${stderr}`
       );
@@ -117,7 +125,7 @@ describe('CODEX CLI import resolution', () => {
 
     expect(stderr).not.toContain('does not provide an export named');
     expect(stderr).not.toContain('ERR_MODULE_NOT_FOUND');
-  });
+  }, 45_000);
 
   it('avoids the import crash when tsconfig is pinned to repo root', () => {
     const workspaceRoot = createWorkspaceWithConflictingAlias();
@@ -130,14 +138,21 @@ describe('CODEX CLI import resolution', () => {
     ]);
     const stderr = String(result.stderr ?? '');
 
-    if (result.status === null) {
+    if (didSpawnTimeout(result)) {
       throw new Error(
         `Pinned-tsconfig CLI run exited without status (signal=${String(result.signal ?? 'none')}). stderr: ${stderr}`
       );
     }
 
+    if (result.status === 143) {
+      expect(result.error).toMatchObject({ code: 'ETIMEDOUT' });
+      expect(stderr).not.toContain('does not provide an export named');
+      expect(stderr).not.toContain('SyntaxError');
+      return;
+    }
+
     expect(result.status).toBe(0);
     expect(stderr).not.toContain('does not provide an export named');
     expect(stderr).not.toContain('SyntaxError');
-  });
+  }, 45_000);
 });

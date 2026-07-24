@@ -1,16 +1,23 @@
 import type { SessionStatus } from '@/shared/core';
 
-export type SessionRuntimePhase =
-  | 'loading'
-  | 'starting'
-  | 'running'
-  | 'idle'
-  | 'stopping'
-  | 'error';
+export const SESSION_RUNTIME_PHASES = [
+  'loading',
+  'starting',
+  'running',
+  'idle',
+  'stopping',
+  'error',
+] as const;
 
-export type SessionRuntimeProcessState = 'unknown' | 'alive' | 'stopped';
+export type SessionRuntimePhase = (typeof SESSION_RUNTIME_PHASES)[number];
 
-export type SessionRuntimeActivity = 'WORKING' | 'IDLE';
+export const SESSION_RUNTIME_PROCESS_STATES = ['unknown', 'alive', 'stopped'] as const;
+
+export type SessionRuntimeProcessState = (typeof SESSION_RUNTIME_PROCESS_STATES)[number];
+
+export const SESSION_RUNTIME_ACTIVITIES = ['WORKING', 'IDLE'] as const;
+
+export type SessionRuntimeActivity = (typeof SESSION_RUNTIME_ACTIVITIES)[number];
 
 export interface SessionRuntimeLastExit {
   code: number | null;
@@ -40,6 +47,56 @@ export interface SessionRuntimeState {
   errorMessage?: string;
   activity: SessionRuntimeActivity;
   updatedAt: string;
+}
+
+/**
+ * Canonical UI-facing session status, derived from the runtime signals in a
+ * fixed precedence order. Both the chat reducer (composer status) and the
+ * session tab presenter derive from this single function so their semantics
+ * cannot drift apart.
+ */
+export type SessionUiStatusKind =
+  | 'loading'
+  | 'starting'
+  | 'stopping'
+  | 'error'
+  | 'unexpected-exit'
+  | 'stopped'
+  | 'working'
+  | 'idle';
+
+export interface SessionUiStatusInput {
+  phase: SessionRuntimePhase;
+  processState: SessionRuntimeProcessState;
+  activity: SessionRuntimeActivity;
+  lastExit?: SessionRuntimeLastExit | null;
+}
+
+export function deriveSessionUiStatusKind(input: SessionUiStatusInput): SessionUiStatusKind {
+  if (input.phase === 'loading' || input.phase === 'starting' || input.phase === 'stopping') {
+    return input.phase;
+  }
+  if (input.phase === 'error') {
+    return 'error';
+  }
+  if (input.processState === 'stopped') {
+    return input.lastExit?.unexpected ? 'unexpected-exit' : 'stopped';
+  }
+  if (input.activity === 'WORKING' || input.phase === 'running') {
+    return 'working';
+  }
+  return 'idle';
+}
+
+export function sessionUiStatusKindFromSummary(
+  summary: Pick<SessionSummary, 'runtimePhase' | 'processState' | 'activity' | 'lastExit'>
+): SessionUiStatusKind {
+  return deriveSessionUiStatusKind({
+    phase: summary.runtimePhase,
+    processState: summary.processState,
+    activity: summary.activity,
+    lastExit: summary.lastExit,
+  });
 }
 
 export function createInitialSessionRuntimeState(): SessionRuntimeState {
@@ -93,6 +150,20 @@ export function getSessionRuntimeErrorMessage(
   runtime: Pick<SessionRuntimeState, 'phase' | 'errorMessage' | 'lastExit'>
 ): string | null {
   return resolveSessionRuntimeErrorMessage(runtime.phase, runtime.errorMessage, runtime.lastExit);
+}
+
+export function isSessionSummaryWorking(
+  summary: Pick<SessionSummary, 'activity' | 'runtimePhase'>
+): boolean {
+  // activity tracks prompt/work-in-flight state; runtimePhase tracks process lifecycle.
+  // Persisted or merged snapshots can briefly expose only one of these signals.
+  return summary.activity === 'WORKING' || summary.runtimePhase === 'running';
+}
+
+export function hasWorkingSessionSummary(
+  summaries: Pick<SessionSummary, 'activity' | 'runtimePhase'>[]
+): boolean {
+  return summaries.some((summary) => isSessionSummaryWorking(summary));
 }
 
 export function findWorkspaceSessionRuntimeError(

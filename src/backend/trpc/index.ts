@@ -4,6 +4,7 @@ import { closedSessionsRouter } from './closed-sessions.trpc';
 import { decisionLogRouter } from './decision-log.trpc';
 import { githubRouter } from './github.trpc';
 import { linearRouter } from './linear.trpc';
+import { periodicTaskRouter } from './periodic-task.trpc';
 import { prReviewRouter } from './pr-review.trpc';
 import { projectRouter } from './project.trpc';
 import { sessionRouter } from './session.trpc';
@@ -23,11 +24,11 @@ export const appRouter = router({
   github: githubRouter,
   linear: linearRouter,
   autoIteration: autoIterationRouter,
+  periodicTask: periodicTaskRouter,
 });
 
 // Export type for use in frontend
 export type AppRouter = typeof appRouter;
 
-export { projectScopedProcedure } from './procedures/index';
 // Re-export context and procedure helpers
 export { createContext, publicProcedure } from './trpc';

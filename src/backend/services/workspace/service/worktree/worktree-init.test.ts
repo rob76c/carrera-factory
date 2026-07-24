@@ -7,14 +7,17 @@ import { SessionStatus } from '@/shared/core';
 const mocks = vi.hoisted(() => ({
   findById: vi.fn(),
   findByIdWithProject: vi.fn(),
-  updateWorkspace: vi.fn(),
+  registerInitializedWorktree: vi.fn(),
+  setRunScriptCommands: vi.fn(),
   findByWorkspaceId: vi.fn(),
   ensureBaseBranchExists: vi.fn(),
   createWorktree: vi.fn(),
   createWorktreeFromExistingBranch: vi.fn(),
+  removeWorktree: vi.fn(),
   getAuthenticatedUsername: vi.fn(),
   getIssue: vi.fn(),
   readConfig: vi.fn(),
+  syncWorkspaceCommandsFromFactoryConfig: vi.fn(),
   runStartupScript: vi.fn(),
   hasStartupScript: vi.fn(),
   startSession: vi.fn(),
@@ -34,9 +37,11 @@ const mocks = vi.hoisted(() => ({
   markFailed: vi.fn(),
   getInitMode: vi.fn(),
   clearInitMode: vi.fn(),
+  assertWorktreePathSafe: vi.fn(),
 }));
 
 vi.mock('@/backend/services/workspace', () => ({
+  assertWorktreePathSafe: mocks.assertWorktreePathSafe,
   workspaceStateMachine: {
     startProvisioning: mocks.startProvisioning,
     markReady: mocks.markReady,
@@ -47,17 +52,26 @@ vi.mock('@/backend/services/workspace', () => ({
     getInitMode: mocks.getInitMode,
     clearInitMode: mocks.clearInitMode,
   },
-  workspaceAccessor: {
+  workspaceDataService: {
     findById: mocks.findById,
     findByIdWithProject: mocks.findByIdWithProject,
-    update: mocks.updateWorkspace,
+  },
+  workspaceRelationshipsService: {
+    findParent: vi.fn(),
+  },
+  workspaceRunScriptService: {
+    registerInitializedWorktree: mocks.registerInitializedWorktree,
+    setCommands: mocks.setRunScriptCommands,
+  },
+  gitOpsService: {
+    ensureBaseBranchExists: mocks.ensureBaseBranchExists,
+    createWorktree: mocks.createWorktree,
+    createWorktreeFromExistingBranch: mocks.createWorktreeFromExistingBranch,
+    removeWorktree: mocks.removeWorktree,
   },
 }));
 
 vi.mock('@/backend/services/session', () => ({
-  agentSessionAccessor: {
-    findByWorkspaceId: mocks.findByWorkspaceId,
-  },
   sessionService: {
     startSession: mocks.startSession,
     stopWorkspaceSessions: mocks.stopWorkspaceSessions,
@@ -70,8 +84,7 @@ vi.mock('@/backend/services/session', () => ({
     tryDispatchNextMessage: mocks.tryDispatchNextMessage,
   },
   sessionDataService: {
-    createTerminalSession: mocks.createTerminalSession,
-    clearTerminalPid: mocks.clearTerminalPid,
+    findAgentSessionsByWorkspaceId: mocks.findByWorkspaceId,
   },
 }));
 
@@ -82,13 +95,9 @@ vi.mock('@/backend/services/terminal', () => ({
     getTerminalsForWorkspace: mocks.getTerminalsForWorkspace,
     onExit: mocks.onExit,
   },
-}));
-
-vi.mock('@/backend/services/git-ops.service', () => ({
-  gitOpsService: {
-    ensureBaseBranchExists: mocks.ensureBaseBranchExists,
-    createWorktree: mocks.createWorktree,
-    createWorktreeFromExistingBranch: mocks.createWorktreeFromExistingBranch,
+  terminalSessionService: {
+    registerSession: mocks.createTerminalSession,
+    releaseSessionPid: mocks.clearTerminalPid,
   },
 }));
 
@@ -99,13 +108,13 @@ vi.mock('@/backend/services/github', () => ({
   },
 }));
 
-vi.mock('@/backend/services/factory-config.service', () => ({
+vi.mock('@/backend/services/run-script', () => ({
   FactoryConfigService: {
     readConfig: mocks.readConfig,
   },
-}));
-
-vi.mock('@/backend/services/run-script', () => ({
+  runScriptConfigPersistenceService: {
+    syncWorkspaceCommandsFromFactoryConfig: mocks.syncWorkspaceCommandsFromFactoryConfig,
+  },
   startupScriptService: {
     runStartupScript: mocks.runStartupScript,
     hasStartupScript: mocks.hasStartupScript,
@@ -150,9 +159,11 @@ describe('initializeWorkspaceWorktree orchestrator', () => {
       worktreePath: '/worktrees/workspace-1',
       branchName: 'feature-1',
     });
+    mocks.removeWorktree.mockResolvedValue(undefined);
     mocks.getAuthenticatedUsername.mockResolvedValue(null);
     mocks.getIssue.mockResolvedValue(null);
-    mocks.updateWorkspace.mockResolvedValue(undefined);
+    mocks.registerInitializedWorktree.mockResolvedValue(undefined);
+    mocks.setRunScriptCommands.mockResolvedValue(undefined);
     mocks.hasStartupScript.mockReturnValue(false);
     mocks.readConfig.mockResolvedValue({
       scripts: {
@@ -307,7 +318,7 @@ describe('initializeWorkspaceWorktree orchestrator', () => {
     });
     expect(mocks.stopWorkspaceSessions).toHaveBeenCalledWith('workspace-1');
     expect(mocks.destroyTerminal).toHaveBeenCalledWith('workspace-1', 'term-default');
-    expect(mocks.clearTerminalPid).toHaveBeenCalledWith('term-default');
+    expect(mocks.clearTerminalPid).toHaveBeenCalledWith('workspace-1', 'term-default');
     expect(mocks.markFailed).toHaveBeenCalled();
   });
 

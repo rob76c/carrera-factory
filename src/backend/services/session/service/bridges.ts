@@ -6,8 +6,8 @@
 
 /** Workspace activity callbacks needed by session domain */
 export interface SessionWorkspaceBridge {
-  markSessionRunning(workspaceId: string, sessionId: string): void;
-  markSessionIdle(workspaceId: string, sessionId: string): void;
+  markSessionRunning(workspaceId: string, sessionId: string): number;
+  markSessionIdle(workspaceId: string, sessionId: string, generation?: number): void;
   on(
     event: 'request_notification',
     handler: (data: {
@@ -19,11 +19,28 @@ export interface SessionWorkspaceBridge {
   ): void;
 }
 
+/**
+ * Outcome of a ratchet fixer session that has ended, as observed by the
+ * session lifecycle: COMPLETED for deliberate stops / clean exits, DIED for
+ * unexpected exits (which makes the dispatch eligible for a bounded retry).
+ */
+export type RatchetSessionEndOutcome = 'COMPLETED' | 'DIED';
+
 /** Workspace callbacks needed by session lifecycle service */
 export interface SessionLifecycleWorkspaceBridge {
-  markSessionRunning(workspaceId: string, sessionId: string): void;
-  markSessionIdle(workspaceId: string, sessionId: string): void;
-  clearRatchetActiveSessionIfMatching(workspaceId: string, sessionId: string): Promise<void>;
+  markSessionRunning(workspaceId: string, sessionId: string): number;
+  markSessionIdle(workspaceId: string, sessionId: string, generation?: number): void;
+  recordRatchetSessionEnd(
+    workspaceId: string,
+    sessionId: string,
+    outcome: RatchetSessionEndOutcome
+  ): Promise<void>;
+  resetPRDiscoveryBackoff(workspaceId: string): Promise<boolean>;
+}
+
+/** Queued message dispatch callback needed by session lifecycle service */
+export interface SessionLifecycleMessageQueueBridge {
+  tryDispatchNextMessage(sessionId: string): Promise<void>;
 }
 
 /** Auto-iteration exit notification bridge */

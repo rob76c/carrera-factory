@@ -21,11 +21,12 @@ const mocks = vi.hoisted(() => ({
   kanbanCache: undefined as unknown[] | undefined,
 }));
 
-vi.mock('lucide-react', () => ({
-  ChevronDown: () => null,
-  Loader2: () => null,
-  Paperclip: () => null,
-  RefreshCw: () => null,
+vi.mock('@phosphor-icons/react', () => ({
+  ArrowsClockwiseIcon: () => null,
+  CalendarIcon: () => null,
+  CaretDownIcon: () => null,
+  PaperclipIcon: () => null,
+  SpinnerGapIcon: () => null,
 }));
 
 vi.mock('sonner', () => ({
@@ -47,6 +48,9 @@ vi.mock('@/client/lib/trpc', () => ({
         },
         list: { invalidate: mocks.listInvalidateMock },
         getProjectSummaryState: { invalidate: mocks.getProjectSummaryStateInvalidateMock },
+      },
+      periodicTask: {
+        list: { invalidate: vi.fn() },
       },
     }),
     userSettings: {
@@ -75,6 +79,22 @@ vi.mock('@/client/lib/trpc', () => ({
             isPending: false,
           };
         },
+      },
+    },
+    periodicTask: {
+      create: {
+        useMutation: () => ({
+          mutate: vi.fn(),
+          isPending: false,
+        }),
+      },
+    },
+    project: {
+      listSlashCommands: {
+        useQuery: () => ({
+          data: { commands: [] },
+          isFetched: true,
+        }),
       },
     },
   },
@@ -118,6 +138,23 @@ vi.mock('@/components/chat/chat-input/hooks/use-project-file-mentions', () => ({
 
 vi.mock('@/components/chat/file-mention-palette', () => ({
   FileMentionPalette: () => null,
+}));
+
+vi.mock('@/components/chat/slash-command-palette', () => ({
+  SlashCommandPalette: () => null,
+}));
+
+vi.mock('@/components/chat/chat-input/hooks/use-slash-commands', () => ({
+  useSlashCommands: () => ({
+    slashMenuOpen: false,
+    slashFilter: '',
+    commandsReady: true,
+    paletteRef: { current: null },
+    handleInputChange: vi.fn(),
+    handleSlashCommandSelect: vi.fn(),
+    handleSlashMenuClose: vi.fn(),
+    delegateToSlashMenu: () => 'passthrough',
+  }),
 }));
 
 vi.mock('@/components/ui/button', () => ({
@@ -169,7 +206,7 @@ vi.mock('@/components/ui/textarea', () => ({
 }));
 
 vi.mock('@/components/workspace', () => ({
-  RatchetToggleButton: () => null,
+  RatchetToggleButton: () => createElement('button', { 'aria-label': 'Toggle ratchet' }),
 }));
 
 function renderForm(): {
@@ -222,6 +259,47 @@ afterEach(() => {
 });
 
 describe('InlineWorkspaceForm', () => {
+  it('shows workspace-only toolbar controls in standard mode', () => {
+    const { container, root } = renderForm();
+
+    expect(container.querySelector('[aria-label="Toggle ratchet"]')).not.toBeNull();
+    expect(container.textContent).toContain('Claude');
+    expect(container.textContent).toContain('Codex');
+    expect(container.textContent).toContain('Default');
+    expect(container.textContent).toContain('Plan');
+    expect(container.querySelectorAll('[aria-label="Attach files"]')).toHaveLength(2);
+
+    root.unmount();
+    container.remove();
+  });
+
+  it('hides ignored workspace-only toolbar controls in periodic task mode', () => {
+    const { container, root } = renderForm();
+    const periodicTaskItem = Array.from(container.querySelectorAll('div')).find(
+      (element) => element.textContent === 'Create Periodic Task'
+    );
+
+    if (!periodicTaskItem) {
+      throw new Error('Expected periodic task menu item to render');
+    }
+
+    flushSync(() => {
+      periodicTaskItem.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(container.querySelector('[aria-label="Toggle ratchet"]')).toBeNull();
+    expect(container.textContent).not.toContain('Claude');
+    expect(container.textContent).not.toContain('Codex');
+    expect(container.textContent).not.toContain('Default');
+    expect(container.textContent).not.toContain('Plan');
+    expect(container.querySelectorAll('[aria-label="Attach files"]')).toHaveLength(0);
+    expect(container.textContent).toContain('Periodic task config');
+    expect(container.textContent).toContain('Daily');
+
+    root.unmount();
+    container.remove();
+  });
+
   it('auto-resizes the textarea while typing normally', () => {
     const { container, root, textarea } = renderForm();
     const setTextareaValue = Object.getOwnPropertyDescriptor(

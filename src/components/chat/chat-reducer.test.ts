@@ -15,10 +15,15 @@ import type {
   UserQuestionRequest,
   WebSocketMessage,
 } from '@/lib/chat-protocol';
-import { DEFAULT_CHAT_SETTINGS, MessageState } from '@/lib/chat-protocol';
+import {
+  DEFAULT_CHAT_SETTINGS,
+  DEFAULT_RENDERER_TRANSCRIPT_LIMIT,
+  MessageState,
+} from '@/lib/chat-protocol';
 import type { ChatBarCapabilities } from '@/shared/chat-capabilities';
 import { unsafeCoerce } from '@/test-utils/unsafe-coerce';
 import {
+  type AcpConfigOption,
   type ChatAction,
   type ChatState,
   chatReducer,
@@ -31,12 +36,15 @@ import {
 // Test Helpers
 // =============================================================================
 
+type TestQueuedMessage =
+  ChatState['queuedMessages'] extends Map<string, infer Message> ? Message : never;
+
 /**
  * Helper to convert array of QueuedMessages to Map.
  * Used for setting up test state since queuedMessages is now a Map.
  */
-function toQueuedMessagesMap(messages: QueuedMessage[]): Map<string, QueuedMessage> {
-  const map = new Map<string, QueuedMessage>();
+function toQueuedMessagesMap(messages: TestQueuedMessage[]): ChatState['queuedMessages'] {
+  const map = new Map<string, TestQueuedMessage>();
   for (const msg of messages) {
     map.set(msg.id, msg);
   }
@@ -163,6 +171,36 @@ function createTestToolResultMessage(toolUseId: string): AgentMessage {
   };
 }
 
+function createUserChatMessage(id: string, order: number): ChatMessage {
+  return {
+    id,
+    source: 'user',
+    text: `Message ${order}`,
+    timestamp: '2024-01-01T00:00:00.000Z',
+    order,
+  };
+}
+
+function createToolUseChatMessage(id: string, toolUseId: string, order: number): ChatMessage {
+  return {
+    id,
+    source: 'agent',
+    message: createTestToolUseMessage(toolUseId),
+    timestamp: '2024-01-01T00:00:00.000Z',
+    order,
+  };
+}
+
+function createToolResultChatMessage(id: string, toolUseId: string, order: number): ChatMessage {
+  return {
+    id,
+    source: 'agent',
+    message: createTestToolResultMessage(toolUseId),
+    timestamp: '2024-01-01T00:00:00.000Z',
+    order,
+  };
+}
+
 // =============================================================================
 // Initial State Tests
 // =============================================================================
@@ -202,6 +240,65 @@ describe('createInitialChatState', () => {
     expect(state.chatSettings).toEqual(customSettings);
     // Other values should still be defaults
     expect(state.messages).toEqual([]);
+  });
+});
+
+// =============================================================================
+// CONFIG_OPTIONS_UPDATE model sync
+// =============================================================================
+
+describe('chatReducer CONFIG_OPTIONS_UPDATE', () => {
+  function modelConfigOption(currentValue: string): AcpConfigOption {
+    return {
+      id: 'model',
+      name: 'Model',
+      type: 'string',
+      category: 'model',
+      currentValue,
+      options: [
+        { value: 'opus', name: 'Opus' },
+        { value: 'sonnet', name: 'Sonnet' },
+      ],
+    };
+  }
+
+  it('mirrors the ACP model option currentValue into chatSettings.selectedModel', () => {
+    // Regression: model chosen via the ACP config selector must reach chatSettings, otherwise
+    // the stale default is re-applied at message dispatch and clobbers the user's pick.
+    const state = createInitialChatState({
+      chatSettings: { ...DEFAULT_CHAT_SETTINGS, selectedModel: 'opus' },
+    });
+
+    const next = chatReducer(state, {
+      type: 'CONFIG_OPTIONS_UPDATE',
+      payload: { configOptions: [modelConfigOption('sonnet')] },
+    });
+
+    expect(next.chatSettings.selectedModel).toBe('sonnet');
+    expect(next.acpConfigOptions).toEqual([modelConfigOption('sonnet')]);
+  });
+
+  it('leaves chatSettings unchanged when there is no model config option', () => {
+    const state = createInitialChatState({
+      chatSettings: { ...DEFAULT_CHAT_SETTINGS, selectedModel: 'opus' },
+    });
+
+    const modeOption: AcpConfigOption = {
+      id: 'mode',
+      name: 'Mode',
+      type: 'string',
+      category: 'mode',
+      currentValue: 'default',
+      options: [{ value: 'default', name: 'Default' }],
+    };
+
+    const next = chatReducer(state, {
+      type: 'CONFIG_OPTIONS_UPDATE',
+      payload: { configOptions: [modeOption] },
+    });
+
+    expect(next.chatSettings.selectedModel).toBe('opus');
+    expect(next.acpConfigOptions).toEqual([modeOption]);
   });
 });
 
@@ -822,6 +919,165 @@ describe('chatReducer', () => {
   });
 
   // -------------------------------------------------------------------------
+  // WS_ASSISTANT_TEXT_DELTA Action
+  // -------------------------------------------------------------------------
+
+  describe('WS_ASSISTANT_TEXT_DELTA action', () => {
+    function textDelta(
+      offset: number,
+      text: string,
+      options: { messageId?: string; order?: number } = {}
+    ): ChatAction {
+      return unsafeCoerce<ChatAction>({
+        type: 'WS_ASSISTANT_TEXT_DELTA',
+        payload: {
+          messageId: options.messageId ?? 'session-1-7',
+          order: options.order ?? 7,
+          offset,
+          text,
+        },
+      });
+    }
+
+    function assistantText(state: ChatState): string | undefined {
+      const content = state.messages[0]?.message?.message?.content;
+      if (!Array.isArray(content)) {
+        return undefined;
+      }
+      const first = content[0];
+      return first?.type === 'text' ? first.text : undefined;
+    }
+
+    it('maps assistant text delta websocket messages to reducer actions', () => {
+      expect(
+        createActionFromWebSocketMessage({
+          type: 'assistant_text_delta',
+          messageId: 'session-1-7',
+          order: 7,
+          offset: 5,
+          text: ' world',
+        })
+      ).toEqual({
+        type: 'WS_ASSISTANT_TEXT_DELTA',
+        payload: {
+          messageId: 'session-1-7',
+          order: 7,
+          offset: 5,
+          text: ' world',
+        },
+      });
+    });
+
+    it('creates a stable assistant Markdown message from the first delta', () => {
+      const next = chatReducer(initialState, textDelta(0, '**Hello**'));
+
+      expect(next.messages).toHaveLength(1);
+      expect(next.messages[0]).toMatchObject({
+        id: 'session-1-7',
+        source: 'agent',
+        order: 7,
+        message: {
+          type: 'assistant',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: '**Hello**' }],
+          },
+        },
+      });
+      expect(next.agentMessageOrderToIndex.get(7)).toBe(0);
+    });
+
+    it('applies many sequential deltas to one indexed assistant message', () => {
+      let state = initialState;
+      for (let offset = 0; offset < 200; offset += 1) {
+        state = chatReducer(state, textDelta(offset, 'x'));
+      }
+
+      expect(state.messages).toHaveLength(1);
+      expect(assistantText(state)).toBe('x'.repeat(200));
+      expect(state.agentMessageOrderToIndex.get(7)).toBe(0);
+    });
+
+    it('deduplicates full and partially overlapping deltas', () => {
+      const first = chatReducer(initialState, textDelta(0, 'Hello'));
+      const duplicate = chatReducer(first, textDelta(0, 'Hello'));
+      const overlap = chatReducer(duplicate, textDelta(3, 'lo world'));
+
+      expect(duplicate).toBe(first);
+      expect(assistantText(overlap)).toBe('Hello world');
+    });
+
+    it('ignores forward gaps, conflicting overlaps, and identifier mismatches', () => {
+      const first = chatReducer(initialState, textDelta(0, 'Hello'));
+
+      expect(chatReducer(first, textDelta(10, ' gap'))).toBe(first);
+      expect(chatReducer(first, textDelta(3, 'XX'))).toBe(first);
+      expect(chatReducer(first, textDelta(5, ' world', { messageId: 'different-message' }))).toBe(
+        first
+      );
+    });
+
+    it('extends a full replayed assistant message and ignores stale replay overlap', () => {
+      const replayed = chatReducer(initialState, {
+        type: 'SESSION_REPLAY_BATCH',
+        payload: {
+          replayEvents: [
+            {
+              type: 'agent_message',
+              messageId: 'session-1-7',
+              order: 7,
+              data: {
+                type: 'assistant',
+                message: { role: 'assistant', content: [{ type: 'text', text: 'Hello' }] },
+              },
+            },
+          ],
+        },
+      });
+      const stale = chatReducer(replayed, textDelta(0, 'Hello'));
+      const extended = chatReducer(stale, textDelta(5, ' world'));
+
+      expect(stale).toBe(replayed);
+      expect(assistantText(extended)).toBe('Hello world');
+      expect(extended.messages[0]?.id).toBe('session-1-7');
+    });
+
+    it('does not rebuild tool or queue indexes when extending known text', () => {
+      let state = chatReducer(initialState, textDelta(0, 'Hello'));
+      state = chatReducer(state, {
+        type: 'WS_AGENT_MESSAGE',
+        payload: { message: createTestToolUseMessage('tool-1'), order: 8 },
+      });
+      state = {
+        ...state,
+        queuedMessages: toQueuedMessagesMap([
+          {
+            id: 'queued-1',
+            text: 'queued',
+            timestamp: '2026-02-01T00:00:00.000Z',
+            settings: {
+              selectedModel: null,
+              reasoningEffort: null,
+              thinkingEnabled: false,
+              planModeEnabled: false,
+            },
+          },
+        ]),
+      };
+      const toolIndex = state.toolUseIdToIndex;
+      const orderIndex = state.agentMessageOrderToIndex;
+      const queue = state.queuedMessages;
+
+      const next = chatReducer(state, textDelta(5, ' world'));
+
+      expect(assistantText(next)).toBe('Hello world');
+      expect(next.toolUseIdToIndex).toBe(toolIndex);
+      expect(next.agentMessageOrderToIndex).toBe(orderIndex);
+      expect(next.queuedMessages).toBe(queue);
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // WS_ERROR Action
   // -------------------------------------------------------------------------
 
@@ -1078,6 +1334,94 @@ describe('chatReducer', () => {
       const newState = chatReducer(initialState, action);
 
       expect(newState.sessionStatus).toEqual({ phase: 'loading' });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // SESSION_SNAPSHOT Action
+  // -------------------------------------------------------------------------
+
+  describe('SESSION_SNAPSHOT action', () => {
+    it('should preserve lastRejectedMessage for recovery', () => {
+      let state: ChatState = {
+        ...initialState,
+        pendingMessages: new Map([['msg-1', { text: 'My important message', attachments: [] }]]),
+      };
+
+      state = chatReducer(state, {
+        type: 'MESSAGE_STATE_CHANGED',
+        payload: {
+          id: 'msg-1',
+          newState: MessageState.REJECTED,
+          errorMessage: 'Unsupported image type',
+        },
+      });
+
+      expect(state.pendingMessages.size).toBe(0);
+      expect(state.queuedMessages.size).toBe(0);
+      expect(state.lastRejectedMessage?.text).toBe('My important message');
+
+      const newState = chatReducer(state, {
+        type: 'SESSION_SNAPSHOT',
+        payload: {
+          messages: [],
+          queuedMessages: [],
+          sessionRuntime: {
+            phase: 'idle',
+            processState: 'alive',
+            activity: 'IDLE',
+            updatedAt: '2026-02-08T00:00:00.000Z',
+          },
+        },
+      });
+
+      expect(newState.lastRejectedMessage?.text).toBe('My important message');
+      expect(newState.lastRejectedMessage?.error).toBe('Unsupported image type');
+    });
+
+    it('should clear pending messages when replay includes a missed rejected state', () => {
+      let state = chatReducer(createInitialChatState(), {
+        type: 'MESSAGE_SENDING',
+        payload: {
+          id: 'msg-rejected',
+          text: 'This message will be rejected',
+          attachments: [],
+          sessionId: 'session-1',
+        },
+      });
+
+      expect(state.pendingMessages.has('msg-rejected')).toBe(true);
+
+      state = chatReducer(state, {
+        type: 'SESSION_REPLAY_BATCH',
+        payload: {
+          replayEvents: [
+            {
+              type: 'session_runtime_snapshot',
+              sessionRuntime: {
+                phase: 'idle',
+                processState: 'alive',
+                activity: 'IDLE',
+                updatedAt: '2026-02-08T00:00:00.000Z',
+              },
+            },
+            {
+              type: 'message_state_changed',
+              id: 'msg-rejected',
+              newState: MessageState.REJECTED,
+              errorMessage: 'Empty message',
+            },
+          ],
+        },
+      });
+
+      expect(state.pendingMessages.has('msg-rejected')).toBe(false);
+      expect(state.lastRejectedMessage).toEqual({
+        text: 'This message will be rejected',
+        attachments: [],
+        error: 'Empty message',
+        sessionId: 'session-1',
+      });
     });
   });
 
@@ -1497,6 +1841,151 @@ describe('chatReducer', () => {
     });
   });
 
+  describe('renderer transcript retention', () => {
+    it('caps live agent inserts to the recent renderer window and prunes rewind metadata', () => {
+      const messages = Array.from({ length: DEFAULT_RENDERER_TRANSCRIPT_LIMIT }, (_, order) =>
+        createUserChatMessage(`msg-${order}`, order)
+      );
+      const state = createInitialChatState({
+        messages,
+        messageIdToUuid: new Map([
+          ['msg-0', 'uuid-0'],
+          [`msg-${DEFAULT_RENDERER_TRANSCRIPT_LIMIT - 1}`, 'uuid-recent'],
+        ]),
+        localUserMessageIds: new Set(['msg-0', `msg-${DEFAULT_RENDERER_TRANSCRIPT_LIMIT - 1}`]),
+      });
+
+      const newState = chatReducer(state, {
+        type: 'WS_AGENT_MESSAGE',
+        payload: {
+          message: createTestAssistantMessage(),
+          order: DEFAULT_RENDERER_TRANSCRIPT_LIMIT,
+        },
+      });
+
+      expect(newState.messages).toHaveLength(DEFAULT_RENDERER_TRANSCRIPT_LIMIT);
+      expect(newState.messages[0]!.id).toBe('msg-1');
+      expect(newState.messages.at(-1)?.source).toBe('agent');
+      expect(newState.messageIdToUuid.has('msg-0')).toBe(false);
+      expect(newState.messageIdToUuid.get(`msg-${DEFAULT_RENDERER_TRANSCRIPT_LIMIT - 1}`)).toBe(
+        'uuid-recent'
+      );
+      expect(newState.localUserMessageIds.has('msg-0')).toBe(false);
+    });
+
+    it('drops recovered old user-message deltas that fall outside the recent window', () => {
+      const messages = Array.from({ length: DEFAULT_RENDERER_TRANSCRIPT_LIMIT }, (_, index) =>
+        createUserChatMessage(`msg-${index + 100}`, index + 100)
+      );
+      const state = createInitialChatState({ messages });
+
+      const newState = chatReducer(state, {
+        type: 'MESSAGE_STATE_CHANGED',
+        payload: {
+          id: 'missed-old-message',
+          newState: MessageState.DISPATCHED,
+          userMessage: {
+            text: 'Recovered but too old',
+            timestamp: '2024-01-01T00:00:00.000Z',
+            order: 0,
+          },
+        },
+      });
+
+      expect(newState.messages).toHaveLength(DEFAULT_RENDERER_TRANSCRIPT_LIMIT);
+      expect(newState.messages.some((message) => message.id === 'missed-old-message')).toBe(false);
+      expect(newState.messages[0]!.id).toBe('msg-100');
+    });
+
+    it('caps snapshot hydration and rebuilds tool indexes for retained messages', () => {
+      const messages = [
+        createToolUseChatMessage('old-tool', 'tool-old', 0),
+        ...Array.from({ length: DEFAULT_RENDERER_TRANSCRIPT_LIMIT - 1 }, (_, index) =>
+          createUserChatMessage(`msg-${index + 1}`, index + 1)
+        ),
+        createToolUseChatMessage('recent-tool', 'tool-recent', DEFAULT_RENDERER_TRANSCRIPT_LIMIT),
+      ];
+
+      const newState = chatReducer(initialState, {
+        type: 'SESSION_SNAPSHOT',
+        payload: {
+          messages,
+          queuedMessages: [],
+          sessionRuntime: {
+            phase: 'idle',
+            processState: 'alive',
+            activity: 'IDLE',
+            updatedAt: '2026-02-08T00:00:00.000Z',
+          },
+        },
+      });
+
+      expect(newState.messages).toHaveLength(DEFAULT_RENDERER_TRANSCRIPT_LIMIT);
+      expect(newState.messages[0]!.id).toBe('msg-1');
+      expect(newState.messages.at(-1)?.id).toBe('recent-tool');
+      expect(newState.toolUseIdToIndex.has('tool-old')).toBe(false);
+      expect(newState.toolUseIdToIndex.get('tool-recent')).toBe(
+        DEFAULT_RENDERER_TRANSCRIPT_LIMIT - 1
+      );
+    });
+
+    it('starts a trimmed snapshot at a render-safe boundary', () => {
+      const messages = [
+        createUserChatMessage('too-old', 0),
+        createToolResultChatMessage('orphaned-tool-result', 'tool-too-old', 1),
+        ...Array.from({ length: DEFAULT_RENDERER_TRANSCRIPT_LIMIT - 1 }, (_, index) =>
+          createUserChatMessage(`msg-${index + 2}`, index + 2)
+        ),
+      ];
+
+      const newState = chatReducer(initialState, {
+        type: 'SESSION_SNAPSHOT',
+        payload: {
+          messages,
+          queuedMessages: [],
+          sessionRuntime: {
+            phase: 'idle',
+            processState: 'alive',
+            activity: 'IDLE',
+            updatedAt: '2026-02-08T00:00:00.000Z',
+          },
+        },
+      });
+
+      expect(newState.messages).toHaveLength(DEFAULT_RENDERER_TRANSCRIPT_LIMIT - 1);
+      expect(newState.messages[0]!.id).toBe('msg-2');
+      expect(newState.messages.some((message) => message.id === 'orphaned-tool-result')).toBe(
+        false
+      );
+    });
+
+    it('drops late user-message UUIDs when there is no retained local message or pending send', () => {
+      const state = createInitialChatState({
+        pendingUserMessageUuids: ['stale-uuid'],
+      });
+
+      const newState = chatReducer(state, {
+        type: 'USER_MESSAGE_UUID_RECEIVED',
+        payload: { uuid: 'late-uuid' },
+      });
+
+      expect(newState.pendingUserMessageUuids).toEqual([]);
+    });
+
+    it('still queues early user-message UUIDs while a local send is pending', () => {
+      const state = createInitialChatState({
+        pendingMessages: new Map([['pending-message', { text: 'Pending send' }]]),
+      });
+
+      const newState = chatReducer(state, {
+        type: 'USER_MESSAGE_UUID_RECEIVED',
+        payload: { uuid: 'early-uuid' },
+      });
+
+      expect(newState.pendingUserMessageUuids).toEqual(['early-uuid']);
+    });
+  });
+
   // -------------------------------------------------------------------------
   // Queue Actions (Backend-managed)
   // -------------------------------------------------------------------------
@@ -1554,6 +2043,26 @@ describe('chatReducer', () => {
       expect(newState.queuedMessages.size).toBe(2);
       expect(newState.queuedMessages.get(existingMessage.id)).toEqual(existingMessage);
       expect(newState.queuedMessages.get(newMessage.id)).toEqual(newMessage);
+    });
+  });
+
+  describe('MESSAGE_SENDING action', () => {
+    it('stores the source session for later rejection recovery', () => {
+      const action: ChatAction = {
+        type: 'MESSAGE_SENDING',
+        payload: {
+          id: 'msg-1',
+          text: 'Recover me',
+          sessionId: 'session-A',
+        },
+      };
+      const newState = chatReducer(initialState, action);
+
+      expect(newState.pendingMessages.get('msg-1')).toEqual({
+        text: 'Recover me',
+        attachments: undefined,
+        sessionId: 'session-A',
+      });
     });
   });
 
@@ -1922,6 +2431,69 @@ describe('chatReducer', () => {
       expect(newState.sessionStatus).toEqual({ phase: 'running' });
       expect(newState.sessionRuntime.phase).toBe('running');
     });
+
+    it('should preserve lastRejectedMessage for recovery', () => {
+      let state: ChatState = {
+        ...initialState,
+        pendingMessages: new Map([['msg-1', { text: 'My important message', attachments: [] }]]),
+      };
+
+      state = chatReducer(state, {
+        type: 'MESSAGE_STATE_CHANGED',
+        payload: {
+          id: 'msg-1',
+          newState: MessageState.REJECTED,
+          errorMessage: 'Unsupported image type',
+        },
+      });
+
+      expect(state.pendingMessages.size).toBe(0);
+      expect(state.queuedMessages.size).toBe(0);
+      expect(state.lastRejectedMessage?.text).toBe('My important message');
+
+      const newState = chatReducer(state, {
+        type: 'SESSION_REPLAY_BATCH',
+        payload: {
+          replayEvents: [],
+        },
+      });
+
+      expect(newState.lastRejectedMessage?.text).toBe('My important message');
+      expect(newState.lastRejectedMessage?.error).toBe('Unsupported image type');
+    });
+
+    it('should preserve lastRejectedMessage when replay includes an already-handled rejection', () => {
+      const state: ChatState = {
+        ...initialState,
+        lastRejectedMessage: {
+          text: 'My important message',
+          attachments: [],
+          error: 'Unsupported image type',
+          sessionId: 'session-1',
+        },
+      };
+
+      const newState = chatReducer(state, {
+        type: 'SESSION_REPLAY_BATCH',
+        payload: {
+          replayEvents: [
+            {
+              type: 'message_state_changed',
+              id: 'msg-1',
+              newState: MessageState.REJECTED,
+              errorMessage: 'Unsupported image type',
+            },
+          ],
+        },
+      });
+
+      expect(newState.lastRejectedMessage).toEqual({
+        text: 'My important message',
+        attachments: [],
+        error: 'Unsupported image type',
+        sessionId: 'session-1',
+      });
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -1998,6 +2570,134 @@ describe('chatReducer', () => {
         source: 'user',
         text: 'Queued',
         order: 3,
+      });
+    });
+
+    it('should keep pending message session on rejected recovery content', () => {
+      const state: ChatState = {
+        ...initialState,
+        pendingMessages: new Map([
+          [
+            'msg-1',
+            {
+              text: 'Sensitive text',
+              sessionId: 'session-A',
+            },
+          ],
+        ]),
+      };
+
+      const newState = chatReducer(state, {
+        type: 'MESSAGE_STATE_CHANGED',
+        payload: {
+          id: 'msg-1',
+          newState: MessageState.REJECTED,
+          errorMessage: 'Rejected',
+        },
+      });
+
+      expect(newState.lastRejectedMessage).toMatchObject({
+        text: 'Sensitive text',
+        error: 'Rejected',
+        sessionId: 'session-A',
+      });
+    });
+
+    it('should preserve source session when an accepted queued message is later rejected', () => {
+      const state: ChatState = {
+        ...initialState,
+        pendingMessages: new Map([
+          [
+            'msg-1',
+            {
+              text: 'Queued text',
+              sessionId: 'session-A',
+            },
+          ],
+        ]),
+      };
+
+      const acceptedState = chatReducer(state, {
+        type: 'MESSAGE_STATE_CHANGED',
+        payload: {
+          id: 'msg-1',
+          newState: MessageState.ACCEPTED,
+          userMessage: {
+            text: 'Queued text',
+            timestamp: '2024-01-01T00:00:00.000Z',
+          },
+        },
+      });
+
+      const rejectedState = chatReducer(acceptedState, {
+        type: 'MESSAGE_STATE_CHANGED',
+        payload: {
+          id: 'msg-1',
+          newState: MessageState.REJECTED,
+          errorMessage: 'Rejected',
+        },
+      });
+
+      expect(rejectedState.lastRejectedMessage).toMatchObject({
+        text: 'Queued text',
+        error: 'Rejected',
+        sessionId: 'session-A',
+      });
+    });
+
+    it('should preserve source session across repeated accepted transitions', () => {
+      const state: ChatState = {
+        ...initialState,
+        messages: [
+          {
+            id: 'msg-1',
+            source: 'user',
+            text: 'Queued text',
+            timestamp: '2024-01-01T00:00:00.000Z',
+            order: 1_000_000_000,
+          },
+        ],
+        queuedMessages: toQueuedMessagesMap([
+          {
+            id: 'msg-1',
+            text: 'Queued text',
+            timestamp: '2024-01-01T00:00:00.000Z',
+            sessionId: 'session-A',
+            settings: {
+              selectedModel: null,
+              reasoningEffort: null,
+              thinkingEnabled: false,
+              planModeEnabled: false,
+            },
+          },
+        ]),
+      };
+
+      const acceptedState = chatReducer(state, {
+        type: 'MESSAGE_STATE_CHANGED',
+        payload: {
+          id: 'msg-1',
+          newState: MessageState.ACCEPTED,
+          userMessage: {
+            text: 'Queued text',
+            timestamp: '2024-01-01T00:00:00.000Z',
+          },
+        },
+      });
+
+      const rejectedState = chatReducer(acceptedState, {
+        type: 'MESSAGE_STATE_CHANGED',
+        payload: {
+          id: 'msg-1',
+          newState: MessageState.REJECTED,
+          errorMessage: 'Rejected',
+        },
+      });
+
+      expect(rejectedState.lastRejectedMessage).toMatchObject({
+        text: 'Queued text',
+        error: 'Rejected',
+        sessionId: 'session-A',
       });
     });
 

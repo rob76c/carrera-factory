@@ -10,6 +10,10 @@ export type BuildPromptInput = {
     name: string;
     description?: string | null;
     runScriptPort?: number | null;
+    parentWorkspaceId?: string | null;
+    parentWorkspaceName?: string | null;
+    parentProjectName?: string | null;
+    reportBackOn?: string | null;
   };
   project?: { githubOwner?: string | null } | null;
   claudeMdContent?: string | null;
@@ -20,6 +24,25 @@ export type BuildPromptResult = {
   systemPrompt: string | undefined;
   injectedBranchRename: boolean;
 };
+
+export function buildChildWorkspaceContext(input: {
+  parentWorkspaceName?: string | null;
+  parentProjectName?: string | null;
+  reportBackOn?: string | null;
+}): string {
+  const parentName = input.parentWorkspaceName ?? 'unknown';
+  const projectName = input.parentProjectName ?? 'unknown project';
+  const reportBackOn = input.reportBackOn?.trim();
+  let context =
+    `## Child Workspace Context\n` +
+    `You are working in a child workspace created by the parent workspace "${parentName}" (project: ${projectName}). ` +
+    `When you have completed your task or reached a significant milestone — especially if you produced a PR, a finding, or are blocked — ` +
+    `use the \`send_message_to_parent\` tool to report back. Include a brief summary of what was done and any next steps the parent workspace should be aware of.`;
+  if (reportBackOn) {
+    context += `\nReport back when: ${reportBackOn}`;
+  }
+  return `${context}\n`;
+}
 
 export class SessionPromptBuilder {
   /**
@@ -80,6 +103,15 @@ export class SessionPromptBuilder {
     if (workspace.runScriptPort) {
       const devServerInfo = `\n\n## Dev Server\nA development server is running at http://localhost:${workspace.runScriptPort}. You can use Playwright MCP tools (browser_navigate, browser_screenshot) to capture screenshots of UI changes.\n`;
       systemPrompt = (systemPrompt ?? '') + devServerInfo;
+    }
+
+    if (workspace.parentWorkspaceId) {
+      const childContext = buildChildWorkspaceContext({
+        parentWorkspaceName: workspace.parentWorkspaceName,
+        parentProjectName: workspace.parentProjectName,
+        reportBackOn: workspace.reportBackOn,
+      });
+      systemPrompt = `${systemPrompt ?? ''}\n\n${childContext}`;
     }
 
     return { workflowPrompt, systemPrompt, injectedBranchRename };

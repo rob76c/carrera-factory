@@ -8,7 +8,7 @@
 import { createLogger } from '@/backend/services/logger.service';
 import type { AgentContentItem } from '@/shared/acp-protocol';
 import type { MessageAttachment } from '@/shared/acp-protocol/protocol';
-import { resolveAttachmentContentType } from './attachment-utils';
+import { resolveAttachmentContentType, stripBase64LineEndings } from './attachment-utils';
 
 const logger = createLogger('attachment-processing');
 
@@ -20,10 +20,21 @@ function isSupportedImageMediaType(type: string): type is SupportedImageMediaTyp
 }
 
 /**
+ * Thrown when an attachment is structurally invalid and cannot be dispatched.
+ * This is a permanent error — retrying will always fail.
+ */
+export class PermanentAttachmentError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PermanentAttachmentError';
+  }
+}
+
+/**
  * Thrown when an image attachment has an unsupported MIME type.
  * This is a permanent error — retrying will always fail.
  */
-export class UnsupportedImageTypeError extends Error {
+export class UnsupportedImageTypeError extends PermanentAttachmentError {
   constructor(type: string) {
     super(
       `Unsupported image format "${type || '(unknown)'}". Supported formats: JPEG, PNG, GIF, WebP.`
@@ -38,26 +49,28 @@ export class UnsupportedImageTypeError extends Error {
 
 /**
  * Validate that an attachment has required data.
- * @throws Error if attachment is missing data
+ * @throws PermanentAttachmentError if attachment is missing data
  */
 function validateAttachmentHasData(attachment: MessageAttachment): void {
   if (!attachment.data) {
     logger.error('[Chat WS] Attachment missing data', { attachmentId: attachment.id });
-    throw new Error(`Attachment "${attachment.name}" is missing data`);
+    throw new PermanentAttachmentError(`Attachment "${attachment.name}" is missing data`);
   }
 }
 
 /**
  * Validate base64 encoding for image attachments.
- * @throws Error if attachment has invalid base64 data
+ * @throws PermanentAttachmentError if attachment has invalid base64 data
  */
 function validateImageBase64(attachment: MessageAttachment): void {
+  const normalizedData = stripBase64LineEndings(attachment.data);
+
   // Basic base64 check - alphanumeric, +, /, =
-  if (!/^[A-Za-z0-9+/=]+$/.test(attachment.data)) {
+  if (!(normalizedData && /^[A-Za-z0-9+/=]+$/.test(normalizedData))) {
     logger.error('[Chat WS] Invalid base64 data in attachment', {
       attachmentId: attachment.id,
     });
-    throw new Error(`Attachment "${attachment.name}" has invalid image data`);
+    throw new PermanentAttachmentError(`Attachment "${attachment.name}" has invalid image data`);
   }
 }
 
@@ -78,7 +91,8 @@ function validateImageMediaType(attachment: MessageAttachment): void {
 /**
  * Validate an attachment before processing.
  * Checks for required data and validates base64 encoding for images.
- * @throws Error if attachment is invalid
+ * @throws PermanentAttachmentError if attachment is structurally invalid
+ * @throws UnsupportedImageTypeError if the MIME type is not accepted
  */
 export function validateAttachment(attachment: MessageAttachment): void {
   validateAttachmentHasData(attachment);
@@ -181,7 +195,7 @@ export function buildContentArray(
       source: {
         type: 'base64',
         media_type: attachment.type as SupportedImageMediaType,
-        data: attachment.data,
+        data: stripBase64LineEndings(attachment.data),
       },
     };
     content.push(imageContent);

@@ -1,0 +1,179 @@
+// @vitest-environment jsdom
+
+import { createElement } from 'react';
+import { flushSync } from 'react-dom';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ServerWorkspace } from '@/client/components/use-workspace-list-state';
+import { WorkspaceItemContent } from './workspace-item-content';
+
+vi.mock('@phosphor-icons/react', () => ({
+  ClockIcon: () => null,
+  DotOutlineIcon: () => null,
+  GitBranchIcon: () => null,
+  GitPullRequestIcon: () => null,
+  TreeStructureIcon: () => null,
+}));
+
+vi.mock('@/client/components/workspace-status-icon', () => ({
+  WorkspaceStatusIcon: () => createElement('span', null),
+}));
+
+const baseWorkspace = {
+  id: 'ws-1',
+  name: 'Workspace',
+  branchName: null,
+  prUrl: null,
+  prNumber: null,
+  prState: 'NONE',
+  prCiStatus: 'UNKNOWN',
+  isWorking: false,
+  sessionSummaries: [],
+  gitStats: null,
+  lastActivityAt: null,
+  ratchetEnabled: true,
+  ratchetState: 'IDLE',
+  sidebarStatus: { activityState: 'IDLE', ciState: 'NONE' },
+  ratchetButtonAnimated: false,
+  flowPhase: 'NO_PR',
+  ciObservation: 'NOT_FETCHED',
+  statusReason: null,
+  runScriptStatus: 'IDLE',
+  pendingRequestType: null,
+  cachedKanbanColumn: null,
+  stateComputedAt: null,
+  snapshotComputedAt: null,
+  githubIssueNumber: null,
+  githubIssueUrl: null,
+  linearIssueId: null,
+  linearIssueIdentifier: null,
+  linearIssueUrl: null,
+} as unknown as ServerWorkspace;
+
+function renderContent(
+  workspace: ServerWorkspace,
+  {
+    onOpenPr,
+    onOpenIssue,
+    onParentPointerUp,
+  }: {
+    onOpenPr?: () => void;
+    onOpenIssue?: () => void;
+    onParentPointerUp?: () => void;
+  } = {}
+): { container: HTMLDivElement; root: Root } {
+  const container = document.createElement('div');
+  document.body.appendChild(container);
+  const root = createRoot(container);
+
+  flushSync(() => {
+    root.render(
+      createElement(
+        'div',
+        { onPointerUp: onParentPointerUp },
+        createElement(WorkspaceItemContent, { workspace, onOpenPr, onOpenIssue })
+      )
+    );
+  });
+
+  return { container, root };
+}
+
+beforeEach(() => {
+  Object.defineProperty(globalThis, 'IS_REACT_ACT_ENVIRONMENT', {
+    configurable: true,
+    writable: true,
+    value: true,
+  });
+});
+
+afterEach(() => {
+  document.body.innerHTML = '';
+  vi.clearAllMocks();
+});
+
+describe('WorkspaceItemContent', () => {
+  it('opens a pull request without propagating pointerup to its parent', () => {
+    const onOpenPr = vi.fn();
+    const onParentPointerUp = vi.fn();
+    const { container, root } = renderContent(
+      {
+        ...baseWorkspace,
+        prUrl: 'https://github.com/example/repo/pull/42',
+        prNumber: 42,
+        prState: 'OPEN',
+      },
+      { onOpenPr, onParentPointerUp }
+    );
+    const button = container.querySelector('button');
+
+    expect(button).not.toBeNull();
+    button?.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));
+    button?.click();
+
+    expect(onParentPointerUp).not.toHaveBeenCalled();
+    expect(onOpenPr).toHaveBeenCalledOnce();
+
+    root.unmount();
+    container.remove();
+  });
+
+  it('opens an issue without propagating pointerup to its parent', () => {
+    const onOpenIssue = vi.fn();
+    const onParentPointerUp = vi.fn();
+    const { container, root } = renderContent(
+      {
+        ...baseWorkspace,
+        githubIssueNumber: 1905,
+        githubIssueUrl: 'https://github.com/example/repo/issues/1905',
+      },
+      { onOpenIssue, onParentPointerUp }
+    );
+    const button = container.querySelector('button');
+
+    expect(button).not.toBeNull();
+    button?.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));
+    button?.click();
+
+    expect(onParentPointerUp).not.toHaveBeenCalled();
+    expect(onOpenIssue).toHaveBeenCalledOnce();
+
+    root.unmount();
+    container.remove();
+  });
+
+  it('hides default idle status reasons', () => {
+    const { container, root } = renderContent({
+      ...baseWorkspace,
+      statusReason: {
+        code: 'READY_FOR_NEXT_PROMPT',
+        label: 'Ready for next prompt',
+        tone: 'neutral',
+        needsUser: true,
+      },
+    });
+
+    expect(container.textContent).toContain('Workspace');
+    expect(container.textContent).not.toContain('Ready for next prompt');
+
+    root.unmount();
+    container.remove();
+  });
+
+  it('renders actionable status reasons', () => {
+    const { container, root } = renderContent({
+      ...baseWorkspace,
+      statusReason: {
+        code: 'NEEDS_ANSWER',
+        label: 'Needs your answer',
+        tone: 'attention',
+        needsUser: true,
+      },
+    });
+
+    expect(container.textContent).toContain('Needs your answer');
+
+    root.unmount();
+    container.remove();
+  });
+});

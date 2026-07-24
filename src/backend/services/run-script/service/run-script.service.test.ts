@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { FactoryConfigService } from '@/backend/services/factory-config.service';
+import { FactoryConfigService } from './factory-config.service';
 
 const mockSpawn = vi.fn();
 const mockTreeKill = vi.fn();
@@ -21,6 +21,20 @@ const mockCleanupTunnels = vi.fn();
 const mockCleanupTunnelsSync = vi.fn();
 const mockReconcileWorkspaceCommandCache = vi.fn();
 
+const MockRunScriptStateMachineError = vi.hoisted(
+  () =>
+    class extends Error {
+      constructor(
+        readonly workspaceId: string,
+        readonly fromStatus: string,
+        readonly toStatus: string
+      ) {
+        super(`Invalid run script state transition: ${fromStatus} -> ${toStatus}`);
+        this.name = 'RunScriptStateMachineError';
+      }
+    }
+);
+
 vi.mock('node:child_process', () => ({
   spawn: (...args: unknown[]) => mockSpawn(...args),
 }));
@@ -30,12 +44,13 @@ vi.mock('tree-kill', () => ({
 }));
 
 vi.mock('@/backend/services/workspace', () => ({
-  workspaceAccessor: {
+  workspaceDataService: {
     findById: (...args: unknown[]) => mockFindById(...args),
   },
 }));
 
 vi.mock('./run-script-state-machine.service', () => ({
+  RunScriptStateMachineError: MockRunScriptStateMachineError,
   runScriptStateMachine: {
     start: (...args: unknown[]) => mockStart(...args),
     beginStopping: (...args: unknown[]) => mockBeginStopping(...args),
@@ -48,13 +63,13 @@ vi.mock('./run-script-state-machine.service', () => ({
   },
 }));
 
-vi.mock('@/backend/services/port-allocation.service', () => ({
+vi.mock('./port-allocation.service', () => ({
   PortAllocationService: {
     findFreePort: (...args: unknown[]) => mockFindFreePort(...args),
   },
 }));
 
-vi.mock('@/backend/services/run-script-proxy.service', () => ({
+vi.mock('./run-script-proxy.service', () => ({
   runScriptProxyService: {
     ensureTunnel: (...args: unknown[]) => mockEnsureTunnel(...args),
     stopTunnel: (...args: unknown[]) => mockStopTunnel(...args),
@@ -73,7 +88,7 @@ vi.mock('@/backend/services/logger.service', () => ({
   }),
 }));
 
-vi.mock('@/backend/services/run-script-config-persistence.service', () => ({
+vi.mock('./run-script-config-persistence.service', () => ({
   runScriptConfigPersistenceService: {
     reconcileWorkspaceCommandCache: (...args: unknown[]) =>
       mockReconcileWorkspaceCommandCache(...args),
@@ -85,6 +100,7 @@ import { RunScriptService } from './run-script.service';
 class FakeChildProcess extends EventEmitter {
   pid: number | undefined;
   exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
   killed = false;
   stdout = new EventEmitter();
   stderr = new EventEmitter();
@@ -112,6 +128,13 @@ type ExitHandlerCapable = {
     code: number | null,
     signal: string | null
   ) => Promise<void>;
+  runningProcesses: Map<string, { pid: number }>;
+};
+
+const createTrackedExitService = (childProcess: { pid: number }): ExitHandlerCapable => {
+  const service = new RunScriptService() as unknown as ExitHandlerCapable;
+  service.runningProcesses.set('ws-1', childProcess);
+  return service;
 };
 
 type StopHandlerCapable = {
@@ -148,9 +171,10 @@ describe('RunScriptService.handleProcessExit', () => {
     mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'STOPPING' });
     mockCompleteStopping.mockResolvedValue(undefined);
 
-    const service = new RunScriptService() as unknown as ExitHandlerCapable;
+    const childProcess = { pid: 12_345 };
+    const service = createTrackedExitService(childProcess);
 
-    await service.handleProcessExit('ws-1', { pid: 12_345 }, 12_345, 0, null);
+    await service.handleProcessExit('ws-1', childProcess, 12_345, 0, null);
 
     expect(mockFindById).toHaveBeenCalledWith('ws-1');
     expect(mockCompleteStopping).toHaveBeenCalledWith('ws-1');
@@ -158,16 +182,22 @@ describe('RunScriptService.handleProcessExit', () => {
     expect(mockMarkFailed).not.toHaveBeenCalled();
   });
 
-  it('swallows completeStopping errors for STOPPING exits', async () => {
+  it('retries completeStopping persistence failures for STOPPING exits', async () => {
     mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'STOPPING' });
-    mockCompleteStopping.mockRejectedValue(new Error('tree-kill failed'));
+    let attempts = 0;
+    mockCompleteStopping.mockImplementation(() => {
+      attempts += 1;
+      return attempts === 1
+        ? Promise.reject(new Error('database unavailable'))
+        : Promise.resolve(undefined);
+    });
 
-    const service = new RunScriptService() as unknown as ExitHandlerCapable;
+    const childProcess = { pid: 12_345 };
+    const service = createTrackedExitService(childProcess);
 
-    await expect(
-      service.handleProcessExit('ws-1', { pid: 12_345 }, 12_345, 1, 'SIGTERM')
-    ).resolves.toBe(undefined);
-    expect(mockCompleteStopping).toHaveBeenCalledWith('ws-1');
+    await service.handleProcessExit('ws-1', childProcess, 12_345, 1, 'SIGTERM');
+
+    expect(mockCompleteStopping).toHaveBeenCalledTimes(2);
     expect(mockMarkCompleted).not.toHaveBeenCalled();
     expect(mockMarkFailed).not.toHaveBeenCalled();
   });
@@ -175,17 +205,32 @@ describe('RunScriptService.handleProcessExit', () => {
   it('ignores stale process exits when a newer process is tracked', async () => {
     const service = new RunScriptService() as unknown as ExitHandlerCapable & {
       runningProcesses: Map<string, { pid: number }>;
-      outputListeners: Map<string, Set<(data: string) => void>>;
+      appendOutput: (workspaceId: string, output: string) => void;
+      subscribeToOutput: (workspaceId: string, listener: (data: string) => void) => () => void;
     };
     const activeProcess = { pid: 22_222 };
+    const listener = vi.fn();
     service.runningProcesses.set('ws-1', activeProcess);
-    service.outputListeners.set('ws-1', new Set([(data: string) => data]));
+    service.subscribeToOutput('ws-1', listener);
 
     const staleProcess = { pid: 11_111 };
     await service.handleProcessExit('ws-1', staleProcess, 11_111, 0, null);
+    service.appendOutput('ws-1', 'still subscribed');
 
     expect(service.runningProcesses.get('ws-1')).toBe(activeProcess);
-    expect(service.outputListeners.has('ws-1')).toBe(true);
+    expect(listener).toHaveBeenCalledWith('still subscribed');
+    expect(mockMarkCompleted).not.toHaveBeenCalled();
+    expect(mockMarkFailed).not.toHaveBeenCalled();
+    expect(mockStopTunnel).not.toHaveBeenCalled();
+  });
+
+  it('ignores an untracked old exit while a new generation is starting', async () => {
+    mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'STARTING' });
+    const service = new RunScriptService() as unknown as ExitHandlerCapable;
+
+    await service.handleProcessExit('ws-1', { pid: 11_111 }, 11_111, 0, null);
+
+    expect(mockFindById).not.toHaveBeenCalled();
     expect(mockMarkCompleted).not.toHaveBeenCalled();
     expect(mockMarkFailed).not.toHaveBeenCalled();
     expect(mockStopTunnel).not.toHaveBeenCalled();
@@ -428,6 +473,28 @@ describe('RunScriptService.registerProcessHandlers', () => {
     expect(mockMarkFailed).toHaveBeenCalledWith('ws-1');
   });
 
+  it('ignores a late spawn error from a replaced process', async () => {
+    const service = new RunScriptService() as unknown as {
+      registerProcessHandlers: (
+        workspaceId: string,
+        childProcess: FakeChildProcess,
+        pid: number
+      ) => void;
+      runningProcesses: Map<string, FakeChildProcess>;
+    };
+    const previousProcess = new FakeChildProcess(12_345);
+    const replacementProcess = new FakeChildProcess(54_321);
+    service.runningProcesses.set('ws-1', previousProcess);
+    service.registerProcessHandlers('ws-1', previousProcess, 12_345);
+    service.runningProcesses.set('ws-1', replacementProcess);
+
+    previousProcess.emit('error', new Error('late spawn failure'));
+    await flushMicrotasks();
+
+    expect(service.runningProcesses.get('ws-1')).toBe(replacementProcess);
+    expect(mockMarkFailed).not.toHaveBeenCalled();
+  });
+
   it('swallows exit-handler failures when handleProcessExit rejects', async () => {
     const service = new RunScriptService() as unknown as {
       registerProcessHandlers: (
@@ -506,6 +573,66 @@ describe('RunScriptService.stopRunScript', () => {
     expect(mockTreeKill).toHaveBeenCalledWith(12_345, 'SIGTERM', expect.any(Function));
     expect(mockCompleteStopping).toHaveBeenCalledWith('ws-1');
     expect(mockFindById).toHaveBeenNthCalledWith(2, 'ws-1');
+  });
+
+  it('clears output listeners when controlled tree-kill completes before exit', async () => {
+    mockFindById.mockResolvedValue({
+      id: 'ws-1',
+      runScriptStatus: 'RUNNING',
+      runScriptPid: 12_345,
+      runScriptCleanupCommand: null,
+      worktreePath: '/tmp/ws-1',
+      runScriptPort: null,
+    });
+    mockBeginStopping.mockResolvedValue(undefined);
+    mockCompleteStopping.mockResolvedValue(undefined);
+    const service = new RunScriptService() as unknown as StopHandlerCapable & {
+      stopRunScript: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
+      appendOutput: (workspaceId: string, output: string) => void;
+      subscribeToOutput: (workspaceId: string, listener: (data: string) => void) => () => void;
+    };
+    const childProcess = { pid: 12_345 };
+    const listener = vi.fn();
+    service.runningProcesses.set('ws-1', childProcess);
+    service.subscribeToOutput('ws-1', listener);
+
+    const result = await service.stopRunScript('ws-1');
+    service.appendOutput('ws-1', 'after stop');
+
+    expect(result).toEqual({ success: true });
+    expect(service.runningProcesses.has('ws-1')).toBe(false);
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it('retains controlled-stop evidence when completing STOPPING fails', async () => {
+    mockFindById
+      .mockResolvedValueOnce({
+        id: 'ws-1',
+        runScriptStatus: 'RUNNING',
+        runScriptPid: 12_345,
+        runScriptCleanupCommand: null,
+        worktreePath: '/tmp/ws-1',
+        runScriptPort: null,
+      })
+      .mockResolvedValueOnce({ id: 'ws-1', runScriptStatus: 'STOPPING' });
+    mockBeginStopping.mockResolvedValue(undefined);
+    mockCompleteStopping.mockRejectedValue(new Error('database unavailable'));
+    const service = new RunScriptService() as unknown as StopHandlerCapable & {
+      stopRunScript: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
+      appendOutput: (workspaceId: string, output: string) => void;
+      subscribeToOutput: (workspaceId: string, listener: (data: string) => void) => () => void;
+    };
+    const childProcess = { pid: 12_345 };
+    const listener = vi.fn();
+    service.runningProcesses.set('ws-1', childProcess);
+    service.subscribeToOutput('ws-1', listener);
+
+    const result = await service.stopRunScript('ws-1');
+    service.appendOutput('ws-1', 'still retained');
+
+    expect(result).toEqual({ success: false, error: 'database unavailable' });
+    expect(service.runningProcesses.get('ws-1')).toBe(childProcess);
+    expect(listener).toHaveBeenCalledWith('still retained');
   });
 
   it('returns error when workspace not found', async () => {
@@ -600,6 +727,29 @@ describe('RunScriptService.stopRunScript', () => {
     const result = await service.stopRunScript('ws-1');
 
     expect(result).toEqual({ success: false, error: 'No run script is running' });
+  });
+
+  it('returns success and transitions to IDLE when stopping STARTING with no process', async () => {
+    mockFindById.mockResolvedValue({
+      id: 'ws-1',
+      runScriptStatus: 'STARTING',
+      runScriptPid: null,
+      runScriptCommand: 'pnpm dev',
+      runScriptPostRunCommand: null,
+      runScriptCleanupCommand: null,
+      worktreePath: '/tmp/ws-1',
+      runScriptPort: null,
+    });
+    mockBeginStopping.mockResolvedValue(undefined);
+    mockCompleteStopping.mockResolvedValue(undefined);
+
+    const service = new RunScriptService();
+    const result = await service.stopRunScript('ws-1');
+
+    expect(result).toEqual({ success: true });
+    expect(mockBeginStopping).toHaveBeenCalledWith('ws-1');
+    expect(mockCompleteStopping).toHaveBeenCalledWith('ws-1');
+    expect(mockTreeKill).not.toHaveBeenCalled();
   });
 
   it('handles beginStopping race where state moved to COMPLETED', async () => {
@@ -758,11 +908,13 @@ describe('RunScriptService.stopRunScript', () => {
     const mockProcess: {
       pid: number;
       exitCode: number | null;
+      signalCode: NodeJS.Signals | null;
       once: (event: string, handler: (code: number | null, signal: string | null) => void) => void;
       off: (event: string, handler: (code: number | null, signal: string | null) => void) => void;
     } = {
       pid: 12_345,
       exitCode: null,
+      signalCode: null,
       once: vi.fn(
         (event: string, handler: (code: number | null, signal: string | null) => void) => {
           if (event === 'exit') {
@@ -806,8 +958,9 @@ describe('RunScriptService.handleProcessExit edge cases', () => {
     mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'RUNNING' });
     mockMarkCompleted.mockResolvedValue(undefined);
 
-    const service = new RunScriptService() as unknown as ExitHandlerCapable;
-    await service.handleProcessExit('ws-1', { pid: 12_345 }, 12_345, 0, null);
+    const childProcess = { pid: 12_345 };
+    const service = createTrackedExitService(childProcess);
+    await service.handleProcessExit('ws-1', childProcess, 12_345, 0, null);
 
     expect(mockMarkCompleted).toHaveBeenCalledWith('ws-1');
     expect(mockMarkFailed).not.toHaveBeenCalled();
@@ -817,8 +970,9 @@ describe('RunScriptService.handleProcessExit edge cases', () => {
     mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'RUNNING' });
     mockMarkFailed.mockResolvedValue(undefined);
 
-    const service = new RunScriptService() as unknown as ExitHandlerCapable;
-    await service.handleProcessExit('ws-1', { pid: 12_345 }, 12_345, 1, null);
+    const childProcess = { pid: 12_345 };
+    const service = createTrackedExitService(childProcess);
+    await service.handleProcessExit('ws-1', childProcess, 12_345, 1, null);
 
     expect(mockMarkFailed).toHaveBeenCalledWith('ws-1');
     expect(mockMarkCompleted).not.toHaveBeenCalled();
@@ -828,8 +982,9 @@ describe('RunScriptService.handleProcessExit edge cases', () => {
     mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'RUNNING' });
     mockMarkFailed.mockResolvedValue(undefined);
 
-    const service = new RunScriptService() as unknown as ExitHandlerCapable;
-    await service.handleProcessExit('ws-1', { pid: 12_345 }, 12_345, null, 'SIGKILL');
+    const childProcess = { pid: 12_345 };
+    const service = createTrackedExitService(childProcess);
+    await service.handleProcessExit('ws-1', childProcess, 12_345, null, 'SIGKILL');
 
     expect(mockMarkFailed).toHaveBeenCalledWith('ws-1');
   });
@@ -837,8 +992,9 @@ describe('RunScriptService.handleProcessExit edge cases', () => {
   it('skips transition when already in IDLE state', async () => {
     mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'IDLE' });
 
-    const service = new RunScriptService() as unknown as ExitHandlerCapable;
-    await service.handleProcessExit('ws-1', { pid: 12_345 }, 12_345, 0, null);
+    const childProcess = { pid: 12_345 };
+    const service = createTrackedExitService(childProcess);
+    await service.handleProcessExit('ws-1', childProcess, 12_345, 0, null);
 
     expect(mockMarkCompleted).not.toHaveBeenCalled();
     expect(mockMarkFailed).not.toHaveBeenCalled();
@@ -848,8 +1004,9 @@ describe('RunScriptService.handleProcessExit edge cases', () => {
   it('skips transition when already in COMPLETED state', async () => {
     mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'COMPLETED' });
 
-    const service = new RunScriptService() as unknown as ExitHandlerCapable;
-    await service.handleProcessExit('ws-1', { pid: 12_345 }, 12_345, 0, null);
+    const childProcess = { pid: 12_345 };
+    const service = createTrackedExitService(childProcess);
+    await service.handleProcessExit('ws-1', childProcess, 12_345, 0, null);
 
     expect(mockMarkCompleted).not.toHaveBeenCalled();
     expect(mockMarkFailed).not.toHaveBeenCalled();
@@ -858,21 +1015,174 @@ describe('RunScriptService.handleProcessExit edge cases', () => {
   it('skips transition when already in FAILED state', async () => {
     mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'FAILED' });
 
-    const service = new RunScriptService() as unknown as ExitHandlerCapable;
-    await service.handleProcessExit('ws-1', { pid: 12_345 }, 12_345, 1, null);
+    const childProcess = { pid: 12_345 };
+    const service = createTrackedExitService(childProcess);
+    await service.handleProcessExit('ws-1', childProcess, 12_345, 1, null);
 
     expect(mockMarkCompleted).not.toHaveBeenCalled();
     expect(mockMarkFailed).not.toHaveBeenCalled();
   });
 
-  it('swallows state machine errors during exit handling', async () => {
+  it('retries a database failure before persisting a successful exit', async () => {
     mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'RUNNING' });
-    mockMarkCompleted.mockRejectedValue(new Error('CAS conflict'));
+    mockMarkCompleted
+      .mockRejectedValueOnce(new Error('database unavailable'))
+      .mockResolvedValueOnce(undefined);
+    const childProcess = { pid: 12_345 };
+    const service = new RunScriptService() as unknown as ExitHandlerCapable & StopHandlerCapable;
+    service.runningProcesses.set('ws-1', childProcess);
 
-    const service = new RunScriptService() as unknown as ExitHandlerCapable;
+    await service.handleProcessExit('ws-1', childProcess, 12_345, 0, null);
+
+    expect(mockMarkCompleted).toHaveBeenCalledTimes(2);
+    expect(service.runningProcesses.has('ws-1')).toBe(false);
+  });
+
+  it('escalates exhausted database failures and retains lifecycle evidence', async () => {
+    mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'RUNNING' });
+    mockMarkFailed.mockRejectedValue(new Error('database unavailable'));
+    const childProcess = { pid: 12_345 };
+    const service = new RunScriptService() as unknown as ExitHandlerCapable &
+      StopHandlerCapable & {
+        appendOutput: (workspaceId: string, output: string) => void;
+        subscribeToOutput: (workspaceId: string, listener: (data: string) => void) => () => void;
+      };
+    const listener = vi.fn();
+    service.runningProcesses.set('ws-1', childProcess);
+    service.postRunProcesses.set('ws-1', { pid: 888 } as never);
+    service.subscribeToOutput('ws-1', listener);
+
+    await expect(service.handleProcessExit('ws-1', childProcess, 12_345, 1, null)).rejects.toThrow(
+      'database unavailable'
+    );
+    service.appendOutput('ws-1', 'still retained');
+
+    expect(mockMarkFailed).toHaveBeenCalledTimes(3);
+    expect(service.runningProcesses.get('ws-1')).toBe(childProcess);
+    expect(service.postRunProcesses.has('ws-1')).toBe(true);
+    expect(mockTreeKill).not.toHaveBeenCalled();
+    expect(mockStopTunnel).not.toHaveBeenCalled();
+    expect(listener).toHaveBeenCalledWith('still retained');
+  });
+
+  it('recognizes a durable terminal state after a post-write error', async () => {
+    mockFindById
+      .mockResolvedValueOnce({ id: 'ws-1', runScriptStatus: 'RUNNING' })
+      .mockResolvedValueOnce({ id: 'ws-1', runScriptStatus: 'COMPLETED' });
+    mockMarkCompleted.mockRejectedValueOnce(new Error('post-write fetch failed'));
+    const childProcess = { pid: 12_345 };
+    const service = createTrackedExitService(childProcess);
+
+    await service.handleProcessExit('ws-1', childProcess, 12_345, 0, null);
+
+    expect(mockMarkCompleted).toHaveBeenCalledTimes(1);
+    expect(mockFindById).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops retrying persistence when a new generation takes ownership', async () => {
+    const exitingProcess = { pid: 12_345 };
+    const newerProcess = { pid: 54_321 };
+    const service = new RunScriptService() as unknown as ExitHandlerCapable & StopHandlerCapable;
+    service.runningProcesses.set('ws-1', exitingProcess);
+    mockFindById
+      .mockResolvedValueOnce({ id: 'ws-1', runScriptStatus: 'RUNNING' })
+      .mockResolvedValue({ id: 'ws-1', runScriptStatus: 'STARTING' });
+    mockMarkCompleted.mockImplementationOnce(() => {
+      service.runningProcesses.set('ws-1', newerProcess);
+      return Promise.reject(new Error('post-write fetch failed'));
+    });
+
+    await service.handleProcessExit('ws-1', exitingProcess, 12_345, 0, null);
+
+    expect(mockMarkCompleted).toHaveBeenCalledTimes(1);
+    expect(mockFindById).toHaveBeenCalledTimes(1);
+    expect(service.runningProcesses.get('ws-1')).toBe(newerProcess);
+    expect(mockStopTunnel).not.toHaveBeenCalled();
+  });
+
+  it('accepts a state-machine race only after confirming a terminal state', async () => {
+    mockFindById
+      .mockResolvedValueOnce({ id: 'ws-1', runScriptStatus: 'RUNNING' })
+      .mockResolvedValueOnce({ id: 'ws-1', runScriptStatus: 'COMPLETED' });
+    mockMarkCompleted.mockRejectedValue(
+      new MockRunScriptStateMachineError('ws-1', 'COMPLETED', 'COMPLETED')
+    );
+
+    const childProcess = { pid: 12_345 };
+    const service = createTrackedExitService(childProcess);
+
     await expect(
-      service.handleProcessExit('ws-1', { pid: 12_345 }, 12_345, 0, null)
+      service.handleProcessExit('ws-1', childProcess, 12_345, 0, null)
     ).resolves.toBeUndefined();
+
+    expect(mockFindById).toHaveBeenCalledTimes(2);
+    expect(mockMarkCompleted).toHaveBeenCalledTimes(1);
+  });
+
+  it('escalates a state-machine error when refreshed state remains active', async () => {
+    mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'RUNNING' });
+    mockMarkCompleted.mockRejectedValue(
+      new MockRunScriptStateMachineError('ws-1', 'RUNNING', 'COMPLETED')
+    );
+
+    const childProcess = { pid: 12_345 };
+    const service = createTrackedExitService(childProcess);
+
+    await expect(service.handleProcessExit('ws-1', childProcess, 12_345, 0, null)).rejects.toThrow(
+      MockRunScriptStateMachineError
+    );
+
+    expect(mockMarkCompleted).toHaveBeenCalledTimes(3);
+    expect(mockFindById).toHaveBeenCalledTimes(6);
+  });
+
+  it('does not clean up a newer process that starts while exit persistence is pending', async () => {
+    let resolveTransition: (() => void) | undefined;
+    mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'RUNNING' });
+    mockMarkCompleted.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveTransition = resolve;
+        })
+    );
+    const exitingProcess = { pid: 12_345 };
+    const newerProcess = { pid: 54_321 };
+    const service = new RunScriptService() as unknown as ExitHandlerCapable & StopHandlerCapable;
+    service.runningProcesses.set('ws-1', exitingProcess);
+
+    const exitPromise = service.handleProcessExit('ws-1', exitingProcess, 12_345, 0, null);
+    await vi.waitFor(() => expect(resolveTransition).toBeDefined());
+    service.runningProcesses.set('ws-1', newerProcess);
+    resolveTransition?.();
+    await exitPromise;
+
+    expect(service.runningProcesses.get('ws-1')).toBe(newerProcess);
+    expect(mockStopTunnel).not.toHaveBeenCalled();
+  });
+
+  it('does not stop a newer tunnel when ownership changes during postRun cleanup', async () => {
+    let completeTreeKill: ((error: Error | null) => void) | undefined;
+    mockFindById.mockResolvedValue({ id: 'ws-1', runScriptStatus: 'RUNNING' });
+    mockMarkCompleted.mockResolvedValue(undefined);
+    mockTreeKill.mockImplementation(
+      (_pid: number, _signal: string, callback: (error: Error | null) => void) => {
+        completeTreeKill = callback;
+      }
+    );
+    const exitingProcess = { pid: 12_345 };
+    const newerProcess = { pid: 54_321 };
+    const service = new RunScriptService() as unknown as ExitHandlerCapable & StopHandlerCapable;
+    service.runningProcesses.set('ws-1', exitingProcess);
+    service.postRunProcesses.set('ws-1', { pid: 888 } as never);
+
+    const exitPromise = service.handleProcessExit('ws-1', exitingProcess, 12_345, 0, null);
+    await vi.waitFor(() => expect(completeTreeKill).toBeDefined());
+    service.runningProcesses.set('ws-1', newerProcess);
+    completeTreeKill?.(null);
+    await exitPromise;
+
+    expect(service.runningProcesses.get('ws-1')).toBe(newerProcess);
+    expect(mockStopTunnel).not.toHaveBeenCalled();
   });
 });
 
@@ -1022,16 +1332,23 @@ describe('RunScriptService.subscribeToOutput', () => {
     expect(listener).toHaveBeenCalledTimes(1);
   });
 
-  it('cleans up listener set when last listener unsubscribes', () => {
+  it('allows resubscribe after the last listener unsubscribes', () => {
     const service = new RunScriptService();
-    const outputListeners = (service as unknown as { outputListeners: Map<string, Set<unknown>> })
-      .outputListeners;
+    const appendOutput = (
+      service as unknown as { appendOutput: (id: string, data: string) => void }
+    ).appendOutput.bind(service);
+    const firstListener = vi.fn();
+    const secondListener = vi.fn();
 
-    const unsub = service.subscribeToOutput('ws-1', vi.fn());
-    expect(outputListeners.has('ws-1')).toBe(true);
+    const unsub = service.subscribeToOutput('ws-1', firstListener);
+    appendOutput('ws-1', 'first');
 
     unsub();
-    expect(outputListeners.has('ws-1')).toBe(false);
+    service.subscribeToOutput('ws-1', secondListener);
+    appendOutput('ws-1', 'second');
+
+    expect(firstListener).toHaveBeenCalledTimes(1);
+    expect(secondListener).toHaveBeenCalledWith('second');
   });
 });
 
@@ -1136,6 +1453,26 @@ describe('RunScriptService.killPostRunProcess', () => {
 
     expect(service.postRunProcesses.has('ws-1')).toBe(false);
   });
+
+  it('does not delete a newer postRun process after the previous kill completes', async () => {
+    let completeTreeKill: ((error: Error | null) => void) | undefined;
+    mockTreeKill.mockImplementation(
+      (_pid: number, _signal: string, callback: (error: Error | null) => void) => {
+        completeTreeKill = callback;
+      }
+    );
+    const oldProcess = { pid: 888 };
+    const newerProcess = { pid: 999 };
+    const service = new RunScriptService() as unknown as KillPostRunCapable;
+    service.postRunProcesses.set('ws-1', oldProcess);
+
+    const killPromise = service.killPostRunProcess('ws-1');
+    service.postRunProcesses.set('ws-1', newerProcess);
+    completeTreeKill?.(null);
+    await killPromise;
+
+    expect(service.postRunProcesses.get('ws-1')).toBe(newerProcess);
+  });
 });
 
 describe('RunScriptService.getRunScriptStatus', () => {
@@ -1182,36 +1519,47 @@ describe('RunScriptService.getRunScriptStatus', () => {
 
 describe('RunScriptService.evictWorkspaceBuffers', () => {
   type BufferEvictionCapable = {
-    outputBuffers: Map<string, string>;
-    outputListeners: Map<string, Set<(data: string) => void>>;
-    postRunOutputBuffers: Map<string, string>;
-    postRunOutputListeners: Map<string, Set<(data: string) => void>>;
+    appendOutput: (workspaceId: string, output: string) => void;
+    appendPostRunOutput: (workspaceId: string, output: string) => void;
+    subscribeToOutput: (workspaceId: string, listener: (data: string) => void) => () => void;
+    subscribeToPostRunOutput: (workspaceId: string, listener: (data: string) => void) => () => void;
+    getOutputBuffer: (workspaceId: string) => string;
+    getPostRunOutputBuffer: (workspaceId: string) => string;
     evictWorkspaceBuffers: (workspaceId: string) => void;
   };
 
   it('evicts output and listener buffers for an archived workspace only', () => {
     const service = new RunScriptService() as unknown as BufferEvictionCapable;
-    service.outputBuffers.set('ws-1', 'main logs');
-    service.postRunOutputBuffers.set('ws-1', 'postRun logs');
-    service.outputListeners.set('ws-1', new Set([vi.fn()]));
-    service.postRunOutputListeners.set('ws-1', new Set([vi.fn()]));
+    const workspaceOneOutputListener = vi.fn();
+    const workspaceOnePostRunListener = vi.fn();
+    const workspaceTwoOutputListener = vi.fn();
+    const workspaceTwoPostRunListener = vi.fn();
 
-    service.outputBuffers.set('ws-2', 'keep');
-    service.postRunOutputBuffers.set('ws-2', 'keep');
-    service.outputListeners.set('ws-2', new Set([vi.fn()]));
-    service.postRunOutputListeners.set('ws-2', new Set([vi.fn()]));
+    service.subscribeToOutput('ws-1', workspaceOneOutputListener);
+    service.subscribeToPostRunOutput('ws-1', workspaceOnePostRunListener);
+    service.subscribeToOutput('ws-2', workspaceTwoOutputListener);
+    service.subscribeToPostRunOutput('ws-2', workspaceTwoPostRunListener);
+    service.appendOutput('ws-1', 'main logs');
+    service.appendPostRunOutput('ws-1', 'postRun logs');
+    service.appendOutput('ws-2', 'keep');
+    service.appendPostRunOutput('ws-2', 'postRun keep');
 
     service.evictWorkspaceBuffers('ws-1');
 
-    expect(service.outputBuffers.has('ws-1')).toBe(false);
-    expect(service.postRunOutputBuffers.has('ws-1')).toBe(false);
-    expect(service.outputListeners.has('ws-1')).toBe(false);
-    expect(service.postRunOutputListeners.has('ws-1')).toBe(false);
+    expect(service.getOutputBuffer('ws-1')).toBe('');
+    expect(service.getPostRunOutputBuffer('ws-1')).toBe('');
+    expect(service.getOutputBuffer('ws-2')).toBe('keep');
+    expect(service.getPostRunOutputBuffer('ws-2')).toBe('postRun keep');
 
-    expect(service.outputBuffers.has('ws-2')).toBe(true);
-    expect(service.postRunOutputBuffers.has('ws-2')).toBe(true);
-    expect(service.outputListeners.has('ws-2')).toBe(true);
-    expect(service.postRunOutputListeners.has('ws-2')).toBe(true);
+    service.appendOutput('ws-1', 'after eviction');
+    service.appendPostRunOutput('ws-1', 'postRun after eviction');
+    service.appendOutput('ws-2', ' still subscribed');
+    service.appendPostRunOutput('ws-2', ' still subscribed');
+
+    expect(workspaceOneOutputListener).toHaveBeenCalledTimes(1);
+    expect(workspaceOnePostRunListener).toHaveBeenCalledTimes(1);
+    expect(workspaceTwoOutputListener).toHaveBeenLastCalledWith(' still subscribed');
+    expect(workspaceTwoPostRunListener).toHaveBeenLastCalledWith(' still subscribed');
   });
 });
 
@@ -1398,7 +1746,7 @@ describe('RunScriptService.cleanup/postRun internals', () => {
     );
   });
 
-  it('runs cleanup script with substituted port and handles stream errors', async () => {
+  it('runs cleanup script with substituted port and ignored output', async () => {
     const cleanupProcess = new FakeChildProcess(55_555);
     mockSpawn.mockReturnValue(cleanupProcess);
     const service = new RunScriptService() as unknown as {
@@ -1417,15 +1765,13 @@ describe('RunScriptService.cleanup/postRun internals', () => {
       worktreePath: '/tmp/ws-1',
       runScriptPort: 3000,
     });
-    cleanupProcess.stdout.emit('error', new Error('stdout fail'));
-    cleanupProcess.stderr.emit('error', new Error('stderr fail'));
     cleanupProcess.emit('exit', 0);
     await promise;
 
     expect(mockSpawn).toHaveBeenCalledWith('bash', ['-c', 'echo cleanup 3000'], {
       cwd: '/tmp/ws-1',
       detached: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: 'ignore',
     });
   });
 
@@ -1556,6 +1902,30 @@ describe('RunScriptService.cleanup/postRun internals', () => {
     expect(service.postRunProcesses.has('ws-1')).toBe(false);
   });
 
+  it('keeps a replacement postRun process when the previous process exits or errors', async () => {
+    const previousProcess = new FakeChildProcess(88_888);
+    const replacementProcess = new FakeChildProcess(99_999);
+    mockSpawn.mockReturnValue(previousProcess);
+    const service = new RunScriptService() as unknown as {
+      spawnPostRunScript: (
+        workspaceId: string,
+        runScriptPostRunCommand: string,
+        worktreePath: string,
+        port: number | undefined
+      ) => Promise<void>;
+      postRunProcesses: Map<string, FakeChildProcess>;
+    };
+
+    await service.spawnPostRunScript('ws-1', 'echo postrun', '/tmp/ws-1', undefined);
+    service.postRunProcesses.set('ws-1', replacementProcess);
+
+    previousProcess.emit('exit', 0, null);
+    expect(service.postRunProcesses.get('ws-1')).toBe(replacementProcess);
+
+    previousProcess.emit('error', new Error('late spawn error'));
+    expect(service.postRunProcesses.get('ws-1')).toBe(replacementProcess);
+  });
+
   it('returns early when postRun process cannot provide a pid', async () => {
     mockSpawn.mockReturnValue(new FakeChildProcess(undefined));
     const service = new RunScriptService() as unknown as {
@@ -1653,7 +2023,7 @@ describe('RunScriptService.stop-flow helper methods', () => {
     expect(mockTreeKill).not.toHaveBeenCalled();
   });
 
-  it('handles ESRCH errors during tree-kill in killProcessTree', async () => {
+  it('retains process ownership after ESRCH until the stop flow releases it', async () => {
     const esrchError = new Error('No such process') as NodeJS.ErrnoException;
     esrchError.code = 'ESRCH';
     mockTreeKill.mockImplementation(
@@ -1672,7 +2042,34 @@ describe('RunScriptService.stop-flow helper methods', () => {
     service.runningProcesses.set('ws-1', running);
 
     await service.killProcessTree('ws-1', running, null);
-    expect(service.runningProcesses.has('ws-1')).toBe(false);
+    expect(service.runningProcesses.get('ws-1')).toBe(running);
+  });
+
+  it('does not delete a replacement process after the previous tree-kill completes', async () => {
+    let completeTreeKill: ((error: Error | null) => void) | undefined;
+    mockTreeKill.mockImplementation(
+      (_pid: number, _signal: string, callback: (error: Error | null) => void) => {
+        completeTreeKill = callback;
+      }
+    );
+    const service = new RunScriptService() as unknown as {
+      killProcessTree: (
+        workspaceId: string,
+        childProcess: FakeChildProcess | undefined,
+        pid: number | null
+      ) => Promise<void>;
+      runningProcesses: Map<string, FakeChildProcess>;
+    };
+    const previousProcess = new FakeChildProcess(12_345);
+    const replacementProcess = new FakeChildProcess(54_321);
+    service.runningProcesses.set('ws-1', previousProcess);
+
+    const killPromise = service.killProcessTree('ws-1', previousProcess, null);
+    service.runningProcesses.set('ws-1', replacementProcess);
+    completeTreeKill?.(null);
+    await killPromise;
+
+    expect(service.runningProcesses.get('ws-1')).toBe(replacementProcess);
   });
 });
 
@@ -1705,6 +2102,22 @@ describe('RunScriptService.waitForProcessExit', () => {
     childProcess.exitCode = 0;
 
     await expect(service.waitForProcessExit('ws-1', childProcess, 12_345)).resolves.toBeUndefined();
+  });
+
+  it('returns when process already has signalCode', async () => {
+    const service = new RunScriptService() as unknown as {
+      waitForProcessExit: (
+        workspaceId: string,
+        childProcess: FakeChildProcess | undefined,
+        pid: number | null
+      ) => Promise<void>;
+    };
+    const childProcess = new FakeChildProcess(12_345);
+    childProcess.signalCode = 'SIGTERM';
+    const onceSpy = vi.spyOn(childProcess, 'once');
+
+    await expect(service.waitForProcessExit('ws-1', childProcess, 12_345)).resolves.toBeUndefined();
+    expect(onceSpy).not.toHaveBeenCalled();
   });
 
   it('returns when child process does not expose once/off', async () => {
@@ -1766,6 +2179,25 @@ describe('RunScriptService.waitForProcessExit', () => {
     onceSpy.mockImplementation(((event: string, listener: (...args: unknown[]) => void) => {
       EventEmitter.prototype.once.call(childProcess, event, listener);
       childProcess.exitCode = 0;
+      return childProcess;
+    }) as typeof childProcess.once);
+
+    await expect(service.waitForProcessExit('ws-1', childProcess, 12_345)).resolves.toBeUndefined();
+  });
+
+  it('resolves immediately when signalCode flips after listeners are attached', async () => {
+    const service = new RunScriptService() as unknown as {
+      waitForProcessExit: (
+        workspaceId: string,
+        childProcess: FakeChildProcess | undefined,
+        pid: number | null
+      ) => Promise<void>;
+    };
+    const childProcess = new FakeChildProcess(12_345);
+    const onceSpy = vi.spyOn(childProcess, 'once');
+    onceSpy.mockImplementation(((event: string, listener: (...args: unknown[]) => void) => {
+      EventEmitter.prototype.once.call(childProcess, event, listener);
+      childProcess.signalCode = 'SIGTERM';
       return childProcess;
     }) as typeof childProcess.once);
 

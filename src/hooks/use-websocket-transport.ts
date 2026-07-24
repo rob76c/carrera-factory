@@ -102,6 +102,13 @@ export interface UseWebSocketTransportReturn {
   /** Whether the WebSocket is currently connected. */
   connected: boolean;
   /**
+   * Whether automatic reconnection has stopped after exhausting its attempt
+   * budget. Consumers should offer a manual-reconnect affordance when true.
+   * Resets whenever a new connection attempt starts (manual reconnect,
+   * lifecycle recovery, or URL change).
+   */
+  gaveUp: boolean;
+  /**
    * Send a message (will be JSON stringified).
    * If disconnected, message is queued for delivery on reconnect.
    * Returns true if sent immediately, false if queued or dropped.
@@ -139,6 +146,7 @@ export function useWebSocketTransport(
   const { url, onMessage, onConnected, onDisconnected, queuePolicy = 'replay' } = options;
 
   const [connected, setConnected] = useState(false);
+  const [gaveUp, setGaveUp] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -209,11 +217,16 @@ export function useWebSocketTransport(
 
     // Reset intentional close flag when establishing a new connection
     intentionalCloseRef.current = false;
+    setGaveUp(false);
 
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) {
+        return;
+      }
+
       setConnected(true);
       reconnectAttemptsRef.current = 0;
 
@@ -229,6 +242,10 @@ export function useWebSocketTransport(
     };
 
     ws.onmessage = (event) => {
+      if (wsRef.current !== ws) {
+        return;
+      }
+
       try {
         if (typeof event.data !== 'string') {
           return;
@@ -253,12 +270,18 @@ export function useWebSocketTransport(
       onDisconnectedRef.current?.();
 
       // Only attempt to reconnect if this wasn't an intentional close
-      if (!intentionalCloseRef.current && reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
-        const delay = getReconnectDelay(reconnectAttemptsRef.current);
-        reconnectAttemptsRef.current += 1;
-        reconnectTimeoutRef.current = setTimeout(() => {
-          connect();
-        }, delay);
+      if (!intentionalCloseRef.current) {
+        if (reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
+          const delay = getReconnectDelay(reconnectAttemptsRef.current);
+          reconnectAttemptsRef.current += 1;
+          reconnectTimeoutRef.current = setTimeout(() => {
+            connect();
+          }, delay);
+        } else {
+          // Attempt budget exhausted: stop retrying and surface the state so
+          // consumers can offer a manual-reconnect affordance.
+          setGaveUp(true);
+        }
       }
     };
 
@@ -297,7 +320,10 @@ export function useWebSocketTransport(
     if (url) {
       connect();
     } else {
-      // URL became null - disconnect and clear queue
+      // URL became null - disconnect and clear queue. With no connection
+      // desired there is nothing to have given up on, so clear gaveUp and
+      // the attempt budget too; otherwise a consumer that restores the URL
+      // sees stale give-up state or re-gives-up on its first failure.
       intentionalCloseRef.current = true;
       messageQueueRef.current = [];
       if (wsRef.current) {
@@ -305,6 +331,8 @@ export function useWebSocketTransport(
         wsRef.current = null;
       }
       setConnected(false);
+      setGaveUp(false);
+      reconnectAttemptsRef.current = 0;
     }
 
     return () => {
@@ -317,6 +345,11 @@ export function useWebSocketTransport(
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
+        // The closing socket's onclose is ignored once wsRef is cleared, so
+        // reflect the closed state here. Otherwise a URL change leaves
+        // consumers reading connected=true while the replacement socket is
+        // still connecting.
+        setConnected(false);
       }
     };
   }, [url, connect]);
@@ -404,6 +437,7 @@ export function useWebSocketTransport(
 
   return {
     connected,
+    gaveUp,
     send,
     reconnect,
   };

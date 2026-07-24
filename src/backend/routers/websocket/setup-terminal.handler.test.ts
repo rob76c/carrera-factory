@@ -5,11 +5,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WebSocket, WebSocketServer } from 'ws';
 import type { AppContext } from '@/backend/app-context';
 import { WS_READY_STATE } from '@/backend/constants/websocket';
+import { MAX_WEBSOCKET_STREAM_BUFFERED_BYTES } from '@/backend/lib/websocket-send';
 
 const mockPtyWrite = vi.fn();
 const mockPtyResize = vi.fn();
 const mockPtyKill = vi.fn();
 const mockPtySpawn = vi.fn();
+const allowedOrigin = 'http://localhost:3000';
 
 let onDataCallback: ((data: string) => void) | null = null;
 let onExitCallback: ((event: { exitCode: number }) => void) | null = null;
@@ -29,6 +31,7 @@ import { createSetupTerminalUpgradeHandler } from './setup-terminal.handler';
 
 class MockWebSocket extends EventEmitter {
   readyState: number = WS_READY_STATE.OPEN;
+  bufferedAmount = 0;
   send = vi.fn();
 }
 
@@ -76,11 +79,50 @@ describe('createSetupTerminalUpgradeHandler', () => {
     mockPtySpawn.mockReturnValue(createMockPty());
   });
 
-  it('creates terminal and routes lifecycle messages', () => {
+  it('rejects upgrades from unauthorized origins before opening a WebSocket', () => {
     const logger = createLogger();
     const configService = {
-      getShellPath: vi.fn(() => '/bin/zsh'),
-      getChildProcessEnv: vi.fn(() => ({ PATH: '/usr/bin' })),
+      getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin] })),
+    };
+    const appContext = {
+      services: {
+        createLogger: vi.fn(() => logger),
+        configService,
+      },
+    } as unknown as AppContext;
+
+    const handler = createSetupTerminalUpgradeHandler(appContext);
+    const ws = new MockWebSocket();
+    const wss = createWss(ws);
+    const request = {
+      headers: { origin: 'https://evil-attacker.com' },
+    } as IncomingMessage;
+    const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
+    const wsAliveMap = new WeakMap<WebSocket, boolean>();
+
+    handler(
+      request,
+      socket,
+      Buffer.alloc(0),
+      new URL('http://localhost/setup-terminal'),
+      wss,
+      wsAliveMap
+    );
+
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('400 Bad Request'));
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('Unauthorized origin'));
+    expect(socket.destroy).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Rejected setup terminal connection from unauthorized origin',
+      { origin: 'https://evil-attacker.com' }
+    );
+  });
+
+  it('rejects upgrades without an Origin header before opening a WebSocket', () => {
+    const logger = createLogger();
+    const configService = {
+      getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin] })),
     };
     const appContext = {
       services: {
@@ -93,6 +135,162 @@ describe('createSetupTerminalUpgradeHandler', () => {
     const ws = new MockWebSocket();
     const wss = createWss(ws);
     const request = {} as IncomingMessage;
+    const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
+    const wsAliveMap = new WeakMap<WebSocket, boolean>();
+
+    handler(
+      request,
+      socket,
+      Buffer.alloc(0),
+      new URL('http://localhost/setup-terminal'),
+      wss,
+      wsAliveMap
+    );
+
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('400 Bad Request'));
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('Missing Origin header'));
+    expect(socket.destroy).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Rejected setup terminal connection without Origin header'
+    );
+  });
+
+  it('rejects untrusted remote addresses before opening a WebSocket', () => {
+    const logger = createLogger();
+    const configService = {
+      getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin], trustedLocalCidrs: [] })),
+    };
+    const appContext = {
+      services: {
+        createLogger: vi.fn(() => logger),
+        configService,
+      },
+    } as unknown as AppContext;
+
+    const handler = createSetupTerminalUpgradeHandler(appContext);
+    const ws = new MockWebSocket();
+    const wss = createWss(ws);
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '203.0.113.10' },
+    } as unknown as IncomingMessage;
+    const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
+    const wsAliveMap = new WeakMap<WebSocket, boolean>();
+
+    handler(
+      request,
+      socket,
+      Buffer.alloc(0),
+      new URL('http://localhost/setup-terminal'),
+      wss,
+      wsAliveMap
+    );
+
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('403 Forbidden'));
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('Untrusted remote address'));
+    expect(socket.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects forwarded local upgrades before opening a WebSocket', () => {
+    const logger = createLogger();
+    const configService = {
+      getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin], trustedLocalCidrs: [] })),
+    };
+    const appContext = {
+      services: {
+        createLogger: vi.fn(() => logger),
+        configService,
+      },
+    } as unknown as AppContext;
+
+    const handler = createSetupTerminalUpgradeHandler(appContext);
+    const ws = new MockWebSocket();
+    const wss = createWss(ws);
+    const request = {
+      headers: { origin: allowedOrigin, 'x-forwarded-for': '203.0.113.10' },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
+    const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
+    const wsAliveMap = new WeakMap<WebSocket, boolean>();
+
+    handler(
+      request,
+      socket,
+      Buffer.alloc(0),
+      new URL('http://localhost/setup-terminal'),
+      wss,
+      wsAliveMap
+    );
+
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('403 Forbidden'));
+    expect(socket.write).toHaveBeenCalledWith(
+      expect.stringContaining('Forwarded WebSocket upgrades are not trusted')
+    );
+    expect(socket.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts upgrades from configured allowed origins', () => {
+    const logger = createLogger();
+    const configService = {
+      getShellPath: vi.fn(() => '/bin/zsh'),
+      getChildProcessEnv: vi.fn(() => ({ PATH: '/usr/bin' })),
+      getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin] })),
+    };
+    const appContext = {
+      services: {
+        createLogger: vi.fn(() => logger),
+        configService,
+      },
+    } as unknown as AppContext;
+
+    const handler = createSetupTerminalUpgradeHandler(appContext);
+    const ws = new MockWebSocket();
+    const wss = createWss(ws);
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
+    const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
+    const wsAliveMap = new WeakMap<WebSocket, boolean>();
+
+    handler(
+      request,
+      socket,
+      Buffer.alloc(0),
+      new URL('http://localhost/setup-terminal'),
+      wss,
+      wsAliveMap
+    );
+
+    expect(wss.handleUpgrade).toHaveBeenCalledTimes(1);
+    expect(socket.destroy).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith('Setup terminal WebSocket connected');
+  });
+
+  it('creates terminal and routes lifecycle messages', () => {
+    const logger = createLogger();
+    const configService = {
+      getShellPath: vi.fn(() => '/bin/zsh'),
+      getChildProcessEnv: vi.fn(() => ({ PATH: '/usr/bin' })),
+      getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin] })),
+    };
+    const appContext = {
+      services: {
+        createLogger: vi.fn(() => logger),
+        configService,
+      },
+    } as unknown as AppContext;
+
+    const handler = createSetupTerminalUpgradeHandler(appContext);
+    const ws = new MockWebSocket();
+    const wss = createWss(ws);
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
     const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
     const wsAliveMap = new WeakMap<WebSocket, boolean>();
 
@@ -123,9 +321,16 @@ describe('createSetupTerminalUpgradeHandler', () => {
     );
     expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'created' }));
 
+    ws.send.mockClear();
+    ws.bufferedAmount = MAX_WEBSOCKET_STREAM_BUFFERED_BYTES + 1;
+    onDataCallback?.('dropped shell output');
+    expect(ws.send).not.toHaveBeenCalled();
+
+    ws.bufferedAmount = 0;
     onDataCallback?.('hello from shell');
     expect(ws.send).toHaveBeenCalledWith(
-      JSON.stringify({ type: 'output', data: 'hello from shell' })
+      JSON.stringify({ type: 'output', data: 'hello from shell' }),
+      expect.any(Function)
     );
 
     ws.emit('message', JSON.stringify({ type: 'input', data: 'echo hi\n' }));
@@ -133,9 +338,6 @@ describe('createSetupTerminalUpgradeHandler', () => {
 
     ws.emit('message', JSON.stringify({ type: 'resize', cols: 150, rows: 50 }));
     expect(mockPtyResize).toHaveBeenCalledWith(150, 50);
-
-    ws.emit('message', JSON.stringify({ type: 'ping' }));
-    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'pong' }));
 
     ws.emit('message', JSON.stringify({ type: 'create' }));
     expect(ws.send).toHaveBeenCalledWith(
@@ -154,6 +356,7 @@ describe('createSetupTerminalUpgradeHandler', () => {
     const configService = {
       getShellPath: vi.fn(() => '/bin/zsh'),
       getChildProcessEnv: vi.fn(() => ({})),
+      getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin] })),
     };
     const appContext = {
       services: {
@@ -165,7 +368,10 @@ describe('createSetupTerminalUpgradeHandler', () => {
     const handler = createSetupTerminalUpgradeHandler(appContext);
     const ws = new MockWebSocket();
     const wss = createWss(ws);
-    const request = {} as IncomingMessage;
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
     const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
     const wsAliveMap = new WeakMap<WebSocket, boolean>();
 
@@ -193,6 +399,7 @@ describe('createSetupTerminalUpgradeHandler', () => {
     const configService = {
       getShellPath: vi.fn(() => '/bin/zsh'),
       getChildProcessEnv: vi.fn(() => ({})),
+      getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin] })),
     };
     const appContext = {
       services: {
@@ -204,7 +411,10 @@ describe('createSetupTerminalUpgradeHandler', () => {
     const handler = createSetupTerminalUpgradeHandler(appContext);
     const ws = new MockWebSocket();
     const wss = createWss(ws);
-    const request = {} as IncomingMessage;
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
     const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
     const wsAliveMap = new WeakMap<WebSocket, boolean>();
 
@@ -218,9 +428,12 @@ describe('createSetupTerminalUpgradeHandler', () => {
     );
 
     ws.emit('message', '{');
-    expect(logger.error).toHaveBeenCalledWith('Error in setup terminal', expect.any(SyntaxError));
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid setup terminal message format',
+      expect.objectContaining({ error: expect.any(String) })
+    );
     expect(ws.send).toHaveBeenCalledWith(
-      expect.stringMatching(/^{"type":"error","message":".+"}$/)
+      JSON.stringify({ type: 'error', message: 'Invalid message format' })
     );
 
     mockPtySpawn.mockImplementationOnce(() => {
@@ -247,7 +460,6 @@ describe('createSetupTerminalUpgradeHandler', () => {
 
     ws.readyState = WS_READY_STATE.CLOSED;
     const sentBeforeClosed = ws.send.mock.calls.length;
-    ws.emit('message', JSON.stringify({ type: 'ping' }));
     ws.emit('message', JSON.stringify({ type: 'resize', cols: '120', rows: 40 }));
     onDataCallback?.('ignored output');
     expect(ws.send).toHaveBeenCalledTimes(sentBeforeClosed);

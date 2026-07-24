@@ -2,6 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { trpc } from '@/client/lib/trpc';
 
+import {
+  forgetSetupWarningDismissed,
+  isSetupWarningDismissed,
+  rememberSetupWarningDismissed,
+} from './setup-warning-storage';
 import type { useWorkspaceData } from './use-workspace-detail';
 
 export function useWorkspaceInitStatus(
@@ -60,17 +65,46 @@ export function useWorkspaceInitStatus(
   const isScriptFailed =
     (status === 'FAILED' && hasWorktreePath) || (status === 'READY' && !!initErrorMessage);
 
-  // Ephemeral dismiss state — resets when the error message changes (e.g. after a retry).
-  const [setupWarningDismissed, setSetupWarningDismissed] = useState(false);
-  const prevErrorMessageRef = useRef<string | null>(null);
+  // Persisted per workspace/error so navigating away and back does not resurface dismissed warnings.
+  // Keep the identity alongside the value so a previous workspace's hydrated `false` cannot make a
+  // newly selected workspace flash its warning before this effect reads that warning's storage key.
+  const [hydratedSetupWarning, setHydratedSetupWarning] = useState<{
+    workspaceId: string;
+    initErrorMessage: string | null;
+    dismissed: boolean;
+  } | null>(null);
+  const setupWarningDismissed =
+    hydratedSetupWarning?.workspaceId === workspaceId &&
+    hydratedSetupWarning.initErrorMessage === initErrorMessage
+      ? hydratedSetupWarning.dismissed
+      : null;
   useEffect(() => {
-    if (initErrorMessage !== prevErrorMessageRef.current) {
-      setSetupWarningDismissed(false);
-      prevErrorMessageRef.current = initErrorMessage;
+    if (!workspaceInitStatus) {
+      return;
     }
-  }, [initErrorMessage]);
 
-  const dismissSetupWarning = useCallback(() => setSetupWarningDismissed(true), []);
+    if (!initErrorMessage) {
+      forgetSetupWarningDismissed(workspaceId);
+      setHydratedSetupWarning({ workspaceId, initErrorMessage, dismissed: false });
+      return;
+    }
+
+    if (workspaceInitStatus.chatBanner?.showDismiss !== true) {
+      setHydratedSetupWarning({ workspaceId, initErrorMessage, dismissed: false });
+      return;
+    }
+
+    setHydratedSetupWarning({
+      workspaceId,
+      initErrorMessage,
+      dismissed: isSetupWarningDismissed(workspaceId, initErrorMessage),
+    });
+  }, [workspaceId, workspaceInitStatus, initErrorMessage]);
+
+  const dismissSetupWarning = useCallback(() => {
+    rememberSetupWarningDismissed(workspaceId, initErrorMessage);
+    setHydratedSetupWarning({ workspaceId, initErrorMessage, dismissed: true });
+  }, [workspaceId, initErrorMessage]);
 
   return {
     workspaceInitStatus,

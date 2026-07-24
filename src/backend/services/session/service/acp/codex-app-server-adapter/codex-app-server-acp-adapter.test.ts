@@ -1320,6 +1320,94 @@ describe('CodexAppServerAcpAdapter', () => {
     );
   });
 
+  it('requests ExitPlanMode approval after recovered completed plan item in plan mode', async () => {
+    const { connection } = createMockConnection();
+    (connection.requestPermission as ReturnType<typeof vi.fn>).mockResolvedValue({
+      outcome: { outcome: 'selected', optionId: 'default' },
+    } satisfies RequestPermissionResponse);
+
+    const { client: codexClient, mocks: codex } = createMockCodexClient();
+    const adapter = new CodexAppServerAcpAdapter(connection as AgentSideConnection, codexClient);
+
+    await initializeAdapterWithDefaultModel(adapter, codex);
+
+    codex.request.mockResolvedValueOnce({
+      thread: { id: 'thread_recovered_plan_approval', cwd: '/tmp/workspace' },
+      approvalPolicy: DEFAULT_APPROVAL_POLICY,
+      reasoningEffort: 'medium',
+    });
+    const session = await adapter.newSession({
+      cwd: '/tmp/workspace',
+      mcpServers: [],
+    });
+    await adapter.setSessionMode({ sessionId: session.sessionId, modeId: 'plan' });
+
+    await (
+      adapter as unknown as {
+        handleCodexNotification: (method: string, params: unknown) => Promise<void>;
+      }
+    ).handleCodexNotification('item/plan/delta', {
+      threadId: 'thread_recovered_plan_approval',
+      turnId: 'turn_recovered_plan_approval',
+      itemId: 'item_recovered_plan_approval',
+      delta: '## Recovered Plan\n1. Request approval after recovery',
+    });
+
+    await (
+      adapter as unknown as {
+        handleCodexNotification: (method: string, params: unknown) => Promise<void>;
+      }
+    ).handleCodexNotification('item/completed', {
+      threadId: 'thread_recovered_plan_approval',
+      turnId: 'turn_recovered_plan_approval',
+      item: {
+        type: 'plan',
+        id: 'item_recovered_plan_approval',
+        status: 'completed',
+      },
+    });
+
+    expect(connection.requestPermission).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolCall: expect.objectContaining({
+          title: 'ExitPlanMode',
+          kind: 'switch_mode',
+        }),
+      })
+    );
+    expect((connection.sessionUpdate as ReturnType<typeof vi.fn>).mock.calls).toEqual(
+      expect.arrayContaining([
+        [
+          expect.objectContaining({
+            update: expect.objectContaining({
+              sessionUpdate: 'tool_call',
+              title: 'plan',
+              kind: 'think',
+              status: 'completed',
+            }),
+          }),
+        ],
+        [
+          expect.objectContaining({
+            update: expect.objectContaining({
+              sessionUpdate: 'tool_call',
+              title: 'ExitPlanMode',
+              kind: 'switch_mode',
+              status: 'pending',
+              rawInput: expect.objectContaining({
+                type: 'ExitPlanMode',
+                plan: expect.objectContaining({
+                  type: 'text',
+                  text: expect.stringContaining('## Recovered Plan'),
+                }),
+              }),
+            }),
+          }),
+        ],
+      ])
+    );
+  });
+
   it('switches to the selected non-plan mode id when plan approval is accepted', async () => {
     const { connection } = createMockConnection();
     (connection.requestPermission as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -2521,6 +2609,64 @@ describe('CodexAppServerAcpAdapter', () => {
     ).resolves.toEqual({ stopReason: 'end_turn' });
   });
 
+  it('settles active prompts when codex exits after turn/start returns', async () => {
+    const { connection } = createMockConnection();
+    const { client: codexClient, mocks: codex } = createMockCodexClient();
+    const adapter = new CodexAppServerAcpAdapter(connection as AgentSideConnection, codexClient);
+
+    await initializeAdapterWithDefaultModel(adapter, codex);
+
+    codex.request.mockResolvedValueOnce({
+      thread: { id: 'thread_exit', cwd: '/tmp/workspace' },
+      approvalPolicy: DEFAULT_APPROVAL_POLICY,
+      reasoningEffort: 'medium',
+    });
+    const session = await adapter.newSession({
+      cwd: '/tmp/workspace',
+      mcpServers: [],
+    });
+
+    codex.request.mockResolvedValueOnce({
+      turn: { id: 'turn_exit', status: 'inProgress' },
+    });
+
+    const promptPromise = adapter.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: 'text', text: 'hello' }],
+    });
+
+    await vi.waitFor(() => {
+      const adapterSession = (
+        adapter as unknown as {
+          sessions: Map<string, { activeTurn: { turnId: string } | null }>;
+        }
+      ).sessions.get(session.sessionId);
+      expect(adapterSession?.activeTurn?.turnId).toBe('turn_exit');
+    });
+
+    (
+      adapter as unknown as {
+        handleCodexExit: (event: {
+          code: number | null;
+          signal: NodeJS.Signals | null;
+          reason: string;
+        }) => void;
+      }
+    ).handleCodexExit({
+      code: 1,
+      signal: null,
+      reason: 'codex app-server exited (code=1, signal=null)',
+    });
+
+    await expect(promptPromise).resolves.toEqual({ stopReason: 'end_turn' });
+    const adapterSession = (
+      adapter as unknown as {
+        sessions: Map<string, { activeTurn: { turnId: string } | null }>;
+      }
+    ).sessions.get(session.sessionId);
+    expect(adapterSession?.activeTurn).toBeNull();
+  });
+
   it('clears stale tool call state when a turn ends without item/completed events', async () => {
     const { connection } = createMockConnection();
     const { client: codexClient, mocks: codex } = createMockCodexClient();
@@ -2825,7 +2971,7 @@ describe('CodexAppServerAcpAdapter', () => {
     expect(mcpByThread.get('thread_restore')).toEqual(previousConfig);
   });
 
-  it('builds tool call state for file, MCP, web search, and unknown types', () => {
+  it('builds tool call state for file, MCP, web search, Codex function calls, and unknown types', () => {
     const { connection } = createMockConnection();
     const { client: codexClient } = createMockCodexClient();
     const adapter = new CodexAppServerAcpAdapter(connection as AgentSideConnection, codexClient);
@@ -2875,6 +3021,68 @@ describe('CodexAppServerAcpAdapter', () => {
       'turn_web'
     ) as { title: string };
 
+    const functionCall = (
+      adapter as unknown as {
+        buildToolCallState: (session: unknown, item: unknown, turnId: string) => unknown;
+      }
+    ).buildToolCallState(
+      session,
+      {
+        type: 'function_call',
+        id: 'item_function',
+        name: 'exec_command',
+        call_id: 'call_function',
+        arguments: '{"cmd":"cat package.json","workdir":"/tmp/workspace"}',
+      },
+      'turn_function'
+    ) as { toolCallId: string; title: string; kind: string };
+
+    const customToolCall = (
+      adapter as unknown as {
+        buildToolCallState: (session: unknown, item: unknown, turnId: string) => unknown;
+      }
+    ).buildToolCallState(
+      session,
+      {
+        type: 'custom_tool_call',
+        id: 'item_custom',
+        name: 'apply_patch',
+        call_id: 'call_custom',
+        input: '*** Begin Patch\n*** End Patch\n',
+      },
+      'turn_custom'
+    ) as { toolCallId: string; title: string; kind: string };
+
+    const functionCallOutput = (
+      adapter as unknown as {
+        buildToolCallState: (session: unknown, item: unknown, turnId: string) => unknown;
+      }
+    ).buildToolCallState(
+      session,
+      {
+        type: 'function_call_output',
+        id: 'item_function_output',
+        call_id: 'call_function',
+        output: 'done',
+      },
+      'turn_function_output'
+    );
+
+    const customToolCallOutput = (
+      adapter as unknown as {
+        buildToolCallState: (session: unknown, item: unknown, turnId: string) => unknown;
+      }
+    ).buildToolCallState(
+      session,
+      {
+        type: 'custom_tool_call_output',
+        id: 'item_custom_output',
+        call_id: 'call_custom',
+        output: 'done',
+      },
+      'turn_custom_output'
+    );
+
     const unknown = (
       adapter as unknown as {
         buildToolCallState: (session: unknown, item: unknown, turnId: string) => unknown;
@@ -2892,6 +3100,14 @@ describe('CodexAppServerAcpAdapter', () => {
     expect(fileCall.locations).toEqual([{ path: 'src/app.ts' }]);
     expect(mcpCall.title).toBe('mcpToolCall:docs/search');
     expect(webCall.title).toBe('webSearch');
+    expect(functionCall.toolCallId).toBe('call_function');
+    expect(functionCall.title).toBe('Read package.json');
+    expect(functionCall.kind).toBe('read');
+    expect(customToolCall.toolCallId).toBe('call_custom');
+    expect(customToolCall.title).toBe('apply_patch');
+    expect(customToolCall.kind).toBe('execute');
+    expect(functionCallOutput).toBeNull();
+    expect(customToolCallOutput).toBeNull();
     expect(unknown).toBeNull();
   });
 });

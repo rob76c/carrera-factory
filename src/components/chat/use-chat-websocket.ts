@@ -26,6 +26,7 @@ import type {
 import { useChatState } from './use-chat-state';
 import {
   evaluateHydrationBatch,
+  evaluateLoadSessionRetry,
   parseHydrationBatch,
   scheduleConnectLoadingStart,
 } from './use-chat-websocket-hydration';
@@ -55,6 +56,13 @@ export interface UseChatWebSocketReturn {
   processStatus: ReturnType<typeof useChatState>['processStatus'];
   // Authoritative runtime snapshot for the selected session
   sessionRuntime: SessionRuntimeState;
+  /**
+   * The dbSessionId the current reducer state was hydrated for, or null
+   * before the first hydration. Stays on the previous session during a
+   * session switch until the new session's hydration batch arrives, so
+   * consumers can tell whether sessionRuntime describes dbSessionId yet.
+   */
+  runtimeSessionId: string | null;
   gitBranch: string | null;
   availableSessions: SessionInfo[];
   // Pending interactive request (permission or user question)
@@ -158,10 +166,23 @@ export function useChatWebSocket(options: UseChatWebSocketOptions): UseChatWebSo
   // 2. The callback wrapper ((msg) => sendRef.current(msg)) always uses the latest ref value
   const sendRef = useRef<(message: unknown) => boolean>(() => false);
   const currentLoadRequestIdRef = useRef<string | null>(null);
+  const exhaustedLoadRequestIdRef = useRef<string | null>(null);
   const currentLoadGenerationRef = useRef(0);
   const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cancelConnectLoadingRef = useRef<(() => void) | null>(null);
   const hydratedSessionIdRef = useRef<string | null>(null);
+
+  // Drop the hydration marker when the selected session moves away from the
+  // hydrated one. Without this, switching A -> B -> back to A before B
+  // hydrates would leave the marker claiming A is hydrated while the reducer
+  // state was reset by the switches, and consumers of runtimeSessionId would
+  // treat the reset runtime as authoritative for A. Same-session reconnects
+  // keep the marker so hydrated state isn't spuriously reported as loading.
+  useEffect(() => {
+    if (hydratedSessionIdRef.current !== null && hydratedSessionIdRef.current !== dbSessionId) {
+      hydratedSessionIdRef.current = null;
+    }
+  }, [dbSessionId]);
 
   const clearLoadTimeout = useCallback(() => {
     if (loadTimeoutRef.current) {
@@ -175,39 +196,52 @@ export function useChatWebSocket(options: UseChatWebSocketOptions): UseChatWebSo
     cancelConnectLoadingRef.current = null;
   }, []);
 
-  const scheduleLoadRetry = useCallback(
-    (loadGeneration: number, loadRequestId: string) => {
-      clearLoadTimeout();
-      loadTimeoutRef.current = setTimeout(() => {
-        if (
-          currentLoadGenerationRef.current !== loadGeneration ||
-          currentLoadRequestIdRef.current !== loadRequestId
-        ) {
-          loadTimeoutRef.current = null;
-          return;
-        }
-
-        const nextLoadRequestId = `load-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-        currentLoadRequestIdRef.current = nextLoadRequestId;
-        sendRef.current({ type: 'load_session', loadRequestId: nextLoadRequestId });
-        scheduleLoadRetry(loadGeneration, nextLoadRequestId);
-      }, LOAD_SESSION_RETRY_TIMEOUT_MS);
-    },
-    [clearLoadTimeout]
-  );
-
   const chat = useChatState({
     dbSessionId,
     send: useCallback((message: unknown) => sendRef.current(message), []),
     connected: false, // Will be overridden by transport.connected in return value
   });
 
+  const scheduleLoadRetry = useCallback(
+    (loadGeneration: number, loadRequestId: string, retryAttempt = 1) => {
+      clearLoadTimeout();
+      loadTimeoutRef.current = setTimeout(() => {
+        const decision = evaluateLoadSessionRetry({
+          loadGeneration,
+          currentLoadGeneration: currentLoadGenerationRef.current,
+          loadRequestId,
+          currentLoadRequestId: currentLoadRequestIdRef.current,
+          retryAttempt,
+        });
+        loadTimeoutRef.current = null;
+        if (decision === 'exhausted') {
+          exhaustedLoadRequestIdRef.current = loadRequestId;
+          currentLoadRequestIdRef.current = null;
+          clearConnectLoadingTimeout();
+          chat.dispatch({ type: 'SESSION_LOADING_END' });
+          return;
+        }
+        if (decision !== 'retry') {
+          return;
+        }
+
+        sendRef.current({ type: 'load_session', loadRequestId });
+        scheduleLoadRetry(loadGeneration, loadRequestId, retryAttempt + 1);
+      }, LOAD_SESSION_RETRY_TIMEOUT_MS);
+    },
+    [chat.dispatch, clearConnectLoadingTimeout, clearLoadTimeout]
+  );
+
   // Handle incoming messages - delegate to chat state
   const handleMessage = useCallback(
     (data: unknown) => {
       const batch = parseHydrationBatch(data);
       if (batch) {
-        const decision = evaluateHydrationBatch(batch, currentLoadRequestIdRef.current);
+        const decision = evaluateHydrationBatch(
+          batch,
+          currentLoadRequestIdRef.current,
+          exhaustedLoadRequestIdRef.current
+        );
         if (decision === 'drop') {
           // A hydration response with a loadRequestId can arrive late (for example
           // from a prior reconnect attempt). Ignore it so stale replay batches
@@ -219,8 +253,11 @@ export function useChatWebSocket(options: UseChatWebSocketOptions): UseChatWebSo
         }
         if (decision === 'match') {
           currentLoadRequestIdRef.current = null;
+          exhaustedLoadRequestIdRef.current = null;
           clearLoadTimeout();
           clearConnectLoadingTimeout();
+        } else {
+          exhaustedLoadRequestIdRef.current = null;
         }
       }
       chat.handleMessage(data);
@@ -241,6 +278,7 @@ export function useChatWebSocket(options: UseChatWebSocketOptions): UseChatWebSo
     const loadGeneration = currentLoadGenerationRef.current + 1;
     currentLoadGenerationRef.current = loadGeneration;
     const loadRequestId = `load-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    exhaustedLoadRequestIdRef.current = null;
     currentLoadRequestIdRef.current = loadRequestId;
     scheduleLoadRetry(loadGeneration, loadRequestId);
     sendRef.current({ type: 'load_session', loadRequestId }); // Hydrates via snapshot or replay batch
@@ -249,6 +287,7 @@ export function useChatWebSocket(options: UseChatWebSocketOptions): UseChatWebSo
   // Handle disconnection - clear loading state to avoid stuck spinner
   const handleDisconnected = useCallback(() => {
     currentLoadRequestIdRef.current = null;
+    exhaustedLoadRequestIdRef.current = null;
     currentLoadGenerationRef.current += 1;
     clearLoadTimeout();
     clearConnectLoadingTimeout();
@@ -259,6 +298,7 @@ export function useChatWebSocket(options: UseChatWebSocketOptions): UseChatWebSo
   useEffect(() => {
     return () => {
       currentLoadRequestIdRef.current = null;
+      exhaustedLoadRequestIdRef.current = null;
       currentLoadGenerationRef.current += 1;
       clearLoadTimeout();
       clearConnectLoadingTimeout();
@@ -290,6 +330,7 @@ export function useChatWebSocket(options: UseChatWebSocketOptions): UseChatWebSo
     // State from chat
     messages: chat.messages,
     connected: transport.connected,
+    runtimeSessionId: hydratedSessionIdRef.current,
     sessionStatus: chat.sessionStatus,
     processStatus: chat.processStatus,
     sessionRuntime: chat.sessionRuntime,

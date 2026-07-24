@@ -1,8 +1,10 @@
-import { AlertTriangle, ExternalLink, RefreshCw, X } from 'lucide-react';
+import { ArrowSquareOutIcon, ArrowsClockwiseIcon, WarningIcon, XIcon } from '@phosphor-icons/react';
 import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import { trpc } from '@/client/lib/trpc';
 import { Button } from '@/components/ui/button';
+
+const CLI_HEALTH_WARNING_DISMISSED_KEY = 'ff_cli_health_warning_dismissed';
 
 interface HealthIssue {
   title: string;
@@ -54,7 +56,8 @@ export function collectIssues(health: CliHealthForBanner): HealthIssue[] {
   } else if (!health.github.isAuthenticated) {
     issues.push({
       title: 'GitHub CLI not authenticated',
-      description: 'Run "gh auth login" in your terminal to authenticate with GitHub.',
+      description:
+        'Run "gh auth refresh -h github.com" or "gh auth login" in your terminal to authenticate with GitHub.',
     });
   }
 
@@ -69,6 +72,58 @@ export function collectIssues(health: CliHealthForBanner): HealthIssue[] {
   }
 
   return issues;
+}
+
+function getStorage(): Storage | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+export function getCLIHealthWarningFingerprint(issues: HealthIssue[]): string {
+  return JSON.stringify(
+    issues.map((issue) => ({
+      title: issue.title,
+      description: issue.description,
+      link: issue.link ?? null,
+      linkLabel: issue.linkLabel ?? null,
+      upgradeProvider: issue.upgradeProvider ?? null,
+    }))
+  );
+}
+
+export function readDismissedCLIHealthWarningFingerprint(): string | null {
+  try {
+    return getStorage()?.getItem(CLI_HEALTH_WARNING_DISMISSED_KEY) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function isCLIHealthWarningDismissed(fingerprint: string): boolean {
+  return readDismissedCLIHealthWarningFingerprint() === fingerprint;
+}
+
+export function rememberDismissedCLIHealthWarning(fingerprint: string) {
+  try {
+    getStorage()?.setItem(CLI_HEALTH_WARNING_DISMISSED_KEY, fingerprint);
+  } catch {
+    // Non-blocking: ignore localStorage failures.
+  }
+}
+
+export function forgetDismissedCLIHealthWarning() {
+  try {
+    getStorage()?.removeItem(CLI_HEALTH_WARNING_DISMISSED_KEY);
+  } catch {
+    // Non-blocking: ignore localStorage failures.
+  }
 }
 
 function renderIssueActions(
@@ -86,7 +141,7 @@ function renderIssueActions(
           className="inline-flex items-center gap-1 text-warning underline hover:text-warning/80"
         >
           {issue.linkLabel ?? 'Install'}
-          <ExternalLink className="h-3 w-3" />
+          <ArrowSquareOutIcon className="h-3 w-3" />
         </a>
       )}
       {issue.upgradeProvider && (
@@ -127,10 +182,10 @@ export function CLIHealthBannerContent({
     <div className="border-b border-warning/20 bg-warning/10 py-2 pl-3 pr-2 sm:px-4 sm:py-3">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
         <div className="flex min-w-0 items-start gap-2.5 sm:gap-3">
-          <AlertTriangle className="mt-0.5 hidden h-5 w-5 shrink-0 text-warning sm:block" />
+          <WarningIcon className="mt-0.5 hidden h-5 w-5 shrink-0 text-warning sm:block" />
           <div className="min-w-0 flex-1 space-y-1.5 sm:space-y-2">
             <div className="flex items-center gap-2 sm:hidden">
-              <AlertTriangle className="h-4 w-4 shrink-0 text-warning" />
+              <WarningIcon className="h-4 w-4 shrink-0 text-warning" />
               <p className="min-w-0 flex-1 text-xs font-medium text-warning-foreground dark:text-warning">
                 Some features require additional setup
               </p>
@@ -142,7 +197,9 @@ export function CLIHealthBannerContent({
                   disabled={isRefetching || isUpgrading}
                   className="h-7 px-2 text-warning hover:bg-warning/20"
                 >
-                  <RefreshCw className={`h-3.5 w-3.5 ${isRefetching ? 'animate-spin' : ''}`} />
+                  <ArrowsClockwiseIcon
+                    className={`h-3.5 w-3.5 ${isRefetching ? 'animate-spin' : ''}`}
+                  />
                   <span className="sr-only">Recheck</span>
                 </Button>
                 <Button
@@ -151,7 +208,7 @@ export function CLIHealthBannerContent({
                   onClick={onDismiss}
                   className="h-7 w-7 text-warning hover:bg-warning/20"
                 >
-                  <X className="h-4 w-4" />
+                  <XIcon className="h-4 w-4" />
                   <span className="sr-only">Dismiss</span>
                 </Button>
               </div>
@@ -188,7 +245,7 @@ export function CLIHealthBannerContent({
             disabled={isRefetching || isUpgrading}
             className="h-8 px-2 text-warning hover:bg-warning/20"
           >
-            <RefreshCw className={`h-3.5 w-3.5 ${isRefetching ? 'animate-spin' : ''}`} />
+            <ArrowsClockwiseIcon className={`h-3.5 w-3.5 ${isRefetching ? 'animate-spin' : ''}`} />
             <span className="ml-1.5">Recheck</span>
           </Button>
           <Button
@@ -197,7 +254,7 @@ export function CLIHealthBannerContent({
             onClick={onDismiss}
             className="h-8 w-8 text-warning hover:bg-warning/20"
           >
-            <X className="h-4 w-4" />
+            <XIcon className="h-4 w-4" />
             <span className="sr-only">Dismiss</span>
           </Button>
         </div>
@@ -208,10 +265,12 @@ export function CLIHealthBannerContent({
 
 /**
  * Banner that displays warnings when CLI dependencies are not properly installed.
- * Shows on app launch and can be dismissed (but will reappear on next launch if issues persist).
+ * Shows on app launch and can be dismissed until the warning content changes.
  */
 export function CLIHealthBanner() {
-  const [dismissed, setDismissed] = useState(false);
+  const [dismissedFingerprint, setDismissedFingerprint] = useState(() =>
+    readDismissedCLIHealthWarningFingerprint()
+  );
   const utils = trpc.useUtils();
   const upgradeProviderCli = trpc.admin.upgradeProviderCLI.useMutation({
     onSuccess: (result) => {
@@ -239,22 +298,27 @@ export function CLIHealthBanner() {
     }
   );
 
-  const issueCount = health ? collectIssues(health).length : 0;
+  const issues = health ? collectIssues(health) : [];
+  const warningFingerprint = issues.length > 0 ? getCLIHealthWarningFingerprint(issues) : null;
 
-  // Reset dismissed state when health issues appear (or change).
   useEffect(() => {
-    if (issueCount > 0) {
-      setDismissed(false);
+    if (health && issues.length === 0) {
+      forgetDismissedCLIHealthWarning();
+      if (dismissedFingerprint !== null) {
+        setDismissedFingerprint(null);
+      }
     }
-  }, [issueCount]);
+  }, [dismissedFingerprint, health, issues.length]);
 
-  if (isLoading || dismissed || !health) {
+  if (isLoading || !health) {
     return null;
   }
 
-  const issues = collectIssues(health);
-
-  if (issues.length === 0) {
+  if (
+    !warningFingerprint ||
+    dismissedFingerprint === warningFingerprint ||
+    isCLIHealthWarningDismissed(warningFingerprint)
+  ) {
     return null;
   }
 
@@ -264,7 +328,10 @@ export function CLIHealthBanner() {
       isRefetching={isRefetching}
       isUpgrading={upgradeProviderCli.isPending}
       onRecheck={() => refetch()}
-      onDismiss={() => setDismissed(true)}
+      onDismiss={() => {
+        rememberDismissedCLIHealthWarning(warningFingerprint);
+        setDismissedFingerprint(warningFingerprint);
+      }}
       onUpgrade={(provider) => upgradeProviderCli.mutate({ provider })}
     />
   );

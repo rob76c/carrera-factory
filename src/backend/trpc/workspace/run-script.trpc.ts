@@ -1,20 +1,20 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
-import { runScriptConfigPersistenceService } from '@/backend/services/run-script-config-persistence.service';
-import { workspaceDataService } from '@/backend/services/workspace';
-import { publicProcedure, router } from '@/backend/trpc/trpc';
+import { publicProcedure, router, trustedLocalProcedure } from '@/backend/trpc/trpc';
 import { FactoryConfigSchema } from '@/shared/schemas/factory-config.schema';
 
 export const workspaceRunScriptRouter = router({
   // Create factory-factory.json configuration file
-  createFactoryConfig: publicProcedure
+  createFactoryConfig: trustedLocalProcedure
     .input(
       z.object({
         workspaceId: z.string(),
         config: FactoryConfigSchema,
       })
     )
-    .mutation(async ({ input }) => {
+    .mutation(async ({ ctx, input }) => {
+      const { runScriptConfigPersistenceService, workspaceDataService, workspaceRunScriptService } =
+        ctx.appContext.services;
       const workspace = await workspaceDataService.findByIdWithProject(input.workspaceId);
 
       if (!workspace) {
@@ -38,12 +38,7 @@ export const workspaceRunScriptRouter = router({
           projectRepoPath: workspace.project?.repoPath,
           config: input.config,
           persistWorkspaceCommands: (id, commands) =>
-            workspaceDataService.setRunScriptCommands(
-              id,
-              commands.runScriptCommand,
-              commands.runScriptPostRunCommand,
-              commands.runScriptCleanupCommand
-            ),
+            workspaceRunScriptService.setCommands(id, commands),
         });
 
         return { success: true };
@@ -55,7 +50,7 @@ export const workspaceRunScriptRouter = router({
       }
     }),
   // Start the run script for a workspace
-  startRunScript: publicProcedure
+  startRunScript: trustedLocalProcedure
     .input(z.object({ workspaceId: z.string() }))
     .mutation(async ({ ctx, input }) => {
       const result = await ctx.appContext.services.runScriptService.startRunScript(
@@ -78,7 +73,7 @@ export const workspaceRunScriptRouter = router({
     }),
 
   // Stop the run script for a workspace
-  stopRunScript: publicProcedure
+  stopRunScript: trustedLocalProcedure
     .input(z.object({ workspaceId: z.string() }))
     .mutation(async ({ ctx, input }) => {
       const result = await ctx.appContext.services.runScriptService.stopRunScript(

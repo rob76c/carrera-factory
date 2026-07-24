@@ -12,8 +12,8 @@
  * - RCNL-04: Drift detection compares existing snapshot against authoritative values
  *
  * Import rules (same as event-collector.orchestrator.ts):
- * - Domain singletons from domain barrels (orchestration layer is allowed)
- * - Store from @/backend/services/workspace-snapshot-store.service
+ * - Dependency types and pure helpers from domain barrels
+ * - Runtime accessors, stores, Git, logging, and session ports supplied at construction
  * - NOT re-exported from orchestration/index.ts (circular dep avoidance)
  */
 
@@ -23,15 +23,16 @@ import {
   buildWorkspaceSessionSummaries,
   hasWorkingSessionSummary,
 } from '@/backend/lib/session-summaries';
-import { gitOpsService } from '@/backend/services/git-ops.service';
-import { createLogger } from '@/backend/services/logger.service';
-import { chatEventForwarderService, sessionService } from '@/backend/services/session';
-import { computePendingRequestType, workspaceAccessor } from '@/backend/services/workspace';
+import type { createLogger } from '@/backend/services/logger.service';
+import type { sessionService } from '@/backend/services/session';
 import {
+  computePendingRequestType,
+  type gitOpsService,
   type SnapshotUpdateInput,
   type WorkspaceSnapshotEntry,
-  workspaceSnapshotStore,
-} from '@/backend/services/workspace-snapshot-store.service';
+  type workspaceMaintenanceService,
+  type workspaceSnapshotStore,
+} from '@/backend/services/workspace';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -39,17 +40,6 @@ import {
 
 const RECONCILIATION_INTERVAL_MS = 60_000;
 const GIT_CONCURRENCY = 10;
-
-type SnapshotReconciliationSessionServices = {
-  chatEventForwarderService: typeof chatEventForwarderService;
-  sessionService: typeof sessionService;
-};
-
-// ---------------------------------------------------------------------------
-// Logger
-// ---------------------------------------------------------------------------
-
-const logger = createLogger('snapshot-reconciliation');
 
 // ---------------------------------------------------------------------------
 // Types
@@ -62,7 +52,25 @@ export interface ReconciliationBridges {
   };
 }
 
+export interface SnapshotReconciliationDependencies extends ReconciliationBridges {
+  createLogger(
+    component: string
+  ): Pick<ReturnType<typeof createLogger>, 'debug' | 'error' | 'info' | 'warn'>;
+  gitOpsService: Pick<typeof gitOpsService, 'getWorkspaceGitStats'>;
+  workspaceMaintenanceService: Pick<
+    typeof workspaceMaintenanceService,
+    'findActiveWithSessionsAndProject'
+  >;
+  workspaceSnapshotStore: Pick<
+    typeof workspaceSnapshotStore,
+    'getAllWorkspaceIds' | 'getByWorkspaceId' | 'remove' | 'upsert'
+  >;
+}
+
 export interface ReconciliationResult {
+  workspacesScanned: number;
+  workspacesChanged: number;
+  deltasEmitted: number;
   workspacesReconciled: number;
   driftsDetected: number;
   staleEntriesRemoved: number;
@@ -90,6 +98,8 @@ type DriftComparableField =
   | 'prNumber'
   | 'ratchetEnabled'
   | 'ratchetState'
+  | 'ratchetDispatchOutcome'
+  | 'ratchetDispatchRetryCount'
   | 'runScriptStatus'
   | 'isWorking'
   | 'pendingRequestType'
@@ -98,7 +108,15 @@ type DriftComparableField =
 const DRIFT_FIELD_GROUPS: { group: string; fields: DriftComparableField[] }[] = [
   { group: 'workspace', fields: ['status', 'name', 'branchName'] },
   { group: 'pr', fields: ['prState', 'prCiStatus', 'prNumber'] },
-  { group: 'ratchet', fields: ['ratchetEnabled', 'ratchetState'] },
+  {
+    group: 'ratchet',
+    fields: [
+      'ratchetEnabled',
+      'ratchetState',
+      'ratchetDispatchOutcome',
+      'ratchetDispatchRetryCount',
+    ],
+  },
   { group: 'runScript', fields: ['runScriptStatus'] },
   { group: 'session', fields: ['isWorking', 'pendingRequestType', 'sessionSummaries'] },
 ];
@@ -138,20 +156,16 @@ export function detectDrift(
 // ---------------------------------------------------------------------------
 
 export class SnapshotReconciliationService {
+  private readonly logger: Pick<
+    ReturnType<typeof createLogger>,
+    'debug' | 'error' | 'info' | 'warn'
+  >;
   private interval: NodeJS.Timeout | null = null;
   private isShuttingDown = false;
   private reconcileInProgress: Promise<ReconciliationResult> | null = null;
-  private _bridges: ReconciliationBridges | null = null;
 
-  private get bridges(): ReconciliationBridges {
-    if (!this._bridges) {
-      throw new Error('SnapshotReconciliationService not configured: call configure() first.');
-    }
-    return this._bridges;
-  }
-
-  configure(bridges: ReconciliationBridges): void {
-    this._bridges = bridges;
+  constructor(private readonly dependencies: Readonly<SnapshotReconciliationDependencies>) {
+    this.logger = dependencies.createLogger('snapshot-reconciliation');
   }
 
   start(): void {
@@ -163,8 +177,11 @@ export class SnapshotReconciliationService {
     // Run initial reconciliation immediately
     this.reconcileInProgress = this.reconcile()
       .catch((err) => {
-        logger.error('Initial reconciliation failed', { error: String(err) });
+        this.logger.error('Initial reconciliation failed', { error: String(err) });
         return {
+          workspacesScanned: 0,
+          workspacesChanged: 0,
+          deltasEmitted: 0,
           workspacesReconciled: 0,
           driftsDetected: 0,
           staleEntriesRemoved: 0,
@@ -183,8 +200,11 @@ export class SnapshotReconciliationService {
       }
       this.reconcileInProgress = this.reconcile()
         .catch((err) => {
-          logger.error('Reconciliation tick failed', { error: String(err) });
+          this.logger.error('Reconciliation tick failed', { error: String(err) });
           return {
+            workspacesScanned: 0,
+            workspacesChanged: 0,
+            deltasEmitted: 0,
             workspacesReconciled: 0,
             driftsDetected: 0,
             staleEntriesRemoved: 0,
@@ -226,7 +246,9 @@ export class SnapshotReconciliationService {
    */
   private buildAuthoritativeFields(
     ws: Awaited<
-      ReturnType<typeof workspaceAccessor.findAllNonArchivedWithSessionsAndProject>
+      ReturnType<
+        SnapshotReconciliationDependencies['workspaceMaintenanceService']['findActiveWithSessionsAndProject']
+      >
     >[number],
     allPendingRequests: Map<string, { toolName: string; input?: Record<string, unknown> }>,
     gitStatsMap: Map<
@@ -236,7 +258,7 @@ export class SnapshotReconciliationService {
   ): SnapshotUpdateInput {
     const sessionIds = [...(ws.agentSessions?.map((s) => s.id) ?? [])];
     const sessionSummaries = buildWorkspaceSessionSummaries(ws.agentSessions ?? [], (sessionId) =>
-      this.bridges.session.getRuntimeSnapshot(sessionId)
+      this.dependencies.session.getRuntimeSnapshot(sessionId)
     );
     const isWorking = hasWorkingSessionSummary(sessionSummaries);
     const pendingRequestType = computePendingRequestType(sessionIds, allPendingRequests);
@@ -266,6 +288,8 @@ export class SnapshotReconciliationService {
       prUpdatedAt: ws.prUpdatedAt?.toISOString() ?? null,
       ratchetEnabled: ws.ratchetEnabled,
       ratchetState: ws.ratchetState,
+      ratchetDispatchOutcome: ws.ratchetDispatchOutcome,
+      ratchetDispatchRetryCount: ws.ratchetDispatchRetryCount,
       runScriptStatus: ws.runScriptStatus,
       isWorking,
       pendingRequestType,
@@ -278,29 +302,35 @@ export class SnapshotReconciliationService {
   /**
    * Remove snapshot entries for workspaces no longer in the DB.
    */
-  private removeStaleEntries(dbWorkspaceIds: Set<string>): number {
-    const storeWorkspaceIds = workspaceSnapshotStore.getAllWorkspaceIds();
+  private removeStaleEntries(dbWorkspaceIds: Set<string>): {
+    staleEntriesRemoved: number;
+    deltasEmitted: number;
+  } {
+    const storeWorkspaceIds = this.dependencies.workspaceSnapshotStore.getAllWorkspaceIds();
     let removed = 0;
 
     for (const storeId of storeWorkspaceIds) {
-      if (!dbWorkspaceIds.has(storeId)) {
-        workspaceSnapshotStore.remove(storeId);
+      if (
+        !dbWorkspaceIds.has(storeId) &&
+        this.dependencies.workspaceSnapshotStore.remove(storeId)
+      ) {
         removed++;
-        logger.info('Removed stale snapshot entry', { workspaceId: storeId });
+        this.logger.info('Removed stale snapshot entry', { workspaceId: storeId });
       }
     }
 
-    return removed;
+    return { staleEntriesRemoved: removed, deltasEmitted: removed };
   }
 
   async reconcile(): Promise<ReconciliationResult> {
     const pollStartTs = Date.now();
 
     // 1. Fetch all non-archived workspaces from DB
-    const workspaces = await workspaceAccessor.findAllNonArchivedWithSessionsAndProject();
+    const workspaces =
+      await this.dependencies.workspaceMaintenanceService.findActiveWithSessionsAndProject();
 
     // 2. Get pending requests from bridges
-    const allPendingRequests = this.bridges.session.getAllPendingRequests();
+    const allPendingRequests = this.dependencies.session.getAllPendingRequests();
 
     // 3. Compute git stats with concurrency limit (RCNL-02)
     const gitLimit = pLimit(GIT_CONCURRENCY);
@@ -318,7 +348,10 @@ export class SnapshotReconciliationService {
           }
           const defaultBranch = ws.project?.defaultBranch ?? 'main';
           try {
-            const stats = await gitOpsService.getWorkspaceGitStats(ws.worktreePath, defaultBranch);
+            const stats = await this.dependencies.gitOpsService.getWorkspaceGitStats(
+              ws.worktreePath,
+              defaultBranch
+            );
             gitStatsMap.set(ws.id, stats);
           } catch {
             gitStatsMap.set(ws.id, null);
@@ -330,6 +363,8 @@ export class SnapshotReconciliationService {
     // 4. Reconcile each workspace
     let driftsDetected = 0;
     let gitStatsComputed = 0;
+    let workspacesChanged = 0;
+    let deltasEmitted = 0;
 
     for (const ws of workspaces) {
       const authoritativeFields = this.buildAuthoritativeFields(
@@ -343,12 +378,12 @@ export class SnapshotReconciliationService {
       }
 
       // Drift detection (RCNL-04)
-      const existing = workspaceSnapshotStore.getByWorkspaceId(ws.id);
+      const existing = this.dependencies.workspaceSnapshotStore.getByWorkspaceId(ws.id);
       if (existing) {
         const drifts = detectDrift(existing, authoritativeFields);
         if (drifts.length > 0) {
           driftsDetected += drifts.length;
-          logger.warn('Snapshot drift detected', {
+          this.logger.warn('Snapshot drift detected', {
             workspaceId: ws.id,
             driftCount: drifts.length,
             drifts: drifts.map((d) => ({
@@ -362,26 +397,44 @@ export class SnapshotReconciliationService {
       }
 
       // Upsert with pollStartTs (RCNL-03)
-      workspaceSnapshotStore.upsert(ws.id, authoritativeFields, 'reconciliation', pollStartTs);
+      const upsertResult = this.dependencies.workspaceSnapshotStore.upsert(
+        ws.id,
+        authoritativeFields,
+        'reconciliation',
+        pollStartTs
+      );
+      if (upsertResult.changed) {
+        workspacesChanged++;
+      }
+      if (upsertResult.emitted) {
+        deltasEmitted++;
+      }
     }
 
     // 5. Stale entry cleanup
-    const staleEntriesRemoved = this.removeStaleEntries(new Set(workspaces.map((w) => w.id)));
+    const staleCleanup = this.removeStaleEntries(new Set(workspaces.map((w) => w.id)));
+    deltasEmitted += staleCleanup.deltasEmitted;
 
     // 6. Log summary
     const durationMs = Date.now() - pollStartTs;
-    logger.info('Reconciliation complete', {
+    this.logger.info('Reconciliation complete', {
+      workspacesScanned: workspaces.length,
+      workspacesChanged,
+      deltasEmitted,
       workspacesReconciled: workspaces.length,
       driftsDetected,
-      staleEntriesRemoved,
+      staleEntriesRemoved: staleCleanup.staleEntriesRemoved,
       gitStatsComputed,
       durationMs,
     });
 
     return {
+      workspacesScanned: workspaces.length,
+      workspacesChanged,
+      deltasEmitted,
       workspacesReconciled: workspaces.length,
       driftsDetected,
-      staleEntriesRemoved,
+      staleEntriesRemoved: staleCleanup.staleEntriesRemoved,
       gitStatsComputed,
       durationMs,
     };
@@ -389,29 +442,9 @@ export class SnapshotReconciliationService {
 }
 
 // ---------------------------------------------------------------------------
-// Singleton + configure function
-// ---------------------------------------------------------------------------
-
-export const snapshotReconciliationService = new SnapshotReconciliationService();
-
-/**
- * Configure and start the snapshot reconciliation service.
- * Must be called AFTER configureDomainBridges() in server startup.
- */
-export function configureSnapshotReconciliation(
-  services: Partial<SnapshotReconciliationSessionServices> = {}
-): void {
-  const resolved = {
-    chatEventForwarderService,
-    sessionService,
-    ...services,
-  };
-
-  snapshotReconciliationService.configure({
-    session: {
-      getRuntimeSnapshot: (sessionId) => resolved.sessionService.getRuntimeSnapshot(sessionId),
-      getAllPendingRequests: () => resolved.chatEventForwarderService.getAllPendingRequests(),
-    },
-  });
-  snapshotReconciliationService.start();
-}
+// Compatibility for transport integration fixtures that only require the
+// read-only startup wait port. Runtime composition creates a fully injected
+// SnapshotReconciliationService in app-context.ts.
+export const snapshotReconciliationService = Object.freeze({
+  waitForInProgress: () => Promise.resolve(),
+});

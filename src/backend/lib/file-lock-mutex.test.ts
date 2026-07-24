@@ -13,6 +13,15 @@ async function exists(targetPath: string): Promise<boolean> {
   }
 }
 
+function lockMetadata(lockId: string): string {
+  return `${JSON.stringify({
+    version: 1,
+    lockId,
+    pid: process.pid,
+    createdAt: new Date().toISOString(),
+  })}\n`;
+}
+
 describe('FileLockMutex', () => {
   it('acquires and releases a lock file', async () => {
     const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ff-lock-mutex-'));
@@ -133,6 +142,142 @@ describe('FileLockMutex', () => {
       expect(await exists(lockPath)).toBe(true);
       await release();
       expect(await exists(lockPath)).toBe(false);
+    } finally {
+      await fs.rm(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not delete a fresh replacement when stale lock claim races with replacement', async () => {
+    const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ff-lock-mutex-'));
+    const lockPath = path.join(baseDir, 'race.lock');
+    const freshLockContent = lockMetadata('fresh-lock-id');
+    await fs.writeFile(lockPath, freshLockContent, 'utf-8');
+
+    const mutex = new FileLockMutex({
+      staleThresholdMs: 20,
+    });
+
+    try {
+      const removed = await (
+        mutex as unknown as {
+          claimAndRemoveStaleLock: (
+            lockPath: string,
+            expectedLockId: string | undefined
+          ) => Promise<boolean>;
+        }
+      ).claimAndRemoveStaleLock(lockPath, 'stale-lock-id');
+
+      expect(removed).toBe(false);
+      expect(await fs.readFile(lockPath, 'utf-8')).toBe(freshLockContent);
+      expect(
+        (await fs.readdir(baseDir)).filter((name) => name.includes('.race.lock.stale'))
+      ).toEqual([]);
+    } finally {
+      await fs.rm(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it('removes claimed stale lock when restore races with a new lock', async () => {
+    const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ff-lock-mutex-'));
+    const lockPath = path.join(baseDir, 'restore-race.lock');
+    const claimedPath = path.join(baseDir, '.restore-race.lock.stale-test');
+    const freshLockContent = lockMetadata('fresh-lock-id');
+    await fs.writeFile(lockPath, freshLockContent, 'utf-8');
+    await fs.writeFile(claimedPath, lockMetadata('claimed-lock-id'), 'utf-8');
+
+    const mutex = new FileLockMutex();
+
+    try {
+      await (
+        mutex as unknown as {
+          restoreClaimedLock: (lockPath: string, claimedPath: string) => Promise<void>;
+        }
+      ).restoreClaimedLock(lockPath, claimedPath);
+
+      expect(await fs.readFile(lockPath, 'utf-8')).toBe(freshLockContent);
+      expect(await exists(claimedPath)).toBe(false);
+    } finally {
+      await fs.rm(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it('propagates unexpected claimed lock restore failures', async () => {
+    const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ff-lock-mutex-'));
+    const lockPath = path.join(baseDir, 'restore-failure.lock');
+    const claimedPath = path.join(baseDir, '.restore-failure.lock.stale-test');
+    await fs.mkdir(claimedPath);
+
+    const mutex = new FileLockMutex();
+
+    try {
+      await expect(
+        (
+          mutex as unknown as {
+            restoreClaimedLock: (lockPath: string, claimedPath: string) => Promise<void>;
+          }
+        ).restoreClaimedLock(lockPath, claimedPath)
+      ).rejects.toThrow();
+
+      expect(await exists(lockPath)).toBe(false);
+      expect(await exists(claimedPath)).toBe(true);
+    } finally {
+      await fs.rm(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it('propagates restore failures from the stale lock acquisition path', async () => {
+    const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ff-lock-mutex-'));
+    const lockPath = path.join(baseDir, 'stale-restore-failure.lock');
+    const restoreError = new Error('restore failed');
+    await fs.writeFile(lockPath, lockMetadata('stale-lock-id'), 'utf-8');
+
+    const staleTime = new Date(Date.now() - 60_000);
+    await fs.utimes(lockPath, staleTime, staleTime);
+
+    const mutex = new FileLockMutex({
+      staleThresholdMs: 20,
+    });
+
+    try {
+      (
+        mutex as unknown as {
+          claimAndRemoveStaleLock: (
+            lockPath: string,
+            expectedLockId: string | undefined
+          ) => Promise<boolean>;
+        }
+      ).claimAndRemoveStaleLock = () => Promise.reject(restoreError);
+
+      await expect(
+        (
+          mutex as unknown as {
+            tryRemoveStaleLock: (lockPath: string) => Promise<boolean>;
+          }
+        ).tryRemoveStaleLock(lockPath)
+      ).rejects.toBe(restoreError);
+    } finally {
+      await fs.rm(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects restore when the claimed lock vanishes before restore', async () => {
+    const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ff-lock-mutex-'));
+    const lockPath = path.join(baseDir, 'missing-claimed.lock');
+    const claimedPath = path.join(baseDir, '.missing-claimed.lock.stale-test');
+
+    const mutex = new FileLockMutex();
+
+    try {
+      await expect(
+        (
+          mutex as unknown as {
+            restoreClaimedLock: (lockPath: string, claimedPath: string) => Promise<void>;
+          }
+        ).restoreClaimedLock(lockPath, claimedPath)
+      ).rejects.toThrow();
+
+      expect(await exists(lockPath)).toBe(false);
+      expect(await exists(claimedPath)).toBe(false);
     } finally {
       await fs.rm(baseDir, { recursive: true, force: true });
     }

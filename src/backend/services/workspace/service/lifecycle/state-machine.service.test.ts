@@ -154,7 +154,7 @@ describe('WorkspaceStateMachineService', () => {
     });
 
     it('should transition from PROVISIONING to FAILED with error message', async () => {
-      const workspace = { id: 'ws-1', status: 'PROVISIONING' };
+      const workspace = { id: 'ws-1', status: 'PROVISIONING', cachedKanbanColumn: 'WAITING' };
       const updatedWorkspace = {
         ...workspace,
         status: 'FAILED',
@@ -174,8 +174,28 @@ describe('WorkspaceStateMachineService', () => {
         where: { id: 'ws-1', status: 'PROVISIONING' },
         data: expect.objectContaining({
           status: 'FAILED',
+          cachedKanbanColumn: 'WAITING',
           initCompletedAt: expect.any(Date),
           initErrorMessage: 'Git clone failed',
+        }),
+      });
+    });
+
+    it('should update cached kanban column when transitioning to FAILED', async () => {
+      const workspace = { id: 'ws-1', status: 'PROVISIONING', cachedKanbanColumn: 'WAITING' };
+      const updatedWorkspace = { ...workspace, status: 'FAILED', cachedKanbanColumn: 'WAITING' };
+
+      mockFindUnique.mockResolvedValue(workspace);
+      mockUpdateMany.mockResolvedValue({ count: 1 });
+      mockFindUniqueOrThrow.mockResolvedValue(updatedWorkspace);
+
+      await workspaceStateMachine.transition('ws-1', 'FAILED');
+
+      expect(mockUpdateMany).toHaveBeenCalledWith({
+        where: { id: 'ws-1', status: 'PROVISIONING' },
+        data: expect.objectContaining({
+          status: 'FAILED',
+          cachedKanbanColumn: 'WAITING',
         }),
       });
     });
@@ -264,7 +284,7 @@ describe('WorkspaceStateMachineService', () => {
     });
 
     it('should transition from READY to ARCHIVING', async () => {
-      const workspace = { id: 'ws-1', status: 'READY' };
+      const workspace = { id: 'ws-1', status: 'READY', cachedKanbanColumn: 'WAITING' };
       const updatedWorkspace = { ...workspace, status: 'ARCHIVING' };
 
       mockFindUnique.mockResolvedValue(workspace);
@@ -274,6 +294,13 @@ describe('WorkspaceStateMachineService', () => {
       const result = await workspaceStateMachine.transition('ws-1', 'ARCHIVING');
 
       expect(result.status).toBe('ARCHIVING');
+      expect(mockUpdateMany).toHaveBeenCalledWith({
+        where: { id: 'ws-1', status: 'READY' },
+        data: expect.not.objectContaining({
+          cachedKanbanColumn: expect.anything(),
+          stateComputedAt: expect.anything(),
+        }),
+      });
     });
 
     it('should transition from FAILED to ARCHIVING', async () => {
@@ -356,8 +383,18 @@ describe('WorkspaceStateMachineService', () => {
     });
 
     it('should transition from FAILED to PROVISIONING (retry)', async () => {
-      const workspace = { id: 'ws-1', status: 'FAILED', initRetryCount: 1 };
-      const updatedWorkspace = { ...workspace, status: 'PROVISIONING', initRetryCount: 2 };
+      const workspace = {
+        id: 'ws-1',
+        status: 'FAILED',
+        initRetryCount: 1,
+        cachedKanbanColumn: 'WAITING',
+      };
+      const updatedWorkspace = {
+        ...workspace,
+        status: 'PROVISIONING',
+        initRetryCount: 2,
+        cachedKanbanColumn: 'WORKING',
+      };
 
       mockFindUnique
         .mockResolvedValueOnce(workspace) // First call for status check
@@ -375,6 +412,8 @@ describe('WorkspaceStateMachineService', () => {
         },
         data: expect.objectContaining({
           status: 'PROVISIONING',
+          cachedKanbanColumn: 'WORKING',
+          stateComputedAt: expect.any(Date),
           initRetryCount: { increment: 1 },
           initStartedAt: expect.any(Date),
           initErrorMessage: null,
@@ -726,7 +765,125 @@ describe('WorkspaceStateMachineService', () => {
         workspaceId: 'ws-1',
         fromStatus: 'PROVISIONING',
         toStatus: 'READY',
+        workspace: updatedWorkspace,
       });
+    });
+
+    it('includes the re-read workspace row in the emitted event', async () => {
+      const workspace = { id: 'ws-1', status: 'PROVISIONING' };
+      const updatedWorkspace = { ...workspace, status: 'READY', branchName: 'feature/test' };
+
+      mockFindUnique.mockResolvedValue(workspace);
+      mockUpdateMany.mockResolvedValue({ count: 1 });
+      mockFindUniqueOrThrow.mockResolvedValue(updatedWorkspace);
+
+      const events: WorkspaceStateChangedEvent[] = [];
+      workspaceStateMachine.on(WORKSPACE_STATE_CHANGED, (event: WorkspaceStateChangedEvent) => {
+        events.push(event);
+      });
+
+      await workspaceStateMachine.transition('ws-1', 'READY', { branchName: 'feature/test' });
+
+      expect(events).toHaveLength(1);
+      expect(events[0]?.workspace).toEqual(updatedWorkspace);
+    });
+
+    it('includes the re-read workspace row on startProvisioning retry', async () => {
+      const workspace = { id: 'ws-1', status: 'FAILED', initRetryCount: 0 };
+      const updatedWorkspace = { ...workspace, status: 'PROVISIONING', initRetryCount: 1 };
+
+      mockFindUnique.mockResolvedValueOnce(workspace).mockResolvedValueOnce(updatedWorkspace);
+      mockUpdateMany.mockResolvedValue({ count: 1 });
+
+      const events: WorkspaceStateChangedEvent[] = [];
+      workspaceStateMachine.on(WORKSPACE_STATE_CHANGED, (event: WorkspaceStateChangedEvent) => {
+        events.push(event);
+      });
+
+      await workspaceStateMachine.startProvisioning('ws-1');
+
+      expect(events).toHaveLength(1);
+      expect(events[0]?.workspace).toEqual(updatedWorkspace);
+    });
+
+    it('includes the re-read workspace row on startArchivingWithSourceStatus', async () => {
+      const workspace = { id: 'ws-1', status: 'READY' };
+      const updatedWorkspace = { ...workspace, status: 'ARCHIVING' };
+
+      mockFindUnique.mockResolvedValue(workspace);
+      mockUpdateMany.mockResolvedValue({ count: 1 });
+      mockFindUniqueOrThrow.mockResolvedValue(updatedWorkspace);
+
+      const events: WorkspaceStateChangedEvent[] = [];
+      workspaceStateMachine.on(WORKSPACE_STATE_CHANGED, (event: WorkspaceStateChangedEvent) => {
+        events.push(event);
+      });
+
+      await workspaceStateMachine.startArchivingWithSourceStatus('ws-1');
+
+      expect(events).toHaveLength(1);
+      expect(events[0]?.workspace).toEqual(updatedWorkspace);
+    });
+
+    it('includes the re-read workspace row on startProvisioningFromReady', async () => {
+      const workspace = { id: 'ws-1', status: 'READY', initRetryCount: 0 };
+      const updatedWorkspace = { ...workspace, status: 'PROVISIONING', initRetryCount: 1 };
+
+      mockFindUnique.mockResolvedValueOnce(workspace).mockResolvedValueOnce(updatedWorkspace);
+      mockUpdateMany.mockResolvedValue({ count: 1 });
+
+      const events: WorkspaceStateChangedEvent[] = [];
+      workspaceStateMachine.on(WORKSPACE_STATE_CHANGED, (event: WorkspaceStateChangedEvent) => {
+        events.push(event);
+      });
+
+      await workspaceStateMachine.startProvisioningFromReady('ws-1');
+
+      expect(events).toHaveLength(1);
+      expect(events[0]).toEqual({
+        workspaceId: 'ws-1',
+        fromStatus: 'READY',
+        toStatus: 'PROVISIONING',
+        workspace: updatedWorkspace,
+      });
+    });
+
+    it('does NOT emit when the transition was superseded before the re-read', async () => {
+      const workspace = { id: 'ws-1', status: 'PROVISIONING' };
+      // Another transition (READY -> ARCHIVING) committed between our CAS and
+      // the re-read: the row no longer reflects this transition's target.
+      const supersededWorkspace = { ...workspace, status: 'ARCHIVING' };
+
+      mockFindUnique.mockResolvedValue(workspace);
+      mockUpdateMany.mockResolvedValue({ count: 1 });
+      mockFindUniqueOrThrow.mockResolvedValue(supersededWorkspace);
+
+      const events: WorkspaceStateChangedEvent[] = [];
+      workspaceStateMachine.on(WORKSPACE_STATE_CHANGED, (event: WorkspaceStateChangedEvent) => {
+        events.push(event);
+      });
+
+      await workspaceStateMachine.transition('ws-1', 'READY');
+
+      expect(events).toHaveLength(0);
+    });
+
+    it('does NOT emit on startProvisioning retry when the re-read finds no row', async () => {
+      const workspace = { id: 'ws-1', status: 'FAILED', initRetryCount: 0 };
+
+      mockFindUnique
+        .mockResolvedValueOnce(workspace) // Status check
+        .mockResolvedValueOnce(null); // Workspace deleted after the update
+      mockUpdateMany.mockResolvedValue({ count: 1 });
+
+      const events: WorkspaceStateChangedEvent[] = [];
+      workspaceStateMachine.on(WORKSPACE_STATE_CHANGED, (event: WorkspaceStateChangedEvent) => {
+        events.push(event);
+      });
+
+      await workspaceStateMachine.startProvisioning('ws-1');
+
+      expect(events).toHaveLength(0);
     });
 
     it('does NOT emit on CAS failure', async () => {
@@ -784,6 +941,7 @@ describe('WorkspaceStateMachineService', () => {
         workspaceId: 'ws-1',
         fromStatus: 'FAILED',
         toStatus: 'PROVISIONING',
+        workspace: updatedWorkspace,
       });
     });
 
@@ -823,6 +981,7 @@ describe('WorkspaceStateMachineService', () => {
         workspaceId: 'ws-1',
         fromStatus: 'FAILED',
         toStatus: 'NEW',
+        workspace: updatedWorkspace,
       });
     });
 

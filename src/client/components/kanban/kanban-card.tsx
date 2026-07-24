@@ -1,18 +1,20 @@
-import type { Workspace } from '@prisma-gen/browser';
 import {
-  AlertTriangle,
-  Archive,
-  GitBranch,
-  GitPullRequest,
-  MessageSquare,
-  Pencil,
-  Play,
-  RefreshCw,
-} from 'lucide-react';
+  ArchiveIcon,
+  ArrowsClockwiseIcon,
+  ChatIcon,
+  GitBranchIcon,
+  GitPullRequestIcon,
+  PencilIcon,
+  PlayIcon,
+  TreeStructureIcon,
+  WarningIcon,
+} from '@phosphor-icons/react';
+import type { Workspace } from '@prisma-gen/browser';
 import { useRef, useState } from 'react';
 import { Link } from 'react-router';
-import { PendingRequestBadge } from '@/client/components/pending-request-badge';
+import { trpc } from '@/client/lib/trpc';
 import { isWorkspaceDoneOrMerged } from '@/client/lib/workspace-archive';
+import { shouldShowWorkspaceStatusReason } from '@/client/lib/workspace-status-reason-display';
 import { CiStatusChip } from '@/components/shared/ci-status-chip';
 import { PrStateBadge } from '@/components/shared/pr-state-badge';
 import { SetupStatusChip } from '@/components/shared/setup-status-chip';
@@ -28,6 +30,7 @@ import { cn } from '@/lib/utils';
 import type { KanbanColumn, WorkspaceSidebarCiState, WorkspaceStatus } from '@/shared/core';
 import { findWorkspaceSessionRuntimeError, type SessionSummary } from '@/shared/session-runtime';
 import { deriveWorkspaceSidebarStatus } from '@/shared/workspace-sidebar-status';
+import type { WorkspaceStatusReason } from '@/shared/workspace-status-reason';
 
 export interface WorkspaceWithKanban extends Workspace {
   kanbanColumn: KanbanColumn | null;
@@ -35,6 +38,7 @@ export interface WorkspaceWithKanban extends Workspace {
   sessionSummaries?: SessionSummary[];
   ratchetButtonAnimated?: boolean;
   flowPhase?: string | null;
+  statusReason?: WorkspaceStatusReason | null;
   isArchived?: boolean;
   pendingRequestType?: 'plan_approval' | 'user_question' | 'permission_request' | null;
 }
@@ -86,7 +90,7 @@ function PullRequestRow({
         }}
         className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground"
       >
-        <GitPullRequest className="h-3 w-3 shrink-0" />
+        <GitPullRequestIcon className="h-3 w-3 shrink-0" />
         <span>#{workspace.prNumber}</span>
       </button>
     </div>
@@ -100,7 +104,7 @@ function BranchRow({ branchName }: { branchName: string | null }) {
 
   return (
     <div className="flex items-center gap-2 text-[11px] text-muted-foreground min-w-0">
-      <GitBranch className="h-3 w-3 shrink-0" />
+      <GitBranchIcon className="h-3 w-3 shrink-0" />
       <span className="font-mono truncate">{branchName}</span>
     </div>
   );
@@ -130,6 +134,12 @@ function CardArchiveButton({
 }) {
   const [dialogOpen, setDialogOpen] = useState(false);
   const requiresConfirmation = !isWorkspaceDoneOrMerged(workspace);
+  const isParent = workspace.creationSource !== 'CHILD_WORKSPACE';
+  const { data: children } = trpc.workspace.listChildren.useQuery(
+    { parentWorkspaceId: workspace.id },
+    { enabled: requiresConfirmation && dialogOpen && isParent }
+  );
+  const activeChildCount = children?.length ?? 0;
 
   const handleClick = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -154,7 +164,7 @@ function CardArchiveButton({
             )}
             onClick={handleClick}
           >
-            <Archive className="h-3 w-3" />
+            <ArchiveIcon className="h-3 w-3" />
           </Button>
         </TooltipTrigger>
         <TooltipContent>Archive workspace</TooltipContent>
@@ -165,6 +175,7 @@ function CardArchiveButton({
           onOpenChange={setDialogOpen}
           hasUncommitted={false}
           onConfirm={(commitUncommitted) => onArchive(workspace.id, commitUncommitted)}
+          activeChildCount={activeChildCount}
         />
       )}
     </>
@@ -212,7 +223,7 @@ function CardTitleIcons({
                 onStartEdit();
               }}
             >
-              <Pencil className="h-3 w-3" />
+              <PencilIcon className="h-3 w-3" />
             </Button>
           </TooltipTrigger>
           <TooltipContent>Rename workspace</TooltipContent>
@@ -235,7 +246,7 @@ function CardTitleIcons({
                 onOpenQuickChat(workspace.id);
               }}
             >
-              <MessageSquare className="h-3 w-3" />
+              <ChatIcon className="h-3 w-3" />
               {workspace.pendingRequestType && (
                 <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-amber-500" />
               )}
@@ -259,7 +270,7 @@ function CardTitleIcons({
         <Tooltip>
           <TooltipTrigger asChild>
             <span>
-              <Play className="h-3 w-3 text-green-500 fill-green-500 animate-pulse" />
+              <PlayIcon className="h-3 w-3 text-green-500 animate-pulse" weight="fill" />
             </span>
           </TooltipTrigger>
           <TooltipContent>Dev server running</TooltipContent>
@@ -269,7 +280,7 @@ function CardTitleIcons({
         <Tooltip>
           <TooltipTrigger asChild>
             <span>
-              <AlertTriangle className="h-3 w-3 text-amber-500" />
+              <WarningIcon className="h-3 w-3 text-amber-500" />
             </span>
           </TooltipTrigger>
           <TooltipContent>{sessionRuntimeError}</TooltipContent>
@@ -299,15 +310,18 @@ function deriveCardState(workspace: WorkspaceWithKanban) {
   const showSetup = workspace.status === 'NEW' || workspace.status === 'PROVISIONING';
   const showCi = sidebarStatus.ciState !== 'NONE';
   const showBranch = Boolean(workspace.branchName);
-  const showPendingRequest = workspace.pendingRequestType;
+  const showStatusReason =
+    shouldShowWorkspaceStatusReason(workspace.statusReason) &&
+    !(workspace.statusReason.code === 'SESSION_ERROR' && sessionRuntimeError);
   const hasMetadata =
     showSetup ||
+    showStatusReason ||
     showCi ||
     showBranch ||
     showPR ||
-    showPendingRequest ||
     !!sessionRuntimeError ||
-    workspace.mode === 'AUTO_ITERATION';
+    workspace.mode === 'AUTO_ITERATION' ||
+    workspace.creationSource === 'CHILD_WORKSPACE';
   return {
     showPR,
     isArchived,
@@ -317,7 +331,7 @@ function deriveCardState(workspace: WorkspaceWithKanban) {
     showSetup,
     showCi,
     showBranch,
-    showPendingRequest,
+    showStatusReason,
     hasMetadata,
   };
 }
@@ -338,7 +352,7 @@ function AutoIterationBadge({ workspace }: { workspace: WorkspaceWithKanban }) {
     <Tooltip>
       <TooltipTrigger asChild>
         <div className="flex items-center gap-1.5 text-[11px] text-primary/80">
-          <RefreshCw className={cn('h-3 w-3', isRunning && 'animate-spin')} />
+          <ArrowsClockwiseIcon className={cn('h-3 w-3', isRunning && 'animate-spin')} />
           <span className="font-mono">
             Iter {current}/{maxLabel}
           </span>
@@ -369,7 +383,7 @@ export function KanbanCard({
     showSetup,
     showCi,
     showBranch,
-    showPendingRequest,
+    showStatusReason,
     hasMetadata,
   } = deriveCardState(workspace);
 
@@ -471,6 +485,11 @@ export function KanbanCard({
                 <SetupStatusChip status={workspace.status} />
               </div>
             )}
+            {showStatusReason && workspace.statusReason && (
+              <div className="flex items-center text-[11px] font-medium text-muted-foreground">
+                <span className="truncate">{workspace.statusReason.label}</span>
+              </div>
+            )}
             {showCi && (
               <div className="flex items-center">
                 <CiRow ciState={sidebarStatus.ciState} prState={workspace.prState} />
@@ -486,15 +505,16 @@ export function KanbanCard({
                 <PullRequestRow workspace={workspace} showPR={showPR} />
               </div>
             )}
-            {showPendingRequest && (
-              <div className="flex items-center gap-2">
-                <PendingRequestBadge type={showPendingRequest} />
+            {workspace.mode === 'AUTO_ITERATION' && <AutoIterationBadge workspace={workspace} />}
+            {workspace.creationSource === 'CHILD_WORKSPACE' && (
+              <div className="flex items-center gap-1 text-[11px] text-violet-600 dark:text-violet-400">
+                <TreeStructureIcon className="h-3 w-3" />
+                <span>Child workspace</span>
               </div>
             )}
-            {workspace.mode === 'AUTO_ITERATION' && <AutoIterationBadge workspace={workspace} />}
             {sessionRuntimeError && (
               <div className="flex items-center gap-2 text-[11px] text-amber-700 min-w-0">
-                <AlertTriangle className="h-3 w-3 shrink-0" />
+                <WarningIcon className="h-3 w-3 shrink-0" />
                 <span className="truncate">{sessionRuntimeError}</span>
               </div>
             )}

@@ -40,6 +40,53 @@ describe('SessionPermissionService', () => {
     });
   });
 
+  it('reuses the existing ACP permission bridge for repeated session setup', () => {
+    const service = createService();
+
+    const firstBridge = service.createPermissionBridge('session-1');
+    const secondBridge = service.createPermissionBridge('session-1');
+
+    expect(secondBridge).toBe(firstBridge);
+  });
+
+  it('keeps pending ACP permissions reachable when bridge creation is repeated', async () => {
+    const service = createService();
+    const bridge = service.createPermissionBridge('session-1');
+
+    const responsePromise = bridge.waitForUserResponse(
+      'req-1',
+      unsafeCoerce({
+        toolCall: {
+          toolCallId: 'tool-1',
+          title: 'Command',
+          rawInput: { command: 'pwd' },
+        },
+        options: [{ optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' }],
+      })
+    );
+
+    service.createPermissionBridge('session-1');
+
+    expect(service.respondToPermission('session-1', 'req-1', 'allow_once')).toBe(true);
+    expect(bridge.hasPending('req-1')).toBe(false);
+    await expect(responsePromise).resolves.toMatchObject({
+      outcome: {
+        outcome: 'selected',
+        optionId: 'allow_once',
+      },
+    });
+  });
+
+  it('creates a fresh ACP permission bridge after session cancellation clears one', () => {
+    const service = createService();
+    const firstBridge = service.createPermissionBridge('session-1');
+
+    service.cancelPendingRequests('session-1');
+
+    const secondBridge = service.createPermissionBridge('session-1');
+    expect(secondBridge).not.toBe(firstBridge);
+  });
+
   it('cancels pending permissions and clears the bridge for the session', async () => {
     const service = createService();
     const bridge = service.createPermissionBridge('session-1');
@@ -147,6 +194,60 @@ describe('SessionPermissionService', () => {
     );
   });
 
+  it('normalizes free-form user question options before emitting and storing', () => {
+    const service = createService();
+
+    service.handlePermissionRequest(
+      'session-1',
+      unsafeCoerce({
+        type: 'acp_permission_request',
+        requestId: 'req-questions-freeform',
+        params: {
+          toolCall: {
+            toolCallId: 'tool-questions-freeform',
+            title: 'AskUserQuestion',
+            rawInput: {
+              questions: [
+                {
+                  id: 'q1',
+                  question: 'What should happen next?',
+                  header: 'Next',
+                  options: null,
+                },
+              ],
+            },
+          },
+          options: [{ optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' }],
+        },
+      })
+    );
+
+    const expectedQuestions = [
+      {
+        id: 'q1',
+        question: 'What should happen next?',
+        header: 'Next',
+        options: [],
+      },
+    ];
+
+    expect(sessionDomain.emitDelta).toHaveBeenCalledWith(
+      'session-1',
+      expect.objectContaining({
+        type: 'user_question',
+        questions: expectedQuestions,
+      })
+    );
+    expect(sessionDomain.setPendingInteractiveRequest).toHaveBeenCalledWith(
+      'session-1',
+      expect.objectContaining({
+        input: expect.objectContaining({
+          questions: expectedQuestions,
+        }),
+      })
+    );
+  });
+
   it('extracts plan content for ExitPlanMode permission payloads', () => {
     const service = createService();
 
@@ -175,6 +276,45 @@ describe('SessionPermissionService', () => {
       expect.objectContaining({
         type: 'permission_request',
         planContent: '# Plan\n- Step 1',
+      })
+    );
+  });
+
+  it('uses stable ExitPlanMode input type when permission title is only a display label', () => {
+    const service = createService();
+
+    service.handlePermissionRequest(
+      'session-1',
+      unsafeCoerce({
+        type: 'acp_permission_request',
+        requestId: 'req-plan-display-title',
+        params: {
+          toolCall: {
+            toolCallId: 'tool-plan-display-title',
+            title: 'Review Proposed Plan',
+            rawInput: {
+              type: 'ExitPlanMode',
+              plan: '# My Plan',
+            },
+          },
+          options: [{ optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' }],
+        },
+      })
+    );
+
+    expect(sessionDomain.emitDelta).toHaveBeenCalledWith(
+      'session-1',
+      expect.objectContaining({
+        type: 'permission_request',
+        toolName: 'ExitPlanMode',
+        planContent: '# My Plan',
+      })
+    );
+    expect(sessionDomain.setPendingInteractiveRequest).toHaveBeenCalledWith(
+      'session-1',
+      expect.objectContaining({
+        toolName: 'ExitPlanMode',
+        planContent: '# My Plan',
       })
     );
   });

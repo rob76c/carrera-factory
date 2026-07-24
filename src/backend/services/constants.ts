@@ -5,6 +5,7 @@ export const SERVICE_LIMITS = Object.freeze({
   sessionStoreMaxQueueSize: 100,
   startupScriptOutputMaxBytes: 1024 * 1024,
   startupScriptOutputTailBytes: 512 * 1024,
+  workspaceScopedCacheMaxEntries: 1024,
 } as const);
 
 export const SERVICE_TIMEOUT_MS = Object.freeze({
@@ -24,16 +25,19 @@ export const SERVICE_INTERVAL_MS = Object.freeze({
   ratchetPoll: 2 * 60_000, // Increased from 1min to 2min to reduce GitHub API pressure
   schedulerPrSync: 3 * 60 * 1000, // Increased from 2min to 3min to reduce GitHub API pressure
   reconciliationCleanup: 5 * 60 * 1000,
+  periodicTaskPoll: 60_000, // Check for due periodic tasks every 60 seconds
 } as const);
 
 export const SERVICE_CACHE_TTL_MS = Object.freeze({
   ratchetAuthenticatedUsername: 5 * 60_000,
   cliHealth: 30_000,
+  workspacePrFetchInFlight: 10 * 60_000,
+  workspaceSnapshotRemovalGrace: 10 * 60_000,
 } as const);
 
 export const SERVICE_THRESHOLDS = Object.freeze({
   schedulerStaleMinutes: 2,
-  ratchetReviewCheckStaleMs: 10 * 60_000, // 10min: treat prReviewLastCheckedAt as stale if no active session
+  ratchetDispatchMaxRetries: 3, // Max re-dispatches of a DIED fixer for an unchanged PR state
 } as const);
 
 export const SERVICE_TTL_SECONDS = Object.freeze({

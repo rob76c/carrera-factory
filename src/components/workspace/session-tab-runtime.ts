@@ -1,14 +1,18 @@
 import {
-  Activity,
-  CheckCircle2,
-  Circle,
-  CircleSlash,
-  Loader2,
-  type LucideIcon,
-  XCircle,
-} from 'lucide-react';
+  CheckCircleIcon,
+  CircleIcon,
+  type Icon,
+  ProhibitIcon,
+  PulseIcon,
+  SpinnerGapIcon,
+  XCircleIcon,
+} from '@phosphor-icons/react';
 import type { SessionStatus as DbSessionStatus } from '@/shared/core';
-import { getSessionSummaryErrorMessage, type SessionSummary } from '@/shared/session-runtime';
+import {
+  getSessionSummaryErrorMessage,
+  type SessionSummary,
+  sessionUiStatusKindFromSummary,
+} from '@/shared/session-runtime';
 
 export type WorkspaceSessionRuntimeSummary = SessionSummary;
 
@@ -18,7 +22,7 @@ export interface SessionTabRuntimeInfo {
   spin: boolean;
   label: string;
   description: string;
-  icon: LucideIcon;
+  icon: Icon;
   isRunning: boolean;
 }
 
@@ -28,7 +32,7 @@ const IDLE_STATUS: SessionTabRuntimeInfo = {
   spin: false,
   label: 'Idle',
   description: 'Ready for input',
-  icon: Circle,
+  icon: CircleIcon,
   isRunning: false,
 };
 
@@ -40,7 +44,7 @@ function getFallbackStatusInfo(persistedStatus?: DbSessionStatus): SessionTabRun
       spin: false,
       label: 'Running',
       description: 'Processing your request',
-      icon: Activity,
+      icon: PulseIcon,
       isRunning: true,
     };
   }
@@ -52,7 +56,7 @@ function getFallbackStatusInfo(persistedStatus?: DbSessionStatus): SessionTabRun
       spin: false,
       label: 'Paused',
       description: 'Session paused',
-      icon: CircleSlash,
+      icon: ProhibitIcon,
       isRunning: false,
     };
   }
@@ -64,7 +68,7 @@ function getFallbackStatusInfo(persistedStatus?: DbSessionStatus): SessionTabRun
       spin: false,
       label: 'Completed',
       description: 'Session finished',
-      icon: CheckCircle2,
+      icon: CheckCircleIcon,
       isRunning: false,
     };
   }
@@ -76,7 +80,7 @@ function getFallbackStatusInfo(persistedStatus?: DbSessionStatus): SessionTabRun
       spin: false,
       label: 'Failed',
       description: 'Session failed',
-      icon: XCircle,
+      icon: XCircleIcon,
       isRunning: false,
     };
   }
@@ -92,93 +96,89 @@ export function deriveSessionTabRuntime(
     return getFallbackStatusInfo(persistedStatus);
   }
 
-  if (summary.runtimePhase === 'loading') {
-    return {
-      color: 'text-muted-foreground',
-      pulse: false,
-      spin: true,
-      label: 'Loading',
-      description: 'Loading session...',
-      icon: Loader2,
-      isRunning: false,
-    };
-  }
+  switch (sessionUiStatusKindFromSummary(summary)) {
+    case 'loading':
+      return {
+        color: 'text-muted-foreground',
+        pulse: false,
+        spin: true,
+        label: 'Loading',
+        description: 'Loading session...',
+        icon: SpinnerGapIcon,
+        isRunning: false,
+      };
 
-  if (summary.runtimePhase === 'starting') {
-    return {
-      color: 'text-muted-foreground',
-      pulse: false,
-      spin: true,
-      label: 'Starting',
-      description: 'Launching agent...',
-      icon: Loader2,
-      isRunning: false,
-    };
-  }
+    case 'starting':
+      return {
+        color: 'text-muted-foreground',
+        pulse: false,
+        spin: true,
+        label: 'Starting',
+        description: 'Launching agent...',
+        icon: SpinnerGapIcon,
+        isRunning: false,
+      };
 
-  if (summary.runtimePhase === 'stopping') {
-    return {
-      color: 'text-brand',
-      pulse: false,
-      spin: true,
-      label: 'Stopping',
-      description: 'Finishing current request...',
-      icon: Loader2,
-      isRunning: false,
-    };
-  }
+    case 'stopping':
+      return {
+        color: 'text-brand',
+        pulse: false,
+        spin: true,
+        label: 'Stopping',
+        description: 'Finishing current request...',
+        icon: SpinnerGapIcon,
+        isRunning: false,
+      };
 
-  if (summary.runtimePhase === 'error') {
-    const runtimeError = getSessionSummaryErrorMessage(summary);
-    return {
-      color: 'text-destructive',
-      pulse: false,
-      spin: false,
-      label: 'Error',
-      description: runtimeError ?? 'Session entered an error state',
-      icon: XCircle,
-      isRunning: false,
-    };
-  }
+    case 'error':
+      return {
+        color: 'text-destructive',
+        pulse: false,
+        spin: false,
+        label: 'Error',
+        description: getSessionSummaryErrorMessage(summary) ?? 'Session entered an error state',
+        icon: XCircleIcon,
+        isRunning: false,
+      };
 
-  if (summary.processState === 'stopped') {
-    if (summary.lastExit?.unexpected) {
-      const runtimeError = getSessionSummaryErrorMessage(summary);
+    case 'unexpected-exit':
       return {
         color: 'text-destructive',
         pulse: false,
         spin: false,
         label: 'Error',
         description:
-          runtimeError ??
-          `Exited unexpectedly${summary.lastExit.code !== null ? ` (code ${summary.lastExit.code})` : ''}`,
-        icon: XCircle,
+          getSessionSummaryErrorMessage(summary) ??
+          `Exited unexpectedly${summary.lastExit?.code != null ? ` (code ${summary.lastExit.code})` : ''}`,
+        icon: XCircleIcon,
         isRunning: false,
       };
-    }
 
-    return {
-      color: 'text-muted-foreground',
-      pulse: false,
-      spin: false,
-      label: 'Stopped',
-      description: 'Send a message to start',
-      icon: CircleSlash,
-      isRunning: false,
-    };
+    case 'stopped':
+      return {
+        color: 'text-muted-foreground',
+        pulse: false,
+        spin: false,
+        label: 'Stopped',
+        description: 'Send a message to start',
+        icon: ProhibitIcon,
+        isRunning: false,
+      };
+
+    case 'working':
+      return {
+        color: 'text-brand',
+        pulse: true,
+        spin: false,
+        label: 'Running',
+        description: 'Processing your request',
+        icon: PulseIcon,
+        isRunning: true,
+      };
+
+    // No default: the declared return type makes this switch exhaustive, so
+    // adding a SessionUiStatusKind fails to compile until it is handled here.
+    case 'idle':
+      return IDLE_STATUS;
   }
-
-  if (summary.activity === 'WORKING' || summary.runtimePhase === 'running') {
-    return {
-      color: 'text-brand',
-      pulse: true,
-      spin: false,
-      label: 'Running',
-      description: 'Processing your request',
-      icon: Activity,
-      isRunning: true,
-    };
-  }
-
-  return IDLE_STATUS;
 }

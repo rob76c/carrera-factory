@@ -4,18 +4,118 @@
  * Provides operations for managing user settings (IDE preferences, etc).
  */
 
-import { SessionPermissionPreset, SessionProvider } from '@prisma-gen/client';
+import {
+  RatchetReviewTriggerMode,
+  SessionPermissionPreset,
+  SessionProvider,
+} from '@prisma-gen/client';
 import { z } from 'zod';
+import type { ApplicationServices } from '@/backend/app-context';
 import { execCommand } from '@/backend/lib/shell';
-import { userSettingsQueryService } from '@/backend/services/workspace';
 import { publicProcedure, router } from './trpc';
+
+const providerModelOptionSchema = z.object({
+  value: z.string(),
+  label: z.string(),
+  description: z.string().nullable().optional(),
+});
+
+const providerEffortOptionSchema = z.object({
+  value: z.string(),
+  label: z.string(),
+  description: z.string().nullable().optional(),
+});
+
+type ProviderOptions = {
+  models: z.infer<typeof providerModelOptionSchema>[];
+  efforts: z.infer<typeof providerEffortOptionSchema>[];
+  source: 'cli' | 'fallback';
+  error?: string;
+};
+
+const CLAUDE_FALLBACK_OPTIONS: ProviderOptions = {
+  source: 'fallback',
+  models: [
+    { value: 'sonnet', label: 'Sonnet' },
+    { value: 'opus', label: 'Opus' },
+    { value: 'haiku', label: 'Haiku' },
+    { value: 'fable', label: 'Fable' },
+  ],
+  efforts: [
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+  ],
+};
+
+function formatEffortLabel(value: string): string {
+  return value
+    .split(/[-_]/)
+    .filter((part) => part.length > 0)
+    .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+async function getCodexProviderOptions(
+  fetchCodexModelCatalogFromAppServer: ApplicationServices['fetchCodexModelCatalogFromAppServer']
+): Promise<ProviderOptions> {
+  try {
+    const catalog = await fetchCodexModelCatalogFromAppServer();
+    const effortsByValue = new Map<string, string | null>();
+    for (const model of catalog) {
+      for (const effort of model.supportedReasoningEfforts ?? []) {
+        if (!effortsByValue.has(effort.reasoningEffort)) {
+          effortsByValue.set(effort.reasoningEffort, effort.description ?? null);
+        }
+      }
+    }
+
+    return {
+      source: 'cli',
+      models: catalog.map((model) => ({
+        value: model.id,
+        label: model.displayName || model.id,
+        description: model.description ?? null,
+      })),
+      efforts: Array.from(effortsByValue.entries()).map(([value, description]) => ({
+        value,
+        label: formatEffortLabel(value),
+        ...(description ? { description } : {}),
+      })),
+    };
+  } catch (error) {
+    return {
+      source: 'fallback',
+      error: error instanceof Error ? error.message : String(error),
+      models: [
+        { value: 'default', label: 'Default' },
+        { value: 'gpt-5-codex', label: 'GPT-5 Codex' },
+      ],
+      efforts: [
+        { value: 'low', label: 'Low' },
+        { value: 'medium', label: 'Medium' },
+        { value: 'high', label: 'High' },
+      ],
+    };
+  }
+}
 
 export const userSettingsRouter = router({
   /**
    * Get user settings
    */
-  get: publicProcedure.query(async () => {
-    return await userSettingsQueryService.get();
+  get: publicProcedure.query(async ({ ctx }) => {
+    return await ctx.appContext.services.userSettingsQueryService.get();
+  }),
+
+  getProviderOptions: publicProcedure.query(async ({ ctx }) => {
+    const codex = await getCodexProviderOptions(
+      ctx.appContext.services.fetchCodexModelCatalogFromAppServer
+    );
+    return {
+      CLAUDE: CLAUDE_FALLBACK_OPTIONS,
+      CODEX: codex,
+    };
   }),
 
   /**
@@ -43,21 +143,24 @@ export const userSettingsRouter = router({
         // Ratchet settings
         ratchetEnabled: z.boolean().optional(),
         ratchetReplyToPrComments: z.boolean().optional(),
+        ratchetReviewTriggerMode: z.nativeEnum(RatchetReviewTriggerMode).optional(),
         // Session provider defaults
         defaultSessionProvider: z.nativeEnum(SessionProvider).optional(),
         defaultClaudeModel: z.string().trim().min(1, 'Claude model cannot be empty').optional(),
         defaultCodexModel: z.string().trim().min(1, 'Codex model cannot be empty').optional(),
+        defaultClaudeReasoningEffort: z.string().trim().min(1).nullable().optional(),
+        defaultCodexReasoningEffort: z.string().trim().min(1).nullable().optional(),
         // Permission preset defaults
         defaultWorkspacePermissions: z.nativeEnum(SessionPermissionPreset).optional(),
         ratchetPermissions: z.nativeEnum(SessionPermissionPreset).optional(),
       })
     )
-    .mutation(async ({ input }) => {
+    .mutation(async ({ ctx, input }) => {
       // Additional validation: if preferredIde is custom, customIdeCommand must be provided
       if (input.preferredIde === 'custom' && !input.customIdeCommand) {
         throw new Error('Custom IDE command is required when using custom IDE');
       }
-      return await userSettingsQueryService.update(input);
+      return await ctx.appContext.services.userSettingsQueryService.update(input);
     }),
 
   /**
@@ -110,8 +213,10 @@ export const userSettingsRouter = router({
    */
   getWorkspaceOrder: publicProcedure
     .input(z.object({ projectId: z.string() }))
-    .query(async ({ input }) => {
-      return await userSettingsQueryService.getWorkspaceOrder(input.projectId);
+    .query(async ({ ctx, input }) => {
+      return await ctx.appContext.services.userSettingsQueryService.getWorkspaceOrder(
+        input.projectId
+      );
     }),
 
   /**
@@ -124,8 +229,11 @@ export const userSettingsRouter = router({
         workspaceIds: z.array(z.string()),
       })
     )
-    .mutation(async ({ input }) => {
-      await userSettingsQueryService.updateWorkspaceOrder(input.projectId, input.workspaceIds);
+    .mutation(async ({ ctx, input }) => {
+      await ctx.appContext.services.userSettingsQueryService.updateWorkspaceOrder(
+        input.projectId,
+        input.workspaceIds
+      );
       return { success: true };
     }),
 });

@@ -3,9 +3,13 @@ export {
   IssueProvider,
   KanbanColumn,
   PRState,
+  RatchetReviewTriggerMode,
   RatchetState,
   RunScriptStatus,
+  SessionPermissionPreset,
+  SessionProvider,
   SessionStatus,
   WorkspaceCreationSource,
+  WorkspaceProviderSelection,
   WorkspaceStatus,
 } from './enums.js';

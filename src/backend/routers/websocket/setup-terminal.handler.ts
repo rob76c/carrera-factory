@@ -6,21 +6,20 @@
  * are destroyed when the WebSocket connection closes.
  */
 
-import type { IncomingMessage } from 'node:http';
 import { createRequire } from 'node:module';
 import { homedir, tmpdir } from 'node:os';
-import type { Duplex } from 'node:stream';
 import type { IPty } from 'node-pty';
-import type { WebSocket, WebSocketServer } from 'ws';
+import type { WebSocket } from 'ws';
 import type { AppContext } from '@/backend/app-context';
 import { WS_READY_STATE } from '@/backend/constants/websocket';
 import { toError } from '@/backend/lib/error-utils';
+import { sendStreamOutput } from '@/backend/lib/websocket-send';
 import {
   type SetupTerminalMessageInput,
   SetupTerminalMessageSchema,
 } from '@/backend/schemas/websocket';
-import { toMessageString } from './message-utils';
-import { markWebSocketAlive } from './upgrade-utils';
+import { parseWebSocketMessage, sendJsonError } from './message-utils';
+import { createWebSocketUpgradeHandler } from './upgrade-utils';
 
 const require = createRequire(import.meta.url);
 
@@ -68,9 +67,12 @@ function handleCreate(
   });
 
   state.pty.onData((output: string) => {
-    if (ws.readyState === WS_READY_STATE.OPEN) {
-      ws.send(JSON.stringify({ type: 'output', data: output }));
-    }
+    sendStreamOutput(
+      ws,
+      JSON.stringify({ type: 'output', data: output }),
+      logger,
+      'setup terminal output'
+    );
   });
 
   state.pty.onExit(({ exitCode }: { exitCode: number }) => {
@@ -102,58 +104,29 @@ function handleResize(
   }
 }
 
-function handlePing(ws: WebSocket): void {
-  if (ws.readyState === WS_READY_STATE.OPEN) {
-    ws.send(JSON.stringify({ type: 'pong' }));
-  }
-}
-
-function parseSetupTerminalMessage(
-  data: unknown,
-  logger: SetupTerminalLogger
-): SetupTerminalMessageInput | null {
-  const rawMessage: unknown = JSON.parse(toMessageString(data));
-  const parseResult = SetupTerminalMessageSchema.safeParse(rawMessage);
-
-  if (!parseResult.success) {
-    logger.warn('Invalid setup terminal message format', {
-      errors: parseResult.error.issues,
-    });
-    return null;
-  }
-
-  return parseResult.data;
-}
-
-function sendSocketError(ws: WebSocket, message: string): void {
-  if (ws.readyState === WS_READY_STATE.OPEN) {
-    ws.send(JSON.stringify({ type: 'error', message }));
-  }
-}
-
 export function createSetupTerminalUpgradeHandler(appContext: AppContext) {
   const logger = appContext.services.createLogger('setup-terminal-handler');
   const { configService } = appContext.services;
 
-  return function handleSetupTerminalUpgrade(
-    request: IncomingMessage,
-    socket: Duplex,
-    head: Buffer,
-    _url: URL,
-    wss: WebSocketServer,
-    wsAliveMap: WeakMap<WebSocket, boolean>
-  ): void {
-    wss.handleUpgrade(request, socket, head, (ws) => {
+  return createWebSocketUpgradeHandler({
+    connectionName: 'setup terminal',
+    configService,
+    logger,
+    onOpen: (ws) => {
       logger.info('Setup terminal WebSocket connected');
-      markWebSocketAlive(ws, wsAliveMap);
 
       const state: SetupTerminalState = { pty: null };
 
       ws.on('message', (data) => {
         try {
-          const message = parseSetupTerminalMessage(data, logger);
+          const message = parseWebSocketMessage(
+            SetupTerminalMessageSchema,
+            data,
+            logger,
+            'setup terminal message'
+          );
           if (!message) {
-            sendSocketError(ws, 'Invalid message format');
+            sendJsonError(ws, 'Invalid message format');
             return;
           }
 
@@ -167,14 +140,11 @@ export function createSetupTerminalUpgradeHandler(appContext: AppContext) {
             case 'resize':
               handleResize(message, state);
               break;
-            case 'ping':
-              handlePing(ws);
-              break;
           }
         } catch (error) {
           const err = toError(error);
           logger.error('Error in setup terminal', err);
-          sendSocketError(ws, err.message);
+          sendJsonError(ws, err.message);
         }
       });
 
@@ -189,6 +159,6 @@ export function createSetupTerminalUpgradeHandler(appContext: AppContext) {
       ws.on('error', (error) => {
         logger.error('Setup terminal WebSocket error', error);
       });
-    });
-  };
+    },
+  });
 }

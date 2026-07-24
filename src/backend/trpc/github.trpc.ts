@@ -5,16 +5,29 @@
  */
 
 import { z } from 'zod';
-import { githubCLIService } from '@/backend/services/github';
-import { projectManagementService, workspaceDataService } from '@/backend/services/workspace';
+import { classifyGitHubCLIError, type GitHubCLIHealthStatus } from '@/backend/services/github';
+import { filterIssuesLinkedToActiveWorkspaces } from './issue-filter';
 import { publicProcedure, router } from './trpc';
+
+const GITHUB_AUTH_REQUIRED_MESSAGE =
+  'GitHub CLI authentication failed. Run `gh auth refresh -h github.com` or `gh auth login` to authenticate.';
+
+function buildAuthRequiredHealth(health: GitHubCLIHealthStatus): GitHubCLIHealthStatus {
+  return {
+    ...health,
+    isInstalled: true,
+    isAuthenticated: false,
+    error: GITHUB_AUTH_REQUIRED_MESSAGE,
+    errorType: 'auth_required',
+  };
+}
 
 export const githubRouter = router({
   /**
    * Check if GitHub CLI is installed and authenticated.
    */
-  checkHealth: publicProcedure.query(() => {
-    return githubCLIService.checkHealth();
+  checkHealth: publicProcedure.query(({ ctx }) => {
+    return ctx.appContext.services.githubCLIService.checkHealth();
   }),
 
   /**
@@ -23,7 +36,8 @@ export const githubRouter = router({
    */
   hasGitHubRepo: publicProcedure
     .input(z.object({ workspaceId: z.string() }))
-    .query(async ({ input }) => {
+    .query(async ({ ctx, input }) => {
+      const { workspaceDataService } = ctx.appContext.services;
       const workspace = await workspaceDataService.findByIdWithProject(input.workspaceId);
       if (!workspace?.project) {
         return false;
@@ -39,7 +53,8 @@ export const githubRouter = router({
    */
   listIssuesForWorkspace: publicProcedure
     .input(z.object({ workspaceId: z.string() }))
-    .query(async ({ input }) => {
+    .query(async ({ ctx, input }) => {
+      const { githubCLIService, workspaceDataService } = ctx.appContext.services;
       // Check GitHub health first
       const health = await githubCLIService.checkHealth();
       if (!(health.isInstalled && health.isAuthenticated)) {
@@ -69,6 +84,15 @@ export const githubRouter = router({
         const issues = await githubCLIService.listIssues(githubOwner, githubRepo, {});
         return { issues, health, error: null, authenticatedUser };
       } catch (err) {
+        if (classifyGitHubCLIError(err) === 'auth_required') {
+          return {
+            issues: [],
+            health: buildAuthRequiredHealth(health),
+            error: GITHUB_AUTH_REQUIRED_MESSAGE,
+            authenticatedUser,
+          };
+        }
+
         return {
           issues: [],
           health,
@@ -84,7 +108,9 @@ export const githubRouter = router({
    */
   listIssuesForProject: publicProcedure
     .input(z.object({ projectId: z.string() }))
-    .query(async ({ input }) => {
+    .query(async ({ ctx, input }) => {
+      const { githubCLIService, projectManagementService, workspaceDataService } =
+        ctx.appContext.services;
       // Check GitHub health first
       const health = await githubCLIService.checkHealth();
       if (!(health.isInstalled && health.isAuthenticated)) {
@@ -108,11 +134,31 @@ export const githubRouter = router({
 
       try {
         // Only fetch issues assigned to the current user (@me)
-        const issues = await githubCLIService.listIssues(githubOwner, githubRepo, {
-          assignee: '@me',
-        });
-        return { issues, health, error: null };
+        const [issues, workspaces] = await Promise.all([
+          githubCLIService.listIssues(githubOwner, githubRepo, {
+            assignee: '@me',
+          }),
+          workspaceDataService.findByProjectId(input.projectId),
+        ]);
+        return {
+          issues: filterIssuesLinkedToActiveWorkspaces(
+            issues,
+            workspaces,
+            (workspace) => workspace.githubIssueNumber,
+            (issue) => issue.number
+          ),
+          health,
+          error: null,
+        };
       } catch (err) {
+        if (classifyGitHubCLIError(err) === 'auth_required') {
+          return {
+            issues: [],
+            health: buildAuthRequiredHealth(health),
+            error: GITHUB_AUTH_REQUIRED_MESSAGE,
+          };
+        }
+
         return {
           issues: [],
           health,
@@ -132,7 +178,8 @@ export const githubRouter = router({
         issueNumber: z.number(),
       })
     )
-    .query(async ({ input }) => {
+    .query(async ({ ctx, input }) => {
+      const { githubCLIService, projectManagementService } = ctx.appContext.services;
       // Get project to access githubOwner/githubRepo
       const project = await projectManagementService.findById(input.projectId);
       if (!project) {

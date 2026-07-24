@@ -1,24 +1,24 @@
 import pLimit from 'p-limit';
 import { toError } from '@/backend/lib/error-utils';
+import { buildWorkspaceSessionSummaries } from '@/backend/lib/session-summaries';
 import {
   assembleWorkspaceDerivedState,
   DEFAULT_WORKSPACE_DERIVED_FLOW_STATE,
 } from '@/backend/lib/workspace-derived-state';
-import { FactoryConfigService } from '@/backend/services/factory-config.service';
-import { gitOpsService } from '@/backend/services/git-ops.service';
 import { createLogger } from '@/backend/services/logger.service';
-import { runScriptConfigPersistenceService } from '@/backend/services/run-script-config-persistence.service';
 import { projectAccessor } from '@/backend/services/workspace/resources/project.accessor';
 import { workspaceAccessor } from '@/backend/services/workspace/resources/workspace.accessor';
 import type {
   WorkspaceGitHubBridge,
   WorkspacePRSnapshotBridge,
-  WorkspaceSessionBridge,
+  WorkspaceQuerySessionBridge,
 } from '@/backend/services/workspace/service/bridges';
 import { computeKanbanColumn } from '@/backend/services/workspace/service/state/kanban-state';
 import { computePendingRequestType } from '@/backend/services/workspace/service/state/pending-request-type';
 import { deriveWorkspaceRuntimeState } from '@/backend/services/workspace/service/state/workspace-runtime-state';
+import { gitOpsService } from '@/backend/services/workspace/service/worktree/git-ops.service';
 import { CIStatus, type KanbanColumn, PRState, RatchetState, WorkspaceStatus } from '@/shared/core';
+import { findWorkspaceSessionRuntimeError } from '@/shared/session-runtime';
 import { deriveWorkspaceSidebarStatus } from '@/shared/workspace-sidebar-status';
 
 const logger = createLogger('workspace-query');
@@ -33,15 +33,15 @@ const REVIEW_CACHE_TTL_MS = 60_000; // 1 minute cache
 class WorkspaceQueryService {
   /** Cached GitHub review count (DOM-04: moved from module scope to instance field) */
   private cachedReviewCount: { count: number; fetchedAt: number } | null = null;
-  private reviewCountRefreshInFlight = false;
-  private prStatusSyncInFlight = false;
+  private reviewCountRefreshPromise: Promise<number> | null = null;
+  private readonly prStatusSyncProjectsInFlight = new Set<string>();
 
-  private sessionBridge: WorkspaceSessionBridge | null = null;
+  private sessionBridge: WorkspaceQuerySessionBridge | null = null;
   private githubBridge: WorkspaceGitHubBridge | null = null;
   private prSnapshotBridge: WorkspacePRSnapshotBridge | null = null;
 
   configure(bridges: {
-    session: WorkspaceSessionBridge;
+    session: WorkspaceQuerySessionBridge;
     github: WorkspaceGitHubBridge;
     prSnapshot: WorkspacePRSnapshotBridge;
   }): void {
@@ -50,13 +50,23 @@ class WorkspaceQueryService {
     this.prSnapshotBridge = bridges.prSnapshot;
   }
 
-  private get session(): WorkspaceSessionBridge {
+  private get session(): WorkspaceQuerySessionBridge {
     if (!this.sessionBridge) {
       throw new Error(
         'WorkspaceQueryService not configured: session bridge missing. Call configure() first.'
       );
     }
     return this.sessionBridge;
+  }
+
+  private hasSessionRuntimeError(workspace: {
+    agentSessions?: Parameters<typeof buildWorkspaceSessionSummaries>[0] | null;
+  }): boolean {
+    const sessionSummaries = buildWorkspaceSessionSummaries(
+      workspace.agentSessions ?? [],
+      (sessionId) => this.session.getRuntimeSnapshot(sessionId)
+    );
+    return Boolean(findWorkspaceSessionRuntimeError(sessionSummaries));
   }
 
   private get github(): WorkspaceGitHubBridge {
@@ -75,6 +85,53 @@ class WorkspaceQueryService {
       );
     }
     return this.prSnapshotBridge;
+  }
+
+  refreshReviewCount(): Promise<number> {
+    if (this.reviewCountRefreshPromise !== null) {
+      return this.reviewCountRefreshPromise;
+    }
+
+    const refreshPromise = Promise.resolve()
+      .then(() => this.github.checkHealth())
+      .then(async (health) => {
+        if (!(health.isInstalled && health.isAuthenticated)) {
+          return this.cachedReviewCount?.count ?? 0;
+        }
+
+        const prs = await this.github.listReviewRequests();
+        const count = prs.filter((pr) => pr.reviewDecision !== 'APPROVED').length;
+        this.cachedReviewCount = {
+          count,
+          fetchedAt: Date.now(),
+        };
+        return count;
+      })
+      .catch((error) => {
+        logger.debug('Failed to fetch review count', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return this.cachedReviewCount?.count ?? 0;
+      })
+      .finally(() => {
+        this.reviewCountRefreshPromise = null;
+      });
+
+    this.reviewCountRefreshPromise = refreshPromise;
+    return refreshPromise;
+  }
+
+  getCachedReviewCount(): number | undefined {
+    return this.cachedReviewCount?.count;
+  }
+
+  refreshReviewCountIfStale(): void {
+    const now = Date.now();
+    const isStale =
+      !this.cachedReviewCount || now - this.cachedReviewCount.fetchedAt >= REVIEW_CACHE_TTL_MS;
+    if (isStale) {
+      void this.refreshReviewCount();
+    }
   }
 
   async getProjectSummaryState(projectId: string) {
@@ -140,36 +197,13 @@ class WorkspaceQueryService {
     );
 
     // Stale-while-revalidate: return cached count immediately, refresh in background if stale.
-    const reviewCount = this.cachedReviewCount?.count ?? 0;
-    const now = Date.now();
-    const isStale =
-      !this.cachedReviewCount || now - this.cachedReviewCount.fetchedAt >= REVIEW_CACHE_TTL_MS;
-    if (isStale && !this.reviewCountRefreshInFlight) {
-      this.reviewCountRefreshInFlight = true;
-      this.github
-        .checkHealth()
-        .then(async (health) => {
-          if (health.isInstalled && health.isAuthenticated) {
-            const prs = await this.github.listReviewRequests();
-            this.cachedReviewCount = {
-              count: prs.filter((pr) => pr.reviewDecision !== 'APPROVED').length,
-              fetchedAt: Date.now(),
-            };
-          }
-        })
-        .catch((error) => {
-          logger.debug('Failed to fetch review count', {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        })
-        .finally(() => {
-          this.reviewCountRefreshInFlight = false;
-        });
-    }
+    const reviewCount = this.getCachedReviewCount() ?? 0;
+    this.refreshReviewCountIfStale();
 
     return {
       workspaces: workspaces.map((w) => {
         const runtimeState = runtimeStateByWorkspace.get(w.id);
+        const pendingRequestType = pendingRequestByWorkspace.get(w.id) ?? null;
         const derivedState = assembleWorkspaceDerivedState(
           {
             lifecycle: w.status ?? WorkspaceStatus.READY,
@@ -179,6 +213,11 @@ class WorkspaceQueryService {
             ratchetState: w.ratchetState ?? RatchetState.IDLE,
             hasHadSessions: w.hasHadSessions ?? true,
             sessionIsWorking: runtimeState?.isSessionWorking ?? false,
+            pendingRequestType,
+            hasSessionRuntimeError: this.hasSessionRuntimeError(w),
+            ratchetDispatchOutcome: w.ratchetDispatchOutcome,
+            ratchetDispatchRetryCount: w.ratchetDispatchRetryCount,
+            runScriptStatus: w.runScriptStatus,
             flowState: runtimeState?.flowState ?? DEFAULT_WORKSPACE_DERIVED_FLOW_STATE,
           },
           {
@@ -214,15 +253,17 @@ class WorkspaceQueryService {
           linearIssueId: w.linearIssueId,
           linearIssueIdentifier: w.linearIssueIdentifier,
           linearIssueUrl: w.linearIssueUrl,
+          creationSource: w.creationSource,
           sidebarStatus: derivedState.sidebarStatus,
           ratchetButtonAnimated: derivedState.ratchetButtonAnimated,
           flowPhase: derivedState.flowPhase,
           ciObservation: derivedState.ciObservation,
+          statusReason: derivedState.statusReason,
           runScriptStatus: w.runScriptStatus,
           cachedKanbanColumn: derivedState.kanbanColumn,
           // DB timestamp for last cached kanban-state recompute/change.
           stateComputedAt: w.stateComputedAt?.toISOString() ?? null,
-          pendingRequestType: pendingRequestByWorkspace.get(w.id) ?? null,
+          pendingRequestType,
         };
       }),
       reviewCount,
@@ -251,6 +292,10 @@ class WorkspaceQueryService {
         const runtimeState = deriveWorkspaceRuntimeState(workspace, (sessionIds) =>
           this.session.isAnySessionWorking(sessionIds)
         );
+        const pendingRequestType = computePendingRequestType(
+          runtimeState.sessionIds,
+          allPendingRequests
+        );
         const derivedState = assembleWorkspaceDerivedState(
           {
             lifecycle: workspace.status,
@@ -260,17 +305,17 @@ class WorkspaceQueryService {
             ratchetState: workspace.ratchetState,
             hasHadSessions: workspace.hasHadSessions,
             sessionIsWorking: runtimeState.isSessionWorking,
+            pendingRequestType,
+            hasSessionRuntimeError: this.hasSessionRuntimeError(workspace),
+            ratchetDispatchOutcome: workspace.ratchetDispatchOutcome,
+            ratchetDispatchRetryCount: workspace.ratchetDispatchRetryCount,
+            runScriptStatus: workspace.runScriptStatus,
             flowState: runtimeState.flowState,
           },
           {
             computeKanbanColumn,
             deriveSidebarStatus: deriveWorkspaceSidebarStatus,
           }
-        );
-
-        const pendingRequestType = computePendingRequestType(
-          runtimeState.sessionIds,
-          allPendingRequests
         );
 
         return {
@@ -280,13 +325,18 @@ class WorkspaceQueryService {
           ratchetButtonAnimated: derivedState.ratchetButtonAnimated,
           flowPhase: derivedState.flowPhase,
           ciObservation: derivedState.ciObservation,
+          statusReason: derivedState.statusReason,
           isArchived: false,
           pendingRequestType,
         };
       })
       .filter((workspace) => {
-        // Filter out workspaces with null kanbanColumn (hidden: READY + no sessions)
-        return workspace.kanbanColumn !== null;
+        // Filter out workspaces with null kanbanColumn (archived/archiving)
+        if (workspace.kanbanColumn === null) {
+          return false;
+        }
+
+        return !input.kanbanColumn || workspace.kanbanColumn === input.kanbanColumn;
       })
       .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
   }
@@ -322,67 +372,6 @@ class WorkspaceQueryService {
     });
   }
 
-  async refreshFactoryConfigs(projectId: string) {
-    const workspaces = await workspaceAccessor.findByProjectId(projectId);
-
-    let updatedCount = 0;
-    const errors: Array<{ workspaceId: string; error: string }> = [];
-
-    for (const workspace of workspaces) {
-      if (!workspace.worktreePath) {
-        continue;
-      }
-
-      try {
-        await runScriptConfigPersistenceService.syncWorkspaceCommandsFromWorktreeConfig({
-          workspaceId: workspace.id,
-          worktreePath: workspace.worktreePath,
-          persistWorkspaceCommands: (id, commands) =>
-            workspaceAccessor.update(id, {
-              runScriptCommand: commands.runScriptCommand,
-              runScriptPostRunCommand: commands.runScriptPostRunCommand,
-              runScriptCleanupCommand: commands.runScriptCleanupCommand,
-            }),
-        });
-
-        updatedCount++;
-      } catch (error) {
-        errors.push({
-          workspaceId: workspace.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        logger.error('Failed to refresh factory config for workspace', {
-          workspaceId: workspace.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-
-    return {
-      updatedCount,
-      totalWorkspaces: workspaces.length,
-      errors,
-    };
-  }
-
-  async getFactoryConfig(projectId: string) {
-    const project = await projectAccessor.findById(projectId);
-    if (!project) {
-      throw new Error('Project not found');
-    }
-
-    try {
-      const config = await FactoryConfigService.readConfig(project.repoPath);
-      return config;
-    } catch (error) {
-      logger.error('Failed to read factory config', {
-        projectId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return null;
-    }
-  }
-
   async syncPRStatus(workspaceId: string) {
     const workspace = await workspaceAccessor.findById(workspaceId);
     if (!workspace) {
@@ -390,9 +379,11 @@ class WorkspaceQueryService {
     }
 
     if (!workspace.prUrl) {
+      await workspaceAccessor.resetPRDiscoveryBackoff(workspaceId);
       return { success: false, reason: 'no_pr_url' as const };
     }
 
+    const previousPrState = workspace.prState;
     const prResult = await this.prSnapshot.refreshWorkspace(workspaceId, workspace.prUrl);
     if (!(prResult.success && prResult.snapshot)) {
       return { success: false, reason: 'fetch_failed' as const };
@@ -404,42 +395,48 @@ class WorkspaceQueryService {
       prState: prResult.snapshot.prState,
     });
 
-    return { success: true, prState: prResult.snapshot.prState };
+    return { success: true, prState: prResult.snapshot.prState, previousPrState };
   }
 
   async syncAllPRStatuses(projectId: string) {
-    if (this.prStatusSyncInFlight) {
-      logger.info('Batch PR status sync already in flight, skipping', { projectId });
+    if (this.prStatusSyncProjectsInFlight.has(projectId)) {
+      logger.info('Batch PR status sync already in flight for project, skipping', { projectId });
       return { queued: 0 };
     }
 
-    const workspaces = await workspaceAccessor.findByProjectIdWithSessions(projectId, {
-      excludeStatuses: [WorkspaceStatus.ARCHIVING, WorkspaceStatus.ARCHIVED],
-    });
+    this.prStatusSyncProjectsInFlight.add(projectId);
 
-    const workspacesWithPRs = workspaces.filter(
-      (w): w is typeof w & { prUrl: string } => w.prUrl !== null
-    );
-
-    if (workspacesWithPRs.length === 0) {
-      return { queued: 0 };
-    }
-
-    this.prStatusSyncInFlight = true;
-
-    // Fire-and-forget: results are pushed to clients via WebSocket as each call completes.
-    Promise.all(
-      workspacesWithPRs.map((workspace) =>
-        gitConcurrencyLimit(() => this.prSnapshot.refreshWorkspace(workspace.id, workspace.prUrl))
-      )
-    )
-      .then(() => logger.info('Batch PR status sync completed', { projectId }))
-      .catch((err) => logger.error('Batch PR status sync failed', toError(err), { projectId }))
-      .finally(() => {
-        this.prStatusSyncInFlight = false;
+    try {
+      const workspaces = await workspaceAccessor.findByProjectIdWithSessions(projectId, {
+        excludeStatuses: [WorkspaceStatus.ARCHIVING, WorkspaceStatus.ARCHIVED],
       });
 
-    return { queued: workspacesWithPRs.length };
+      const workspacesWithPRs = workspaces.filter(
+        (w): w is typeof w & { prUrl: string } => w.prUrl !== null
+      );
+
+      if (workspacesWithPRs.length === 0) {
+        this.prStatusSyncProjectsInFlight.delete(projectId);
+        return { queued: 0 };
+      }
+
+      // Fire-and-forget: results are pushed to clients via WebSocket as each call completes.
+      Promise.all(
+        workspacesWithPRs.map((workspace) =>
+          gitConcurrencyLimit(() => this.prSnapshot.refreshWorkspace(workspace.id, workspace.prUrl))
+        )
+      )
+        .then(() => logger.info('Batch PR status sync completed', { projectId }))
+        .catch((err) => logger.error('Batch PR status sync failed', toError(err), { projectId }))
+        .finally(() => {
+          this.prStatusSyncProjectsInFlight.delete(projectId);
+        });
+
+      return { queued: workspacesWithPRs.length };
+    } catch (error) {
+      this.prStatusSyncProjectsInFlight.delete(projectId);
+      throw error;
+    }
   }
 
   async hasChanges(workspaceId: string): Promise<boolean> {

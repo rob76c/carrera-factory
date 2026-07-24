@@ -2,16 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router';
 import { trpc } from '@/client/lib/trpc';
 import { isWorkspaceDoneOrMerged } from '@/client/lib/workspace-archive';
+import { resolveWorkspaceFileLink } from '@/client/lib/workspace-file-links';
 import { WorkspaceDetailHeaderSlot } from '@/client/routes/projects/workspaces/workspace-detail-header';
 import { useChatWebSocket } from '@/components/chat';
 import { usePersistentScroll, useWorkspacePanel } from '@/components/workspace';
-import type { WorkspaceSessionRuntimeSummary } from '@/components/workspace/session-tab-runtime';
 import { useAutoScroll } from '@/hooks/use-auto-scroll';
 import {
   resolveEffectiveSessionProvider,
   type SessionProviderValue,
 } from '@/lib/session-provider-selection';
-import type { SessionRuntimeState } from '@/shared/session-runtime';
+import { isSessionSummaryWorking } from '@/shared/session-runtime';
 import { forgetResumeWorkspace } from './resume-workspace-storage';
 import { useSessionManagement, useWorkspaceData } from './use-workspace-detail';
 import {
@@ -20,96 +20,13 @@ import {
   useWorkspaceInitStatus,
 } from './use-workspace-detail-hooks';
 import type { ChatContentProps } from './workspace-detail-chat-content';
+import {
+  buildSessionSummariesById,
+  getArchiveGitStatusQueryOptions,
+  getVisibleInitBanner,
+  hasUserMessageWithoutAgentMessage,
+} from './workspace-detail-container.utils';
 import { WorkspaceDetailView } from './workspace-detail-view';
-
-function areRuntimeStatesEqual(
-  left: SessionRuntimeState | undefined,
-  right: SessionRuntimeState
-): boolean {
-  if (!left) {
-    return false;
-  }
-
-  const leftExit = left.lastExit;
-  const rightExit = right.lastExit;
-  const sameLastExit =
-    leftExit === rightExit ||
-    (leftExit?.code === rightExit?.code &&
-      leftExit?.timestamp === rightExit?.timestamp &&
-      leftExit?.unexpected === rightExit?.unexpected);
-
-  return (
-    left.phase === right.phase &&
-    left.processState === right.processState &&
-    left.activity === right.activity &&
-    left.errorMessage === right.errorMessage &&
-    left.updatedAt === right.updatedAt &&
-    sameLastExit
-  );
-}
-
-function isLiveRuntimeNewerOrEqual(
-  liveRuntime: SessionRuntimeState,
-  summaryUpdatedAt: string | undefined
-): boolean {
-  if (!summaryUpdatedAt) {
-    return true;
-  }
-  const liveTs = Date.parse(liveRuntime.updatedAt);
-  const summaryTs = Date.parse(summaryUpdatedAt);
-  if (Number.isNaN(liveTs) || Number.isNaN(summaryTs)) {
-    return true;
-  }
-  return liveTs >= summaryTs;
-}
-
-interface SessionForRuntimeOverlay {
-  id: string;
-  name: string | null;
-  workflow: string | null;
-  model: string | null;
-  provider?: WorkspaceSessionRuntimeSummary['provider'];
-  status: WorkspaceSessionRuntimeSummary['persistedStatus'];
-}
-
-function mergeSessionSummariesWithLiveRuntime(
-  workspaceSummaries: WorkspaceSessionRuntimeSummary[] | undefined,
-  sessions: SessionForRuntimeOverlay[] | undefined,
-  liveSessionRuntimeById: Map<string, SessionRuntimeState>
-): Map<string, WorkspaceSessionRuntimeSummary> {
-  const summaries = new Map(
-    (workspaceSummaries ?? []).map((summary) => [summary.sessionId, summary])
-  );
-
-  for (const session of sessions ?? []) {
-    const liveRuntime = liveSessionRuntimeById.get(session.id);
-    if (!liveRuntime) {
-      continue;
-    }
-
-    const existingSummary = summaries.get(session.id);
-    if (!isLiveRuntimeNewerOrEqual(liveRuntime, existingSummary?.updatedAt)) {
-      continue;
-    }
-
-    summaries.set(session.id, {
-      sessionId: session.id,
-      name: existingSummary?.name ?? session.name ?? null,
-      workflow: existingSummary?.workflow ?? session.workflow ?? null,
-      model: existingSummary?.model ?? session.model ?? null,
-      provider: existingSummary?.provider ?? session.provider,
-      persistedStatus: existingSummary?.persistedStatus ?? session.status,
-      runtimePhase: liveRuntime.phase,
-      processState: liveRuntime.processState,
-      activity: liveRuntime.activity,
-      updatedAt: liveRuntime.updatedAt,
-      lastExit: liveRuntime.lastExit ?? existingSummary?.lastExit ?? null,
-      errorMessage: liveRuntime.errorMessage ?? existingSummary?.errorMessage ?? null,
-    });
-  }
-
-  return summaries;
-}
 
 export function WorkspaceDetailContainer() {
   const { slug = '', id: workspaceId = '' } = useParams<{ slug: string; id: string }>();
@@ -132,7 +49,7 @@ export function WorkspaceDetailContainer() {
     void navigate('/projects', { replace: true });
   }, [workspace?.status, slug, navigate]);
 
-  const { rightPanelVisible, setRightPanelVisible, activeTabId, clearScrollState } =
+  const { rightPanelVisible, setRightPanelVisible, activeTabId, clearScrollState, openTab } =
     useWorkspacePanel();
   const { data: userSettings } = trpc.userSettings.get.useQuery();
 
@@ -157,6 +74,7 @@ export function WorkspaceDetailContainer() {
     sessionIds
   );
   const [archiveDialogOpen, setArchiveDialogOpen] = useState(false);
+  const isParentWorkspace = workspace?.creationSource !== 'CHILD_WORKSPACE';
   const effectiveDefaultProvider = resolveEffectiveSessionProvider(
     workspace?.defaultSessionProvider,
     userSettings?.defaultSessionProvider
@@ -167,11 +85,17 @@ export function WorkspaceDetailContainer() {
     setSelectedProvider(effectiveDefaultProvider);
   }, [effectiveDefaultProvider]);
 
-  const { data: gitStatus } = trpc.workspace.getGitStatus.useQuery(
+  const { data: gitStatus, isFetching: isGitStatusFetching } = trpc.workspace.getGitStatus.useQuery(
     { workspaceId },
-    { enabled: !!workspace?.worktreePath, refetchInterval: 15_000, staleTime: 10_000 }
+    getArchiveGitStatusQueryOptions(archiveDialogOpen, workspace?.worktreePath)
   );
   const hasUncommitted = gitStatus?.hasUncommitted === true;
+  const isDoneOrMergedWorkspace = isWorkspaceDoneOrMerged(workspace);
+  const { data: childWorkspaces } = trpc.workspace.listChildren.useQuery(
+    { parentWorkspaceId: workspaceId },
+    { enabled: !isDoneOrMergedWorkspace && archiveDialogOpen && isParentWorkspace }
+  );
+  const activeChildCount = childWorkspaces?.length ?? 0;
 
   const {
     messages,
@@ -179,6 +103,7 @@ export function WorkspaceDetailContainer() {
     sessionStatus,
     processStatus,
     sessionRuntime,
+    runtimeSessionId,
     pendingRequest,
     chatSettings,
     chatCapabilities,
@@ -220,60 +145,30 @@ export function WorkspaceDetailContainer() {
     selectedDbSessionId !== null &&
     (sessionStatus.phase === 'loading' || sessionStatus.phase === 'ready') &&
     processStatus.state === 'unknown' &&
-    messages.some((message) => message.source === 'user') &&
-    !messages.some((message) => message.source === 'agent');
-
-  const [liveSessionRuntimeById, setLiveSessionRuntimeById] = useState<
-    Map<string, SessionRuntimeState>
-  >(new Map());
-
-  useEffect(() => {
-    if (!selectedDbSessionId) {
-      return;
-    }
-
-    setLiveSessionRuntimeById((previous) => {
-      const previousRuntime = previous.get(selectedDbSessionId);
-      if (areRuntimeStatesEqual(previousRuntime, sessionRuntime)) {
-        return previous;
-      }
-
-      const next = new Map(previous);
-      next.set(selectedDbSessionId, sessionRuntime);
-      return next;
-    });
-  }, [selectedDbSessionId, sessionRuntime]);
-
-  useEffect(() => {
-    const knownSessionIds = new Set(sessionIds);
-    setLiveSessionRuntimeById((previous) => {
-      let changed = false;
-      const next = new Map<string, SessionRuntimeState>();
-      for (const [sessionId, runtime] of previous) {
-        if (knownSessionIds.has(sessionId)) {
-          next.set(sessionId, runtime);
-        } else {
-          changed = true;
-        }
-      }
-      return changed ? next : previous;
-    });
-  }, [sessionIds]);
+    hasUserMessageWithoutAgentMessage(messages);
 
   const sessionSummariesById = useMemo(
     () =>
-      mergeSessionSummariesWithLiveRuntime(
-        workspace?.sessionSummaries,
+      buildSessionSummariesById({
+        workspaceSummaries: workspace?.sessionSummaries,
         sessions,
-        liveSessionRuntimeById
-      ),
-    [workspace?.sessionSummaries, sessions, liveSessionRuntimeById]
+        selectedSessionId: selectedDbSessionId,
+        liveRuntime: sessionRuntime,
+        runtimeSessionId,
+        chatConnected: connected,
+      }),
+    [
+      workspace?.sessionSummaries,
+      sessions,
+      selectedDbSessionId,
+      sessionRuntime,
+      runtimeSessionId,
+      connected,
+    ]
   );
   const workspaceRunning = useMemo(
     () =>
-      Array.from(sessionSummariesById.values()).some(
-        (summary) => summary.activity === 'WORKING' || summary.runtimePhase === 'running'
-      ),
+      Array.from(sessionSummariesById.values()).some((summary) => isSessionSummaryWorking(summary)),
     [sessionSummariesById]
   );
 
@@ -305,8 +200,6 @@ export function WorkspaceDetailContainer() {
     },
     [archiveWorkspace, workspaceId]
   );
-  const isDoneOrMergedWorkspace = isWorkspaceDoneOrMerged(workspace);
-
   const handleArchiveRequest = useCallback(() => {
     // If workspace is done/merged, skip confirmation and archive immediately.
     // Default commitUncommitted to true so we never lose work if git status hasn't loaded yet.
@@ -338,6 +231,7 @@ export function WorkspaceDetailContainer() {
   );
 
   const chatTabId = selectedDbSessionId ? `chat-${selectedDbSessionId}` : null;
+  const initBanner = getVisibleInitBanner(workspaceInitStatus?.chatBanner, setupWarningDismissed);
 
   const { persistCurrent: persistChatScroll } = usePersistentScroll({
     tabId: chatTabId,
@@ -363,6 +257,18 @@ export function WorkspaceDetailContainer() {
     persistChatScroll();
   }, [onScroll, persistChatScroll]);
 
+  const resolveWorkspaceChatFileLink = useCallback(
+    (href: string) => resolveWorkspaceFileLink(href, workspace?.worktreePath),
+    [workspace?.worktreePath]
+  );
+
+  const handleWorkspaceFileLink = useCallback(
+    (path: string) => {
+      openTab('file', path, path.split('/').pop() ?? path);
+    },
+    [openTab]
+  );
+
   useAutoFocusChatInput({
     workspaceLoading,
     workspace,
@@ -374,6 +280,8 @@ export function WorkspaceDetailContainer() {
 
   const chatViewModel: ChatContentProps = {
     workspaceId,
+    resolveWorkspaceFileLink: resolveWorkspaceChatFileLink,
+    onWorkspaceFileLink: handleWorkspaceFileLink,
     messages,
     sessionStatus,
     sessionRuntime,
@@ -413,7 +321,7 @@ export function WorkspaceDetailContainer() {
     acpConfigOptions,
     setConfigOption,
     autoStartPending: isIssueAutoStartPending,
-    initBanner: workspaceInitStatus?.chatBanner ?? null,
+    initBanner,
   };
 
   return (
@@ -477,6 +385,8 @@ export function WorkspaceDetailContainer() {
           open: archiveDialogOpen,
           setOpen: setArchiveDialogOpen,
           hasUncommitted: hasUncommitted && !isDoneOrMergedWorkspace,
+          isCheckingGitStatus: isGitStatusFetching && !isDoneOrMergedWorkspace,
+          activeChildCount,
           onConfirm: handleArchive,
         }}
       />

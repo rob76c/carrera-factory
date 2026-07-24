@@ -1,6 +1,19 @@
-import type { CIStatus, KanbanColumn, PRState, RatchetState, WorkspaceStatus } from '@/shared/core';
+import type { RatchetDispatchOutcome } from '@prisma-gen/client';
+import type {
+  CIStatus,
+  KanbanColumn,
+  PRState,
+  RatchetState,
+  RunScriptStatus,
+  WorkspaceStatus,
+} from '@/shared/core';
 import type { WorkspaceCiObservation, WorkspaceFlowPhase } from '@/shared/workspace-flow-state';
 import type { WorkspaceSidebarStatus } from '@/shared/workspace-sidebar-status';
+import {
+  deriveWorkspaceStatusReason,
+  type WorkspacePendingRequestType,
+  type WorkspaceStatusReason,
+} from '@/shared/workspace-status-reason';
 
 export interface WorkspaceDerivedFlowState {
   phase: WorkspaceFlowPhase;
@@ -18,16 +31,25 @@ export interface WorkspaceDerivedStateInput {
   ratchetState: RatchetState;
   hasHadSessions: boolean;
   sessionIsWorking: boolean;
+  pendingRequestType: WorkspacePendingRequestType | null;
+  hasSessionRuntimeError?: boolean;
+  ratchetDispatchOutcome: RatchetDispatchOutcome | null;
+  ratchetDispatchRetryCount: number;
+  runScriptStatus: RunScriptStatus | null;
   flowState: WorkspaceDerivedFlowState;
 }
 
 export interface WorkspaceDerivedStateFns {
   computeKanbanColumn: (input: {
     lifecycle: WorkspaceStatus;
-    isWorking: boolean;
+    sessionIsWorking: boolean;
+    flowIsWorking: boolean;
     prState: PRState;
     ratchetState: RatchetState;
-    hasHadSessions: boolean;
+    pendingRequestType: WorkspacePendingRequestType | null;
+    hasSessionRuntimeError: boolean;
+    ratchetDispatchOutcome: RatchetDispatchOutcome | null;
+    ratchetDispatchRetryCount: number;
   }) => KanbanColumn | null;
   deriveSidebarStatus: (input: {
     isWorking: boolean;
@@ -45,6 +67,7 @@ export interface WorkspaceDerivedState {
   flowPhase: WorkspaceFlowPhase;
   ciObservation: WorkspaceCiObservation;
   ratchetButtonAnimated: boolean;
+  statusReason: WorkspaceStatusReason;
 }
 
 export const DEFAULT_WORKSPACE_DERIVED_FLOW_STATE: WorkspaceDerivedFlowState = {
@@ -59,7 +82,7 @@ export function assembleWorkspaceDerivedState(
   input: WorkspaceDerivedStateInput,
   fns: WorkspaceDerivedStateFns
 ): WorkspaceDerivedState {
-  const isWorking = input.sessionIsWorking || input.flowState.isWorking;
+  const isWorking = input.sessionIsWorking;
 
   return {
     isWorking,
@@ -72,13 +95,30 @@ export function assembleWorkspaceDerivedState(
     }),
     kanbanColumn: fns.computeKanbanColumn({
       lifecycle: input.lifecycle,
-      isWorking,
+      sessionIsWorking: input.sessionIsWorking,
+      flowIsWorking: input.flowState.isWorking,
       prState: input.prState,
       ratchetState: input.ratchetState,
-      hasHadSessions: input.hasHadSessions,
+      pendingRequestType: input.pendingRequestType,
+      hasSessionRuntimeError: input.hasSessionRuntimeError ?? false,
+      ratchetDispatchOutcome: input.ratchetDispatchOutcome,
+      ratchetDispatchRetryCount: input.ratchetDispatchRetryCount,
     }),
     flowPhase: input.flowState.phase,
     ciObservation: input.flowState.ciObservation,
     ratchetButtonAnimated: input.flowState.shouldAnimateRatchetButton,
+    statusReason: deriveWorkspaceStatusReason({
+      lifecycle: input.lifecycle,
+      hasHadSessions: input.hasHadSessions,
+      isWorking,
+      pendingRequestType: input.pendingRequestType,
+      hasSessionRuntimeError: input.hasSessionRuntimeError,
+      flowPhase: input.flowState.phase,
+      ciObservation: input.flowState.ciObservation,
+      prState: input.prState,
+      prCiStatus: input.prCiStatus,
+      ratchetState: input.ratchetState,
+      runScriptStatus: input.runScriptStatus,
+    }),
   };
 }

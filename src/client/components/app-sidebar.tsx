@@ -1,4 +1,10 @@
-import { CircleDot, GitPullRequest, Plus, Settings, X } from 'lucide-react';
+import {
+  DotOutlineIcon,
+  GearIcon,
+  GitPullRequestIcon,
+  PlusIcon,
+  XIcon,
+} from '@phosphor-icons/react';
 import {
   type PointerEvent as ReactPointerEvent,
   useEffect,
@@ -10,7 +16,7 @@ import { Link, useLocation, useNavigate } from 'react-router';
 import { InlineWorkspaceForm } from '@/client/components/kanban/inline-workspace-form';
 import type { ServerWorkspace } from '@/client/components/use-workspace-list-state';
 import type { useAppNavigationData } from '@/client/hooks/use-app-navigation-data';
-import { useSidebarIssues } from '@/client/hooks/use-sidebar-issues';
+import { useProjectIssues } from '@/client/hooks/use-project-issues';
 import type { NormalizedIssue } from '@/client/lib/issue-normalization';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -99,7 +105,7 @@ function SidebarIssueItem({ issue }: { issue: NormalizedIssue }) {
       <SidebarMenuButton asChild className="h-auto py-1.5 px-2">
         <a href={issue.url} target="_blank" rel="noopener noreferrer">
           <div className="flex items-center gap-2 min-w-0">
-            <CircleDot className="h-3 w-3 shrink-0 text-muted-foreground" />
+            <DotOutlineIcon className="h-3 w-3 shrink-0 text-muted-foreground" />
             <span className="truncate text-sm">{issue.title}</span>
             <span className="text-xs font-medium text-muted-foreground shrink-0 ml-auto">
               {issue.displayId}
@@ -220,7 +226,7 @@ function SidebarInner({
             aria-label="Close sidebar"
             onClick={onNavigate}
           >
-            <X className="h-5 w-5" />
+            <XIcon className="h-5 w-5" />
           </Button>
         </header>
       )}
@@ -253,7 +259,7 @@ function SidebarInner({
                     disabled={!canCreateWorkspace}
                     className="h-9"
                   >
-                    <Plus className="h-4 w-4" />
+                    <PlusIcon className="h-4 w-4" />
                     <span>New Workspace</span>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
@@ -296,7 +302,7 @@ function SidebarInner({
               isActive={pathname === '/reviews' || pathname?.startsWith('/reviews/')}
             >
               <Link to="/reviews" onClick={onNavigate}>
-                <GitPullRequest className="h-4 w-4" />
+                <GitPullRequestIcon className="h-4 w-4" />
                 <span>Reviews</span>
                 {navData.reviewCount > 0 && (
                   <Badge
@@ -317,7 +323,7 @@ function SidebarInner({
                 className="flex-1"
               >
                 <Link to="/admin" onClick={onNavigate}>
-                  <Settings className="h-4 w-4" />
+                  <GearIcon className="h-4 w-4" />
                   <span>Settings</span>
                 </Link>
               </SidebarMenuButton>
@@ -384,11 +390,9 @@ export function AppSidebar({ navData }: { navData: NavigationData }) {
   }, []);
 
   // Fetch issues for the Todo section
-  const { issues } = useSidebarIssues(
-    navData.selectedProjectId,
-    navData.issueProvider,
-    navData.serverWorkspaces
-  );
+  const { issues } = useProjectIssues(navData.selectedProjectId, navData.issueProvider, {
+    workspaceIssueLinks: navData.serverWorkspaces,
+  });
 
   // Group workspaces by kanban column, sorted by createdAt descending (newest first)
   const { waiting, working, done } = useMemo(() => {

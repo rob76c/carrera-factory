@@ -8,7 +8,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WebSocket, WebSocketServer } from 'ws';
 import type { AppContext } from '@/backend/app-context';
 import { WS_READY_STATE } from '@/backend/constants/websocket';
+import { SessionEventBus, sessionEventBus } from '@/backend/services/session';
 import { createChatUpgradeHandler } from './chat.handler';
+import {
+  type ChatConnectionRegistry,
+  disposeChatTransportForApplication,
+  getChatConnectionRegistryForApplication,
+} from './chat-connection-registry';
+
+const allowedOrigin = 'http://localhost:3000';
+const testApplications = new Set<AppContext>();
+let chatConnectionRegistry: ChatConnectionRegistry;
 
 class MockWebSocket extends EventEmitter {
   readyState = WS_READY_STATE.OPEN;
@@ -25,44 +35,11 @@ function createLogger() {
   };
 }
 
-function createTestContext(worktreeBaseDir: string) {
+function createTestContext(worktreeBaseDir: string, eventBus: SessionEventBus = sessionEventBus) {
   const logger = createLogger();
-  const connections = new Map<
-    string,
-    { ws: MockWebSocket; dbSessionId: string | null; workingDir: string | null }
-  >();
-
-  const chatConnectionService = {
-    values: vi.fn(() => connections.values()),
-    countConnectionsViewingSession: vi.fn((dbSessionId: string | null) => {
-      if (!dbSessionId) {
-        return 0;
-      }
-      let count = 0;
-      for (const info of connections.values()) {
-        if (info.dbSessionId === dbSessionId) {
-          count++;
-        }
-      }
-      return count;
-    }),
-    get: vi.fn((connectionId: string) => connections.get(connectionId)),
-    register: vi.fn(
-      (
-        connectionId: string,
-        info: { ws: MockWebSocket; dbSessionId: string | null; workingDir: string | null }
-      ) => {
-        connections.set(connectionId, info);
-      }
-    ),
-    unregister: vi.fn((connectionId: string) => {
-      connections.delete(connectionId);
-    }),
-  };
 
   const appContext = {
     services: {
-      chatConnectionService,
       chatEventForwarderService: {
         setupClientEvents: vi.fn(),
         setupWorkspaceNotifications: vi.fn(),
@@ -73,6 +50,7 @@ function createTestContext(worktreeBaseDir: string) {
         handleMessage: vi.fn(async () => undefined),
       },
       configService: {
+        getCorsConfig: vi.fn(() => ({ allowedOrigins: [allowedOrigin] })),
         getDebugConfig: vi.fn(() => ({ chatWebSocket: false })),
         getWorktreeBaseDir: vi.fn(() => worktreeBaseDir),
       },
@@ -82,6 +60,7 @@ function createTestContext(worktreeBaseDir: string) {
         log: vi.fn(),
         closeSession: vi.fn(),
       },
+      sessionEventBus: eventBus,
       sessionService: {
         getOrCreateClient: vi.fn(),
         getOrCreateSessionClient: vi.fn(async () => ({})),
@@ -93,17 +72,17 @@ function createTestContext(worktreeBaseDir: string) {
       },
     },
   } as unknown as AppContext;
+  testApplications.add(appContext);
+  chatConnectionRegistry = getChatConnectionRegistryForApplication(appContext);
 
   return {
     appContext,
-    chatConnectionService,
     chatMessageHandlerService: appContext.services.chatMessageHandlerService,
     chatEventForwarderService: appContext.services.chatEventForwarderService,
     logger,
     sessionFileLogger: appContext.services.sessionFileLogger,
     sessionDomainService: appContext.services.sessionDomainService,
     sessionService: appContext.services.sessionService,
-    connections,
   };
 }
 
@@ -115,6 +94,10 @@ describe('createChatUpgradeHandler', () => {
   });
 
   afterEach(() => {
+    for (const application of testApplications) {
+      disposeChatTransportForApplication(application);
+    }
+    testApplications.clear();
     vi.restoreAllMocks();
   });
 
@@ -122,7 +105,10 @@ describe('createChatUpgradeHandler', () => {
     const { appContext, chatMessageHandlerService } = createTestContext(tempRootDir);
     const handler = createChatUpgradeHandler(appContext);
 
-    const request = {} as IncomingMessage;
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
     const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
     const wss = { handleUpgrade: vi.fn() } as unknown as WebSocketServer;
     const wsAliveMap = new WeakMap<WebSocket, boolean>();
@@ -136,17 +122,77 @@ describe('createChatUpgradeHandler', () => {
     expect(chatMessageHandlerService.setClientCreator).toHaveBeenCalledTimes(1);
   });
 
+  it('rejects unauthorized origins before validating workingDir', () => {
+    const workingDir = join(tempRootDir, 'workspace-1');
+    mkdirSync(workingDir, { recursive: true });
+
+    const { appContext } = createTestContext(tempRootDir);
+    const handler = createChatUpgradeHandler(appContext);
+
+    const request = { headers: { origin: 'https://evil.example' } } as IncomingMessage;
+    const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
+    const wss = { handleUpgrade: vi.fn() } as unknown as WebSocketServer;
+    const wsAliveMap = new WeakMap<WebSocket, boolean>();
+    const url = new URL(`http://localhost/chat?workingDir=${encodeURIComponent(workingDir)}`);
+
+    handler(request, socket, Buffer.alloc(0), url, wss, wsAliveMap);
+
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('Unauthorized origin'));
+    expect(appContext.services.configService.getWorktreeBaseDir).not.toHaveBeenCalled();
+    expect(socket.destroy).toHaveBeenCalledTimes(1);
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects untrusted remote addresses before opening a WebSocket', () => {
+    const { appContext } = createTestContext(tempRootDir);
+    const handler = createChatUpgradeHandler(appContext);
+
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '203.0.113.10' },
+    } as unknown as IncomingMessage;
+    const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
+    const wss = { handleUpgrade: vi.fn() } as unknown as WebSocketServer;
+    const wsAliveMap = new WeakMap<WebSocket, boolean>();
+    const url = new URL('http://localhost/chat');
+
+    handler(request, socket, Buffer.alloc(0), url, wss, wsAliveMap);
+
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('403 Forbidden'));
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('Untrusted remote address'));
+    expect(socket.destroy).toHaveBeenCalledTimes(1);
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects forwarded local upgrades before opening a WebSocket', () => {
+    const { appContext } = createTestContext(tempRootDir);
+    const handler = createChatUpgradeHandler(appContext);
+
+    const request = {
+      headers: { origin: allowedOrigin, 'x-forwarded-for': '203.0.113.10' },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
+    const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
+    const wss = { handleUpgrade: vi.fn() } as unknown as WebSocketServer;
+    const wsAliveMap = new WeakMap<WebSocket, boolean>();
+    const url = new URL('http://localhost/chat');
+
+    handler(request, socket, Buffer.alloc(0), url, wss, wsAliveMap);
+
+    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('403 Forbidden'));
+    expect(socket.write).toHaveBeenCalledWith(
+      expect.stringContaining('Forwarded WebSocket upgrades are not trusted')
+    );
+    expect(socket.destroy).toHaveBeenCalledTimes(1);
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
+  });
+
   it('registers a connection, dispatches valid messages, and cleans up on close', async () => {
     const workingDir = join(tempRootDir, 'workspace-1');
     mkdirSync(workingDir, { recursive: true });
 
-    const {
-      appContext,
-      chatMessageHandlerService,
-      chatEventForwarderService,
-      chatConnectionService,
-      sessionFileLogger,
-    } = createTestContext(tempRootDir);
+    const { appContext, chatMessageHandlerService, chatEventForwarderService, sessionFileLogger } =
+      createTestContext(tempRootDir);
     const handler = createChatUpgradeHandler(appContext);
 
     const ws = new MockWebSocket();
@@ -161,7 +207,10 @@ describe('createChatUpgradeHandler', () => {
       ),
     } as unknown as WebSocketServer;
 
-    const request = {} as IncomingMessage;
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
     const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
     const wsAliveMap = new WeakMap<WebSocket, boolean>();
     const url = new URL(
@@ -171,10 +220,8 @@ describe('createChatUpgradeHandler', () => {
     handler(request, socket, Buffer.alloc(0), url, wss, wsAliveMap);
     expect(chatEventForwarderService.setupWorkspaceNotifications).toHaveBeenCalledTimes(1);
     expect(sessionFileLogger.initSession).toHaveBeenCalledWith('session-1');
-    expect(chatConnectionService.register).toHaveBeenCalledWith(
-      'conn-1',
-      expect.objectContaining({ dbSessionId: 'session-1' })
-    );
+    expect(chatConnectionRegistry.get('conn-1')).toMatchObject({ dbSessionId: 'session-1' });
+    expect(chatConnectionRegistry.countViewers('session-1')).toBe(1);
 
     ws.emit('message', JSON.stringify({ type: 'load_session' }));
     await Promise.resolve();
@@ -191,13 +238,82 @@ describe('createChatUpgradeHandler', () => {
     });
 
     ws.emit('close');
-    expect(chatConnectionService.unregister).toHaveBeenCalledWith('conn-1');
+    expect(chatConnectionRegistry.has('conn-1')).toBe(false);
+    expect(chatConnectionRegistry.countViewers('session-1')).toBe(0);
     expect(sessionFileLogger.closeSession).toHaveBeenCalledWith('session-1');
   });
 
+  it('keeps chat transport dependencies scoped to each application', () => {
+    const eventBusA = new SessionEventBus();
+    const eventBusB = new SessionEventBus();
+    const contextA = createTestContext(tempRootDir, eventBusA);
+    const contextB = createTestContext(tempRootDir, eventBusB);
+    const handlerA = createChatUpgradeHandler(contextA.appContext);
+    const handlerB = createChatUpgradeHandler(contextB.appContext);
+    const wsA = new MockWebSocket();
+    const wsB = new MockWebSocket();
+
+    const open = (
+      handler: ReturnType<typeof createChatUpgradeHandler>,
+      ws: MockWebSocket,
+      connectionId: string,
+      sessionId: string
+    ) => {
+      const wss = {
+        handleUpgrade: vi.fn(
+          (
+            _request: IncomingMessage,
+            _socket: Duplex,
+            _head: Buffer,
+            callback: (socket: WebSocket) => void
+          ) => callback(ws as unknown as WebSocket)
+        ),
+      } as unknown as WebSocketServer;
+      handler(
+        {
+          headers: { origin: allowedOrigin },
+          socket: { remoteAddress: '127.0.0.1' },
+        } as unknown as IncomingMessage,
+        { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex,
+        Buffer.alloc(0),
+        new URL(`http://localhost/chat?connectionId=${connectionId}&sessionId=${sessionId}`),
+        wss,
+        new WeakMap<WebSocket, boolean>()
+      );
+    };
+
+    open(handlerA, wsA, 'conn-a', 'session-a');
+    open(handlerB, wsB, 'conn-b', 'session-b');
+    wsA.send.mockClear();
+    wsB.send.mockClear();
+
+    eventBusB.publishToSession('session-b', {
+      type: 'session_delta',
+      data: {
+        type: 'assistant_text_delta',
+        messageId: 'message-b',
+        order: 1,
+        offset: 0,
+        text: 'from-b',
+      },
+    });
+
+    expect(wsB.send).toHaveBeenCalledTimes(1);
+    expect(wsA.send).not.toHaveBeenCalled();
+    expect(contextB.sessionFileLogger.log).toHaveBeenCalledWith(
+      'session-b',
+      'OUT_TO_CLIENT',
+      expect.objectContaining({ type: 'session_delta' })
+    );
+    expect(contextA.sessionFileLogger.log).not.toHaveBeenCalledWith(
+      'session-b',
+      'OUT_TO_CLIENT',
+      expect.anything()
+    );
+  });
+
   it('clears in-memory state when the last viewer disconnects from a stopped session', () => {
-    const { appContext, chatConnectionService, sessionDomainService, sessionService } =
-      createTestContext(tempRootDir);
+    const { appContext, sessionDomainService, sessionService } = createTestContext(tempRootDir);
     const handler = createChatUpgradeHandler(appContext);
     vi.mocked(sessionService.isSessionRunning).mockReturnValue(false);
 
@@ -213,16 +329,16 @@ describe('createChatUpgradeHandler', () => {
       ),
     } as unknown as WebSocketServer;
 
-    const request = {} as IncomingMessage;
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
     const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
     const wsAliveMap = new WeakMap<WebSocket, boolean>();
     const url = new URL('http://localhost/chat?connectionId=conn-1&sessionId=session-1');
 
     handler(request, socket, Buffer.alloc(0), url, wss, wsAliveMap);
-    expect(chatConnectionService.register).toHaveBeenCalledWith(
-      'conn-1',
-      expect.objectContaining({ dbSessionId: 'session-1' })
-    );
+    expect(chatConnectionRegistry.get('conn-1')).toMatchObject({ dbSessionId: 'session-1' });
 
     ws.emit('close');
 
@@ -246,7 +362,10 @@ describe('createChatUpgradeHandler', () => {
       ),
     } as unknown as WebSocketServer;
 
-    const request = {} as IncomingMessage;
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
     const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
     const wsAliveMap = new WeakMap<WebSocket, boolean>();
     const url = new URL('http://localhost/chat?connectionId=conn-1&sessionId=session-1');
@@ -283,7 +402,10 @@ describe('createChatUpgradeHandler', () => {
       ),
     } as unknown as WebSocketServer;
 
-    const request = {} as IncomingMessage;
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
     const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
     const wsAliveMap = new WeakMap<WebSocket, boolean>();
     const url = new URL('http://localhost/chat?connectionId=conn-1&sessionId=session-1');
@@ -307,17 +429,16 @@ describe('createChatUpgradeHandler', () => {
   });
 
   it('replaces existing connection with the same id and avoids unregister race on stale close', () => {
-    const {
-      appContext,
-      connections,
-      chatConnectionService,
-      chatMessageHandlerService,
-      sessionFileLogger,
-    } = createTestContext(tempRootDir);
+    const { appContext, chatMessageHandlerService, sessionFileLogger } =
+      createTestContext(tempRootDir);
     const handler = createChatUpgradeHandler(appContext);
 
     const existingWs = new MockWebSocket();
-    connections.set('conn-1', { ws: existingWs, dbSessionId: 'old', workingDir: null });
+    chatConnectionRegistry.register('conn-1', {
+      ws: existingWs as unknown as WebSocket,
+      dbSessionId: 'old',
+      workingDir: null,
+    });
 
     const ws = new MockWebSocket();
     const newerWs = new MockWebSocket();
@@ -332,7 +453,10 @@ describe('createChatUpgradeHandler', () => {
       ),
     } as unknown as WebSocketServer;
 
-    const request = {} as IncomingMessage;
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
     const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
     const wsAliveMap = new WeakMap<WebSocket, boolean>();
     const url = new URL('http://localhost/chat?connectionId=conn-1&sessionId=session-1');
@@ -340,17 +464,19 @@ describe('createChatUpgradeHandler', () => {
     handler(request, socket, Buffer.alloc(0), url, wss, wsAliveMap);
 
     expect(existingWs.close).toHaveBeenCalledWith(1000, 'New connection replacing old one');
-    expect(chatConnectionService.register).toHaveBeenCalledWith(
-      'conn-1',
-      expect.objectContaining({ ws })
-    );
+    expect(chatConnectionRegistry.get('conn-1')?.ws).toBe(ws as unknown as WebSocket);
+    expect(chatConnectionRegistry.countViewers('old')).toBe(0);
     expect(chatMessageHandlerService.setClientCreator).toHaveBeenCalledTimes(1);
 
     // Simulate a newer connection replacing this one before close event fires.
-    connections.set('conn-1', { ws: newerWs, dbSessionId: 'session-1', workingDir: null });
+    chatConnectionRegistry.register('conn-1', {
+      ws: newerWs as unknown as WebSocket,
+      dbSessionId: 'session-1',
+      workingDir: null,
+    });
     ws.emit('close');
 
-    expect(chatConnectionService.unregister).not.toHaveBeenCalled();
+    expect(chatConnectionRegistry.get('conn-1')?.ws).toBe(newerWs as unknown as WebSocket);
     expect(sessionFileLogger.closeSession).not.toHaveBeenCalled();
   });
 
@@ -371,7 +497,10 @@ describe('createChatUpgradeHandler', () => {
       ),
     } as unknown as WebSocketServer;
 
-    const request = {} as IncomingMessage;
+    const request = {
+      headers: { origin: allowedOrigin },
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as IncomingMessage;
     const socket = { write: vi.fn(), destroy: vi.fn() } as unknown as Duplex;
     const wsAliveMap = new WeakMap<WebSocket, boolean>();
     const url = new URL('http://localhost/chat?connectionId=conn-1&sessionId=session-1');

@@ -1,7 +1,8 @@
-import { Terminal } from 'lucide-react';
+import { TerminalIcon } from '@phosphor-icons/react';
 import {
   forwardRef,
   lazy,
+  type SetStateAction,
   Suspense,
   useCallback,
   useEffect,
@@ -12,8 +13,18 @@ import {
 } from 'react';
 
 import { cn } from '@/lib/utils';
-
+import {
+  appendToRollingOutput,
+  TERMINAL_OUTPUT_MAX_CHARS,
+  TERMINAL_TRUNCATION_MARKER,
+  trimRollingOutput,
+} from './rolling-output';
 import { TerminalTabBar } from './terminal-tab-bar';
+import {
+  claimPendingTerminalTab,
+  createTerminalRequestId,
+  removePendingTerminalTab,
+} from './terminal-tab-correlation';
 import { useTerminalWebSocket } from './use-terminal-websocket';
 
 // Lazy import to allow xterm.js to use static imports
@@ -32,6 +43,11 @@ interface TerminalTab {
   terminalId: string | null; // Server-assigned terminal ID
   output: string;
 }
+
+const TERMINAL_ROLLING_OUTPUT_OPTIONS = {
+  maxChars: TERMINAL_OUTPUT_MAX_CHARS,
+  truncationMarker: TERMINAL_TRUNCATION_MARKER,
+};
 
 interface TerminalPanelProps {
   workspaceId: string;
@@ -62,10 +78,21 @@ export interface TerminalPanelRef {
 export const TerminalPanel = forwardRef<TerminalPanelRef, TerminalPanelProps>(
   function TerminalPanel({ workspaceId, className, hideHeader = false, onStateChange }, ref) {
     const [tabs, setTabs] = useState<TerminalTab[]>([]);
-    const [activeTabId, setActiveTabId] = useState<string | null>(null);
+    const tabsRef = useRef<TerminalTab[]>([]);
+    const updateTabs = useCallback((action: SetStateAction<TerminalTab[]>) => {
+      const next = typeof action === 'function' ? action(tabsRef.current) : action;
+      tabsRef.current = next;
+      setTabs(next);
+    }, []);
+    const [activeTabId, setActiveTabIdState] = useState<string | null>(null);
+    const activeTabIdRef = useRef<string | null>(null);
+    const setActiveTabId = useCallback((tabId: string | null) => {
+      activeTabIdRef.current = tabId;
+      setActiveTabIdState(tabId);
+    }, []);
 
-    // Track pending tab that's waiting for a terminalId from the server
-    const pendingTabIdRef = useRef<string | null>(null);
+    // Track pending tabs by create request so out-of-order responses attach correctly.
+    const pendingTabIdsByRequestRef = useRef<Map<string, string>>(new Map());
 
     // Buffer output for terminals that haven't been associated with a tab yet
     // This handles the race condition where output arrives before the 'created' message
@@ -73,82 +100,137 @@ export const TerminalPanel = forwardRef<TerminalPanelRef, TerminalPanelProps>(
 
     // Ref to hold setActive function to break circular dependency with callbacks
     const setActiveRef = useRef<(terminalId: string) => void>(() => undefined);
+    const destroyRef = useRef<(terminalId: string) => void>(() => undefined);
 
     // Handle terminal output - route to correct tab by terminalId
-    const handleOutput = useCallback((terminalId: string, data: string) => {
-      setTabs((prev) => {
-        const tab = prev.find((t) => t.terminalId === terminalId);
-        if (tab) {
-          // Terminal is associated with a tab - append output
-          return prev.map((t) =>
-            t.terminalId === terminalId ? { ...t, output: t.output + data } : t
+    const handleOutput = useCallback(
+      (terminalId: string, data: string) => {
+        const tab = tabsRef.current.find((t) => t.terminalId === terminalId);
+        if (!tab) {
+          // Terminal not yet associated - buffer the output
+          const existingBuffer = outputBufferRef.current.get(terminalId) ?? '';
+          outputBufferRef.current.set(
+            terminalId,
+            appendToRollingOutput(existingBuffer, data, TERMINAL_ROLLING_OUTPUT_OPTIONS)
           );
+          return;
         }
-        // Terminal not yet associated - buffer the output
-        const existingBuffer = outputBufferRef.current.get(terminalId) ?? '';
-        outputBufferRef.current.set(terminalId, existingBuffer + data);
-        return prev;
-      });
-    }, []);
 
-    // Handle terminal created - associate server terminalId with pending tab
-    const handleCreated = useCallback((terminalId: string) => {
-      const pendingTabId = pendingTabIdRef.current;
-      if (pendingTabId) {
-        // Get any buffered output for this terminal
-        const bufferedOutput = outputBufferRef.current.get(terminalId) ?? '';
-        outputBufferRef.current.delete(terminalId);
-
-        setTabs((prev) =>
-          prev.map((tab) =>
-            tab.id === pendingTabId ? { ...tab, terminalId, output: bufferedOutput } : tab
+        // Terminal is associated with a tab - append output
+        updateTabs((prev) =>
+          prev.map((t) =>
+            t.terminalId === terminalId
+              ? {
+                  ...t,
+                  output: appendToRollingOutput(t.output, data, TERMINAL_ROLLING_OUTPUT_OPTIONS),
+                }
+              : t
           )
         );
-        pendingTabIdRef.current = null;
+      },
+      [updateTabs]
+    );
 
-        // Notify backend that this terminal is now active
-        setActiveRef.current(terminalId);
-      }
-    }, []);
+    // Handle terminal created - associate server terminalId with its requested tab
+    const handleCreated = useCallback(
+      (terminalId: string, requestId?: string, outputBuffer?: string) => {
+        const pendingTabId = claimPendingTerminalTab(pendingTabIdsByRequestRef.current, requestId);
+        if (pendingTabId) {
+          // Combine output captured server-side before listeners attached with
+          // any live output buffered client-side before this message arrived.
+          const bufferedOutput = outputBufferRef.current.get(terminalId) ?? '';
+          outputBufferRef.current.delete(terminalId);
+
+          updateTabs((prev) =>
+            prev.map((tab) =>
+              tab.id === pendingTabId
+                ? {
+                    ...tab,
+                    terminalId,
+                    output: trimRollingOutput(
+                      (outputBuffer ?? '') + bufferedOutput,
+                      TERMINAL_ROLLING_OUTPUT_OPTIONS
+                    ),
+                  }
+                : tab
+            )
+          );
+
+          if (activeTabIdRef.current === pendingTabId) {
+            // Notify backend only when this response belongs to the selected tab.
+            setActiveRef.current(terminalId);
+          }
+        } else {
+          // The pending tab was closed before creation completed; avoid an orphaned PTY.
+          outputBufferRef.current.delete(terminalId);
+          destroyRef.current(terminalId);
+        }
+      },
+      [updateTabs]
+    );
 
     // Handle terminal exit
-    const handleExit = useCallback((terminalId: string, exitCode: number) => {
-      setTabs((prev) =>
-        prev.map((tab) =>
-          tab.terminalId === terminalId
-            ? { ...tab, output: `${tab.output}\r\n[Process exited with code ${exitCode}]\r\n` }
-            : tab
-        )
-      );
-    }, []);
-
-    // Handle terminal error
-    const handleError = useCallback((message: string) => {
-      // Show error in pending tab if there is one
-      const pendingTabId = pendingTabIdRef.current;
-      if (pendingTabId) {
-        // Clear the pending tab ref since creation failed
-        pendingTabIdRef.current = null;
-
-        setTabs((prev) =>
+    const handleExit = useCallback(
+      (terminalId: string, exitCode: number) => {
+        updateTabs((prev) =>
           prev.map((tab) =>
-            tab.id === pendingTabId
-              ? { ...tab, output: `${tab.output}\r\n[Error: ${message}]\r\n` }
+            tab.terminalId === terminalId
+              ? {
+                  ...tab,
+                  output: appendToRollingOutput(
+                    tab.output,
+                    `\r\n[Process exited with code ${exitCode}]\r\n`,
+                    TERMINAL_ROLLING_OUTPUT_OPTIONS
+                  ),
+                }
               : tab
           )
         );
-      }
+      },
+      [updateTabs]
+    );
 
-      // Clear any orphaned buffer entries that won't be claimed
-      // This prevents memory leaks when terminal creation fails
-      outputBufferRef.current.clear();
-    }, []);
+    // Handle terminal error
+    const handleError = useCallback(
+      (message: string, requestId?: string) => {
+        // Show request-scoped create errors in the tab that initiated them.
+        if (requestId) {
+          const pendingTabId = claimPendingTerminalTab(
+            pendingTabIdsByRequestRef.current,
+            requestId
+          );
+          if (!pendingTabId) {
+            return;
+          }
+
+          updateTabs((prev) =>
+            prev.map((tab) =>
+              tab.id === pendingTabId
+                ? {
+                    ...tab,
+                    output: appendToRollingOutput(
+                      tab.output,
+                      `\r\n[Error: ${message}]\r\n`,
+                      TERMINAL_ROLLING_OUTPUT_OPTIONS
+                    ),
+                  }
+                : tab
+            )
+          );
+          return;
+        }
+
+        // Legacy uncorrelated errors cannot be tied to one create request.
+        outputBufferRef.current.clear();
+      },
+      [updateTabs]
+    );
 
     // Handle terminal list restoration (after page refresh)
     const handleTerminalList = useCallback(
       (terminals: Array<{ id: string; createdAt: string; outputBuffer?: string }>) => {
         // Only restore if we don't already have tabs (avoid duplicates on reconnect)
-        setTabs((prev) => {
+        updateTabs((prev) => {
           if (prev.length > 0) {
             return prev;
           }
@@ -158,7 +240,7 @@ export const TerminalPanel = forwardRef<TerminalPanelRef, TerminalPanelProps>(
             id: `tab-${terminal.id}`,
             label: `Terminal ${index + 1}`,
             terminalId: terminal.id,
-            output: terminal.outputBuffer ?? '',
+            output: trimRollingOutput(terminal.outputBuffer ?? '', TERMINAL_ROLLING_OUTPUT_OPTIONS),
           }));
 
           // Set the first tab as active
@@ -175,38 +257,41 @@ export const TerminalPanel = forwardRef<TerminalPanelRef, TerminalPanelProps>(
           return restoredTabs;
         });
       },
-      []
+      [setActiveTabId, updateTabs]
     );
 
-    const { connected, create, sendInput, resize, destroy, setActive } = useTerminalWebSocket({
-      workspaceId,
-      onOutput: handleOutput,
-      onCreated: handleCreated,
-      onExit: handleExit,
-      onError: handleError,
-      onTerminalList: handleTerminalList,
-    });
+    const { connected, gaveUp, reconnect, create, sendInput, resize, destroy, setActive } =
+      useTerminalWebSocket({
+        workspaceId,
+        onOutput: handleOutput,
+        onCreated: handleCreated,
+        onExit: handleExit,
+        onError: handleError,
+        onTerminalList: handleTerminalList,
+      });
 
     // Update ref so callbacks can access setActive
     setActiveRef.current = setActive;
+    destroyRef.current = destroy;
 
     // Create new terminal tab - extracted so it can be exposed via ref
     const handleNewTab = useCallback(() => {
-      const id = `tab-${Date.now()}`;
-      const newTab: TerminalTab = {
-        id,
-        label: `Terminal ${tabs.length + 1}`,
-        terminalId: null,
-        output: '',
-      };
+      const requestId = createTerminalRequestId();
+      const id = `tab-${requestId}`;
 
-      // Track this as the pending tab waiting for a terminalId
-      pendingTabIdRef.current = id;
-
-      setTabs((prev) => [...prev, newTab]);
+      pendingTabIdsByRequestRef.current.set(requestId, id);
+      updateTabs((prev) => [
+        ...prev,
+        {
+          id,
+          label: `Terminal ${prev.length + 1}`,
+          terminalId: null,
+          output: '',
+        },
+      ]);
       setActiveTabId(id);
-      create();
-    }, [tabs.length, create]);
+      create(requestId);
+    }, [create, setActiveTabId, updateTabs]);
 
     // Expose createNewTerminal to parent via ref
     useImperativeHandle(
@@ -220,9 +305,10 @@ export const TerminalPanel = forwardRef<TerminalPanelRef, TerminalPanelProps>(
     // Close terminal tab
     const handleCloseTab = useCallback(
       (id: string) => {
-        setTabs((prev) => {
+        updateTabs((prev) => {
           // Find the tab to get its terminalId before removing it
           const tab = prev.find((t) => t.id === id);
+          removePendingTerminalTab(pendingTabIdsByRequestRef.current, id);
           if (tab?.terminalId) {
             // Destroy the server-side terminal process
             destroy(tab.terminalId);
@@ -255,7 +341,7 @@ export const TerminalPanel = forwardRef<TerminalPanelRef, TerminalPanelProps>(
           return filtered;
         });
       },
-      [activeTabId, destroy, setActive]
+      [activeTabId, destroy, setActive, setActiveTabId, updateTabs]
     );
 
     // Handle terminal input - send to the active tab's terminal
@@ -289,7 +375,7 @@ export const TerminalPanel = forwardRef<TerminalPanelRef, TerminalPanelProps>(
           setActive(tab.terminalId);
         }
       },
-      [tabs, setActive]
+      [tabs, setActive, setActiveTabId]
     );
 
     // Notify parent of state changes for inline tab rendering
@@ -319,17 +405,49 @@ export const TerminalPanel = forwardRef<TerminalPanelRef, TerminalPanelProps>(
             className
           )}
         >
-          <Terminal className="h-10 w-10 text-zinc-500 mb-3" />
+          <TerminalIcon className="h-10 w-10 text-zinc-500 mb-3" />
           <p className="text-sm font-medium text-zinc-400">No terminal open</p>
           <p className="text-xs text-zinc-500 mt-1">
-            {connected ? 'Click + to open a new terminal' : 'Connecting...'}
+            {connected
+              ? 'Click + to open a new terminal'
+              : gaveUp
+                ? 'Disconnected'
+                : 'Connecting...'}
           </p>
+          {gaveUp && (
+            <button
+              type="button"
+              onClick={reconnect}
+              className="mt-2 px-2 py-1 text-xs rounded border border-zinc-700 text-zinc-300 hover:bg-zinc-800"
+            >
+              Reconnect
+            </button>
+          )}
         </div>
       );
     }
 
     return (
       <div className={cn('h-full flex flex-col', className)}>
+        {/* Input sent while disconnected is dropped, so make the gap visible */}
+        {!connected && (
+          <div className="flex items-center justify-between gap-2 px-3 py-1.5 bg-amber-950/70 border-b border-amber-900">
+            <p className="text-xs text-amber-200">
+              {gaveUp
+                ? 'Terminal disconnected. Input will not be delivered until you reconnect.'
+                : 'Terminal disconnected — reconnecting... Input typed now will not be delivered.'}
+            </p>
+            {gaveUp && (
+              <button
+                type="button"
+                onClick={reconnect}
+                className="shrink-0 px-2 py-0.5 text-xs rounded border border-amber-700 text-amber-200 hover:bg-amber-900"
+              >
+                Reconnect
+              </button>
+            )}
+          </div>
+        )}
         {/* Terminal tabs row - only show if not hidden */}
         {!hideHeader && (
           <div className="flex items-center gap-1.5 px-2 py-1 bg-zinc-900 border-b border-zinc-800">

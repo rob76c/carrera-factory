@@ -1,10 +1,8 @@
 import { toError } from '@/backend/lib/error-utils';
 import { configService } from '@/backend/services/config.service';
 import { createLogger } from '@/backend/services/logger.service';
-import { agentSessionAccessor } from '@/backend/services/session';
-import { workspaceAccessor } from '@/backend/services/workspace';
 import { SessionStatus } from '@/shared/core';
-import type { RatchetSessionBridge } from './bridges';
+import type { RatchetSessionBridge, RatchetWorkspaceBridge } from './bridges';
 import { ratchetProviderResolverService } from './ratchet-provider-resolver.service';
 
 const logger = createLogger('fixer-session');
@@ -23,21 +21,40 @@ export interface AcquireAndDispatchInput {
 }
 
 export type AcquireAndDispatchResult =
-  | { status: 'started'; sessionId: string; promptSent?: boolean }
+  | {
+      status: 'started';
+      sessionId: string;
+      promptSent?: boolean;
+      promptCompletion?: Promise<boolean>;
+    }
   | { status: 'already_active'; sessionId: string; reason: 'working' | 'message_dispatched' }
   | { status: 'skipped'; reason: string }
   | { status: 'error'; error: string };
 
 type SessionAcquisitionDecision =
-  | { action: 'start' | 'restart' | 'send_message' | 'already_active'; sessionId: string }
+  | { action: 'start'; sessionId: string }
+  | { action: 'restart'; sessionId: string }
+  | { action: 'send_message'; sessionId: string }
+  | { action: 'already_active'; sessionId: string }
   | { action: 'limit_reached' };
 
 class FixerSessionService {
   private readonly pendingAcquisitions = new Map<string, Promise<AcquireAndDispatchResult>>();
   private sessionBridge: RatchetSessionBridge | null = null;
+  private workspaceBridge: RatchetWorkspaceBridge | null = null;
 
-  configure(bridges: { session: RatchetSessionBridge }): void {
+  configure(bridges: { session: RatchetSessionBridge; workspace: RatchetWorkspaceBridge }): void {
     this.sessionBridge = bridges.session;
+    this.workspaceBridge = bridges.workspace;
+  }
+
+  private get workspace(): RatchetWorkspaceBridge {
+    if (!this.workspaceBridge) {
+      throw new Error(
+        'FixerSessionService not configured: workspace bridge missing. Call configure() first.'
+      );
+    }
+    return this.workspaceBridge;
   }
 
   private get session(): RatchetSessionBridge {
@@ -74,10 +91,15 @@ class FixerSessionService {
     workspaceId: string,
     workflow: string
   ): Promise<{ id: string; status: SessionStatus } | null> {
+    const workspace = await this.workspace.findFixerContext(workspaceId);
+    if (!workspace) {
+      return null;
+    }
     const provider = await ratchetProviderResolverService.resolveRatchetProvider({
       workspaceId,
+      workspace,
     });
-    const sessions = await agentSessionAccessor.findByWorkspaceId(workspaceId);
+    const sessions = await this.session.findSessionsByWorkspaceId(workspaceId);
     const matching = sessions
       .filter(
         (s) =>
@@ -97,13 +119,13 @@ class FixerSessionService {
     const { workspaceId, workflow } = input;
 
     try {
-      const workspace = await workspaceAccessor.findById(workspaceId);
+      const workspace = await this.workspace.findFixerContext(workspaceId);
       if (!workspace?.worktreePath) {
         logger.warn('Workspace not ready for fixer session', { workspaceId, workflow });
         return { status: 'skipped', reason: 'Workspace not ready (no worktree path)' };
       }
 
-      const acquisitionResult = await this.acquireSessionDecision(input);
+      const acquisitionResult = await this.acquireSessionDecision(input, workspace);
 
       if (acquisitionResult.action === 'limit_reached') {
         return { status: 'skipped', reason: 'Workspace session limit reached' };
@@ -121,12 +143,14 @@ class FixerSessionService {
   }
 
   private async acquireSessionDecision(
-    input: AcquireAndDispatchInput
+    input: AcquireAndDispatchInput,
+    workspace: NonNullable<Awaited<ReturnType<RatchetWorkspaceBridge['findFixerContext']>>>
   ): Promise<SessionAcquisitionDecision> {
     const provider = await ratchetProviderResolverService.resolveRatchetProvider({
       workspaceId: input.workspaceId,
+      workspace,
     });
-    const acquisition = await agentSessionAccessor.acquireFixerSession({
+    const acquisition = await this.session.acquireFixerSession({
       workspaceId: input.workspaceId,
       workflow: input.workflow,
       sessionName: input.sessionName,
@@ -213,22 +237,26 @@ class FixerSessionService {
     await input.beforeStart?.({ sessionId: acquisitionResult.sessionId, prompt });
 
     if (input.dispatchMode === 'start_empty_and_send') {
-      await this.session.startSession(acquisitionResult.sessionId, {
+      await this.startOrRestartSession(acquisitionResult, {
         initialPrompt: '',
         startupModePreset: 'non_interactive',
       });
 
-      const promptSent = await this.sendMessageSafely(acquisitionResult.sessionId, prompt);
-
       await input.afterStart?.({ sessionId: acquisitionResult.sessionId, prompt });
+
+      const { promptSent, promptCompletion } = this.beginMessageSafely(
+        acquisitionResult.sessionId,
+        prompt
+      );
 
       return {
         status: 'started',
         sessionId: acquisitionResult.sessionId,
         promptSent,
+        promptCompletion,
       };
     } else {
-      await this.session.startSession(acquisitionResult.sessionId, {
+      await this.startOrRestartSession(acquisitionResult, {
         initialPrompt: prompt,
         startupModePreset: 'non_interactive',
       });
@@ -240,6 +268,18 @@ class FixerSessionService {
       status: 'started',
       sessionId: acquisitionResult.sessionId,
     };
+  }
+
+  private async startOrRestartSession(
+    acquisitionResult: Extract<SessionAcquisitionDecision, { action: 'start' | 'restart' }>,
+    opts: { initialPrompt?: string; startupModePreset?: 'non_interactive' | 'plan' }
+  ): Promise<void> {
+    if (acquisitionResult.action === 'restart') {
+      await this.session.restartSession(acquisitionResult.sessionId, opts);
+      return;
+    }
+
+    await this.session.startSession(acquisitionResult.sessionId, opts);
   }
 
   private async sendMessageSafely(sessionId: string, prompt: string): Promise<boolean> {
@@ -257,6 +297,36 @@ class FixerSessionService {
         error: error instanceof Error ? error.message : String(error),
       });
       return false;
+    }
+  }
+
+  private beginMessageSafely(
+    sessionId: string,
+    prompt: string
+  ): { promptSent: boolean; promptCompletion?: Promise<boolean> } {
+    if (!this.session.isSessionRunning(sessionId)) {
+      logger.warn('Could not send fixer message because session is not running', { sessionId });
+      return { promptSent: false };
+    }
+
+    try {
+      const promptCompletion = this.session
+        .sendSessionMessage(sessionId, prompt)
+        .then(() => true)
+        .catch((error) => {
+          logger.warn('Failed to send fixer message', {
+            sessionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return false;
+        });
+      return { promptSent: true, promptCompletion };
+    } catch (error) {
+      logger.warn('Failed to initiate fixer message', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { promptSent: false };
     }
   }
 }

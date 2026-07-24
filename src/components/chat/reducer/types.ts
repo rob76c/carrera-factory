@@ -27,12 +27,19 @@ export interface RejectedMessageInfo {
   text: string;
   attachments?: MessageAttachment[];
   error: string;
+  sessionId?: string | null;
 }
 
 /** Content stored for a pending message (for recovery on rejection) */
 export interface PendingMessageContent {
   text: string;
   attachments?: MessageAttachment[];
+  sessionId?: string | null;
+}
+
+/** Queued message metadata tracked locally for rejection recovery. */
+export interface RecoverableQueuedMessage extends QueuedMessage {
+  sessionId?: string | null;
 }
 
 /**
@@ -175,9 +182,11 @@ export interface ChatState {
    * Map from message ID to QueuedMessage - enforces uniqueness by design.
    * Maps automatically de-dupe: adding the same ID twice simply overwrites.
    */
-  queuedMessages: Map<string, QueuedMessage>;
+  queuedMessages: Map<string, RecoverableQueuedMessage>;
   /** Tool use ID to message index map for O(1) updates */
   toolUseIdToIndex: Map<string, number>;
+  /** Agent transcript order to message index map for O(1) live updates. */
+  agentMessageOrderToIndex: Map<number, number>;
   /** Latest accumulated thinking content from extended thinking mode */
   latestThinking: string | null;
   /**
@@ -242,7 +251,14 @@ export type ChatAction =
   // WebSocket message actions
   | { type: 'SESSION_RUNTIME_SNAPSHOT'; payload: { sessionRuntime: SessionRuntimeState } }
   | { type: 'SESSION_RUNTIME_UPDATED'; payload: { sessionRuntime: SessionRuntimeState } }
-  | { type: 'WS_AGENT_MESSAGE'; payload: { message: AgentMessage; order: number } }
+  | {
+      type: 'WS_AGENT_MESSAGE';
+      payload: { message: AgentMessage; order: number; messageId?: string };
+    }
+  | {
+      type: 'WS_ASSISTANT_TEXT_DELTA';
+      payload: { messageId: string; order: number; offset: number; text: string };
+    }
   | { type: 'WS_ERROR'; payload: { message: string } }
   | { type: 'WS_SESSIONS'; payload: { sessions: SessionInfo[] } }
   | { type: 'WS_PERMISSION_REQUEST'; payload: PermissionRequest }
@@ -268,7 +284,12 @@ export type ChatAction =
   | { type: 'ADD_TO_QUEUE'; payload: QueuedMessage }
   | {
       type: 'MESSAGE_SENDING';
-      payload: { id: string; text: string; attachments?: MessageAttachment[] };
+      payload: {
+        id: string;
+        text: string;
+        attachments?: MessageAttachment[];
+        sessionId?: string | null;
+      };
     }
   | { type: 'CLEAR_REJECTED_MESSAGE' }
   // Message used as interactive response (clears pending request and adds message)

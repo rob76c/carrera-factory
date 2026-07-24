@@ -1,4 +1,8 @@
-import { debugLog, insertMessageByOrder } from '@/components/chat/reducer/helpers';
+import {
+  applyRendererMessages,
+  debugLog,
+  insertMessageByOrder,
+} from '@/components/chat/reducer/helpers';
 import type { ChatAction, ChatState } from '@/components/chat/reducer/types';
 import type { ChatMessage } from '@/lib/chat-protocol';
 import { MessageState, QUEUED_MESSAGE_ORDER_BASE } from '@/lib/chat-protocol';
@@ -55,6 +59,7 @@ function handleAcceptedState(
   userMessage: StateChangeUserMessage,
   queuePosition?: number
 ): ChatState {
+  const pendingContent = state.pendingMessages.get(id);
   const newPendingMessages = new Map(state.pendingMessages);
   newPendingMessages.delete(id);
 
@@ -65,6 +70,7 @@ function handleAcceptedState(
       text: userMessage.text,
       timestamp: userMessage.timestamp,
       attachments: userMessage.attachments,
+      sessionId: pendingContent?.sessionId ?? state.queuedMessages.get(id)?.sessionId,
       settings: userMessage.settings ?? {
         selectedModel: null,
         reasoningEffort: null,
@@ -98,6 +104,7 @@ function handleAcceptedState(
     text: userMessage.text,
     timestamp: userMessage.timestamp,
     attachments: userMessage.attachments,
+    sessionId: pendingContent?.sessionId,
     settings: userMessage.settings ?? {
       selectedModel: null,
       reasoningEffort: null,
@@ -124,16 +131,18 @@ function handleAcceptedState(
     }
   }
 
-  return {
-    ...state,
-    messages: insertMessageByOrder(state.messages, newMessage),
-    queuedMessages: newQueuedMessages,
-    pendingMessages: newPendingMessages,
-    latestThinking: null,
-    messageIdToUuid: newMessageIdToUuid,
-    pendingUserMessageUuids: newPendingUuids,
-    localUserMessageIds: newLocalUserMessageIds,
-  };
+  return applyRendererMessages(
+    {
+      ...state,
+      queuedMessages: newQueuedMessages,
+      pendingMessages: newPendingMessages,
+      latestThinking: null,
+      messageIdToUuid: newMessageIdToUuid,
+      pendingUserMessageUuids: newPendingUuids,
+      localUserMessageIds: newLocalUserMessageIds,
+    },
+    insertMessageByOrder(state.messages, newMessage)
+  );
 }
 
 function handleDispatchedState(
@@ -178,10 +187,7 @@ function upsertUserMessageFromStateChange(
   const existingMessageIndex = state.messages.findIndex((m) => m.id === id);
   if (existingMessageIndex === -1) {
     // If this tab missed earlier transitions (reconnect/race), recover from payload.
-    return {
-      ...state,
-      messages: insertMessageByOrder(state.messages, messageFromDelta),
-    };
+    return applyRendererMessages(state, insertMessageByOrder(state.messages, messageFromDelta));
   }
 
   // Update the message with the new order and re-insert at correct position
@@ -205,10 +211,7 @@ function upsertUserMessageFromStateChange(
   ];
   const newMessages = insertMessageByOrder(messagesWithoutOld, updatedMessage);
 
-  return {
-    ...state,
-    messages: newMessages,
-  };
+  return applyRendererMessages(state, newMessages);
 }
 
 function handleCommittedState(
@@ -228,11 +231,13 @@ function handleRemoveFromQueue(state: ChatState, id: string): ChatState {
 function handleCancelledState(state: ChatState, id: string): ChatState {
   const newQueuedMessages = new Map(state.queuedMessages);
   newQueuedMessages.delete(id);
-  return {
-    ...state,
-    messages: state.messages.filter((m) => m.id !== id),
-    queuedMessages: newQueuedMessages,
-  };
+  return applyRendererMessages(
+    {
+      ...state,
+      queuedMessages: newQueuedMessages,
+    },
+    state.messages.filter((m) => m.id !== id)
+  );
 }
 
 function handleRejectedOrFailedState(
@@ -250,17 +255,20 @@ function handleRejectedOrFailedState(
   const newPendingMessages = new Map(state.pendingMessages);
   newPendingMessages.delete(id);
 
-  return {
-    ...state,
-    messages: state.messages.filter((m) => m.id !== id),
-    queuedMessages: newQueuedMessages,
-    pendingMessages: newPendingMessages,
-    lastRejectedMessage: recoveryContent
-      ? {
-          text: queuedMessage?.text ?? pendingContent?.text ?? '',
-          attachments: recoveryContent.attachments,
-          error: errorMessage ?? 'Message failed',
-        }
-      : null,
-  };
+  return applyRendererMessages(
+    {
+      ...state,
+      queuedMessages: newQueuedMessages,
+      pendingMessages: newPendingMessages,
+      lastRejectedMessage: recoveryContent
+        ? {
+            text: queuedMessage?.text ?? pendingContent?.text ?? '',
+            attachments: recoveryContent.attachments,
+            error: errorMessage ?? 'Message failed',
+            sessionId: recoveryContent.sessionId,
+          }
+        : state.lastRejectedMessage,
+    },
+    state.messages.filter((m) => m.id !== id)
+  );
 }

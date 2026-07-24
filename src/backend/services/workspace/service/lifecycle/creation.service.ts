@@ -1,13 +1,14 @@
 import type { Prisma, SessionProvider, Workspace } from '@prisma-gen/client';
-import { TRPCError } from '@trpc/server';
+import { ApplicationError } from '@/backend/lib/application-error';
 import type { AutoIterationConfig } from '@/backend/services/auto-iteration';
-import { gitOpsService } from '@/backend/services/git-ops.service';
 import type { createLogger } from '@/backend/services/logger.service';
-import { userSettingsAccessor } from '@/backend/services/settings';
+import { userSettingsService } from '@/backend/services/settings';
 import { projectAccessor } from '@/backend/services/workspace/resources/project.accessor';
 import { workspaceAccessor } from '@/backend/services/workspace/resources/workspace.accessor';
+import { gitOpsService } from '@/backend/services/workspace/service/worktree/git-ops.service';
 import { worktreeLifecycleService } from '@/backend/services/workspace/service/worktree/worktree-lifecycle.service';
 import type { MessageAttachment } from '@/shared/acp-protocol';
+import { autoIterationConfigSchema } from '@/shared/schemas/auto-iteration.schema';
 
 type Logger = ReturnType<typeof createLogger>;
 
@@ -46,7 +47,9 @@ export type WorkspaceCreationSource =
       name?: string;
       description?: string;
       ratchetEnabled?: boolean;
+      initialPrompt?: string;
       startupModePreset?: 'non_interactive' | 'plan';
+      provider?: SessionProvider;
     }
   | {
       type: 'LINEAR_ISSUE';
@@ -57,7 +60,27 @@ export type WorkspaceCreationSource =
       name?: string;
       description?: string;
       ratchetEnabled?: boolean;
+      initialPrompt?: string;
       startupModePreset?: 'non_interactive' | 'plan';
+      provider?: SessionProvider;
+    }
+  | {
+      type: 'CHILD_WORKSPACE';
+      parentWorkspaceId: string;
+      projectId: string;
+      name: string;
+      description?: string;
+      initialPrompt?: string;
+      reportBackOn?: string;
+    }
+  | {
+      type: 'PERIODIC_TASK';
+      projectId: string;
+      periodicTaskId: string;
+      name: string;
+      description?: string;
+      initialPrompt: string;
+      ratchetEnabled?: boolean;
     };
 
 /**
@@ -78,15 +101,28 @@ type PreparedWorkspaceCreation = {
     linearIssueId?: string;
     linearIssueIdentifier?: string;
     linearIssueUrl?: string;
-    creationSource: 'MANUAL' | 'RESUME_BRANCH' | 'GITHUB_ISSUE' | 'LINEAR_ISSUE';
+    creationSource:
+      | 'MANUAL'
+      | 'RESUME_BRANCH'
+      | 'GITHUB_ISSUE'
+      | 'LINEAR_ISSUE'
+      | 'PERIODIC_TASK'
+      | 'CHILD_WORKSPACE';
     creationMetadata?: Prisma.InputJsonValue;
+    defaultSessionProvider?: Prisma.WorkspaceCreateInput['defaultSessionProvider'];
     mode?: 'STANDARD' | 'AUTO_ITERATION';
     autoIterationConfig?: Prisma.InputJsonValue;
+    parentWorkspaceId?: string;
+    periodicTaskId?: string;
   };
   initMode?: {
     useExistingBranch: boolean;
   };
 };
+
+function hasInitialPrompt(source: { initialPrompt?: string }): source is { initialPrompt: string } {
+  return typeof source.initialPrompt === 'string';
+}
 
 /**
  * Canonical workspace creation orchestrator.
@@ -111,7 +147,9 @@ export class WorkspaceCreationService {
     const { preparedInput, initMode } = await this.prepareCreation(source);
 
     // Apply workspace creation defaults from user settings where needed.
-    const ratchetEnabled = await this.resolveWorkspaceCreationDefaults(source.ratchetEnabled);
+    const ratchetEnabled = await this.resolveWorkspaceCreationDefaults(
+      'ratchetEnabled' in source ? source.ratchetEnabled : undefined
+    );
 
     // Create workspace record
     const workspace = await workspaceAccessor.create({
@@ -143,6 +181,10 @@ export class WorkspaceCreationService {
         return this.prepareGitHubIssueCreation(source);
       case 'LINEAR_ISSUE':
         return this.prepareLinearIssueCreation(source);
+      case 'CHILD_WORKSPACE':
+        return await this.prepareChildWorkspaceCreation(source);
+      case 'PERIODIC_TASK':
+        return this.preparePeriodicTaskCreation(source);
     }
   }
 
@@ -150,20 +192,30 @@ export class WorkspaceCreationService {
     source: Extract<WorkspaceCreationSource, { type: 'MANUAL' }>
   ): PreparedWorkspaceCreation {
     if (source.mode === 'AUTO_ITERATION' && !source.autoIterationConfig) {
-      throw new TRPCError({
-        code: 'BAD_REQUEST',
-        message: 'autoIterationConfig is required for AUTO_ITERATION workspaces',
-      });
+      throw new ApplicationError(
+        'INVALID_INPUT',
+        'autoIterationConfig is required for AUTO_ITERATION workspaces'
+      );
     }
     if (source.autoIterationConfig && source.mode !== 'AUTO_ITERATION') {
-      throw new TRPCError({
-        code: 'BAD_REQUEST',
-        message: 'autoIterationConfig is only allowed for AUTO_ITERATION workspaces',
-      });
+      throw new ApplicationError(
+        'INVALID_INPUT',
+        'autoIterationConfig is only allowed for AUTO_ITERATION workspaces'
+      );
     }
+    const configParsed = source.autoIterationConfig
+      ? autoIterationConfigSchema.safeParse(source.autoIterationConfig)
+      : null;
+    if (configParsed && !configParsed.success) {
+      throw new ApplicationError(
+        'INVALID_INPUT',
+        `Invalid auto-iteration config: ${configParsed.error.message}`
+      );
+    }
+    const autoIterationConfig = configParsed?.success ? configParsed.data : undefined;
 
     const metadata: Record<string, unknown> = {};
-    if (source.initialPrompt) {
+    if (hasInitialPrompt(source)) {
       metadata.initialPrompt = source.initialPrompt;
     }
     if (source.initialAttachments && source.initialAttachments.length > 0) {
@@ -184,8 +236,8 @@ export class WorkspaceCreationService {
           ? { creationMetadata: metadata as Prisma.InputJsonValue }
           : {}),
         ...(source.mode ? { mode: source.mode } : {}),
-        ...(source.autoIterationConfig
-          ? { autoIterationConfig: source.autoIterationConfig as unknown as Prisma.InputJsonValue }
+        ...(autoIterationConfig
+          ? { autoIterationConfig: autoIterationConfig as unknown as Prisma.InputJsonValue }
           : {}),
       },
     };
@@ -196,18 +248,15 @@ export class WorkspaceCreationService {
   ): Promise<PreparedWorkspaceCreation> {
     const project = await projectAccessor.findById(source.projectId);
     if (!project) {
-      throw new TRPCError({
-        code: 'NOT_FOUND',
-        message: `Project not found: ${source.projectId}`,
-      });
+      throw new ApplicationError('NOT_FOUND', `Project not found: ${source.projectId}`);
     }
 
     const isCheckedOut = await gitOpsService.isBranchCheckedOut(project, source.branchName);
     if (isCheckedOut) {
-      throw new TRPCError({
-        code: 'BAD_REQUEST',
-        message: `Branch '${source.branchName}' is already checked out in another worktree.`,
-      });
+      throw new ApplicationError(
+        'INVALID_INPUT',
+        `Branch '${source.branchName}' is already checked out in another worktree.`
+      );
     }
 
     return {
@@ -237,6 +286,9 @@ export class WorkspaceCreationService {
     if (source.startupModePreset) {
       metadata.startupModePreset = source.startupModePreset;
     }
+    if (hasInitialPrompt(source)) {
+      metadata.initialPrompt = source.initialPrompt;
+    }
 
     return {
       preparedInput: {
@@ -245,6 +297,7 @@ export class WorkspaceCreationService {
         description: source.description,
         githubIssueNumber: source.issueNumber,
         githubIssueUrl: source.issueUrl,
+        defaultSessionProvider: source.provider,
         creationSource: 'GITHUB_ISSUE',
         creationMetadata: metadata as Prisma.InputJsonValue,
       },
@@ -262,6 +315,9 @@ export class WorkspaceCreationService {
     if (source.startupModePreset) {
       metadata.startupModePreset = source.startupModePreset;
     }
+    if (hasInitialPrompt(source)) {
+      metadata.initialPrompt = source.initialPrompt;
+    }
 
     return {
       preparedInput: {
@@ -271,8 +327,69 @@ export class WorkspaceCreationService {
         linearIssueId: source.issueId,
         linearIssueIdentifier: source.issueIdentifier,
         linearIssueUrl: source.issueUrl,
+        defaultSessionProvider: source.provider,
         creationSource: 'LINEAR_ISSUE',
         creationMetadata: metadata as Prisma.InputJsonValue,
+      },
+    };
+  }
+
+  private async prepareChildWorkspaceCreation(
+    source: Extract<WorkspaceCreationSource, { type: 'CHILD_WORKSPACE' }>
+  ): Promise<PreparedWorkspaceCreation> {
+    const parent = await workspaceAccessor.findRawById(source.parentWorkspaceId);
+    if (!parent) {
+      throw new ApplicationError(
+        'NOT_FOUND',
+        `Parent workspace not found: ${source.parentWorkspaceId}`
+      );
+    }
+    if (parent.status === 'ARCHIVED') {
+      throw new ApplicationError(
+        'INVALID_INPUT',
+        'Cannot create a child workspace under an archived parent'
+      );
+    }
+    if (parent.parentWorkspaceId) {
+      throw new ApplicationError(
+        'INVALID_INPUT',
+        'Child workspaces cannot have children (max depth 1)'
+      );
+    }
+
+    const metadata: Record<string, unknown> = {
+      parentWorkspaceId: source.parentWorkspaceId,
+    };
+    if (source.initialPrompt) {
+      metadata.initialPrompt = source.initialPrompt;
+    }
+    if (source.reportBackOn) {
+      metadata.reportBackOn = source.reportBackOn;
+    }
+
+    return {
+      preparedInput: {
+        projectId: source.projectId,
+        name: source.name,
+        description: source.description,
+        creationSource: 'CHILD_WORKSPACE',
+        creationMetadata: metadata as Prisma.InputJsonValue,
+        parentWorkspaceId: source.parentWorkspaceId,
+      },
+    };
+  }
+
+  private preparePeriodicTaskCreation(
+    source: Extract<WorkspaceCreationSource, { type: 'PERIODIC_TASK' }>
+  ): PreparedWorkspaceCreation {
+    return {
+      preparedInput: {
+        projectId: source.projectId,
+        periodicTaskId: source.periodicTaskId,
+        name: source.name,
+        description: source.description,
+        creationSource: 'PERIODIC_TASK',
+        creationMetadata: { initialPrompt: source.initialPrompt },
       },
     };
   }
@@ -280,7 +397,7 @@ export class WorkspaceCreationService {
   private async resolveWorkspaceCreationDefaults(
     explicitRatchetEnabled?: boolean
   ): Promise<boolean> {
-    const settings = await userSettingsAccessor.get();
+    const settings = await userSettingsService.get();
     return explicitRatchetEnabled ?? settings.ratchetEnabled;
   }
 }

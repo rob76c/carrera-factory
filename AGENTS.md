@@ -5,7 +5,7 @@
 - `src/backend/services/`: Service capsules and infrastructure services
 - `src/backend/services/{name}/service/`: Business logic for service `{name}`
 - `src/backend/services/{name}/resources/`: DB/resource access for service `{name}` (Prisma accessors)
-- `src/backend/orchestration/`: Cross-service coordination layer (bridges, workspace init/archive)
+- `src/backend/orchestration/`: Cross-service coordination layer (bridges, workspace init/archive, child workspace coordination)
 - `src/client/`: React UI (routes/pages, plus client-specific hooks/components/lib; router in `src/client/router.tsx`)
 - `src/cli/`: CLI entrypoint and commands
 - `src/components/`: Shared UI components (shadcn/ui)
@@ -21,6 +21,7 @@ Path aliases: `@/*` → `src/`, `@prisma-gen/*` → `prisma/generated/`.
 - `pnpm start`: Run production server
 - `pnpm dev:electron`: Electron app with hot reload
 - `pnpm test`: Run Vitest test suite
+- `pnpm check`: Run standard guardrails (Biome, env, ownership, dependency boundaries, Codex schema)
 - `pnpm typecheck`: TypeScript checks only
 - `pnpm check:fix`: Lint + format with Biome
 - `pnpm db:migrate`, `pnpm db:generate`, `pnpm db:studio`: Prisma workflows
@@ -31,7 +32,7 @@ Path aliases: `@/*` → `src/`, `@prisma-gen/*` → `prisma/generated/`.
 - Prefer existing patterns and directory conventions; keep backend logic in `src/backend/` and UI in `src/client/`.
 
 ## Backend Service Capsule Pattern
-- **Service capsules:** session, workspace, github, linear, ratchet, terminal, run-script, settings, decision-log (under `src/backend/services/{name}/`)
+- **Service capsules:** session, workspace, github, linear, ratchet, terminal, run-script, settings, decision-log, periodic-task (under `src/backend/services/{name}/`)
 - Each capsule has an `index.ts` barrel file as the sole public API
 - Consumers must import from barrel (`@/backend/services/session`), never from internal paths
 - Service-to-service imports must go through barrel imports and follow `dependsOn` in `src/backend/services/registry.ts`
@@ -52,7 +53,7 @@ Path aliases: `@/*` → `src/`, `@prisma-gen/*` → `prisma/generated/`.
 ## Commit & Pull Request Guidelines
 - Commit messages are short, imperative, and descriptive (e.g., “Fix session tab close requiring double-click”), often with issue/PR references like `(#123)`.
 - Keep the first line under 72 characters and reference issues when relevant.
-- PRs should include: a clear description, any required tests run (`pnpm test`, `pnpm typecheck`, `pnpm check:fix`), and updated docs when behavior changes.
+- PRs should include: a clear description, any required tests run (`pnpm test`, `pnpm typecheck`, `pnpm check`, `pnpm check:fix`), and updated docs when behavior changes.
 
 ## Git & GitHub CLI
 - Authenticate once: `gh auth login`, verify with `gh auth status`.
@@ -65,7 +66,9 @@ Path aliases: `@/*` → `src/`, `@prisma-gen/*` → `prisma/generated/`.
 ## Contributor Checklist
 - Add or update tests and run `pnpm test` (use `pnpm test:watch` during development).
 - Add or update Storybook stories when UI changes are introduced (`pnpm storybook`).
-- Run `pnpm typecheck` and `pnpm check:fix`.
+- Run `pnpm check`, `pnpm typecheck`, and `pnpm check:fix`.
+- Run `pnpm check:prisma-schema` when `prisma/schema.prisma` changes.
+- `pnpm check` enforces Codex schema drift in CI. Locally, that check is skipped unless the pinned Codex CLI is installed; use `CODEX_SCHEMA_CHECK=strict pnpm check:codex-schema` to enforce it.
 - Ensure schemas use Zod and avoid raw typecasts.
 - Update docs if behavior or commands change.
 
@@ -74,9 +77,11 @@ Path aliases: `@/*` → `src/`, `@prisma-gen/*` → `prisma/generated/`.
 - The app can run commands without manual approval in some modes; review changes carefully before merging.
 
 ## Feature Notes (Keep Docs Current)
-- **Auto-Fix (Ratchet):** Automatically watches pull requests and dispatches agents to fix issues (1-minute check cadence). When a PR has failing CI or review comments, creates a fixer session to address them. PR states: `IDLE` / `CI_RUNNING` / `CI_FAILED` / `REVIEW_PENDING` / `READY` / `MERGED`. Workspace-level toggle controls whether auto-fix is active. Admin setting controls the default ratchet state for new workspaces.
+- **Auto-Fix (Ratchet):** Automatically watches pull requests and dispatches agents to fix issues (1-minute check cadence). When a PR has failing CI or actionable review feedback, creates a fixer session to address it. The global review-trigger mode defaults to `CHANGES_REQUESTED`, which includes changes-requested review bodies and unresolved inline review threads; `ALL_REVIEW_FEEDBACK` additionally permits top-level commented review summaries. Ordinary PR conversation comments never trigger Ratchet or advance its review snapshot. PR states: `IDLE` / `CI_RUNNING` / `CI_FAILED` / `REVIEW_PENDING` / `READY` / `MERGED`. Workspace-level toggle controls whether auto-fix is active. Admin settings control the default ratchet state for new workspaces and the global review-trigger mode. Each fixer dispatch is tracked via an explicit record on the workspace (snapshot key + outcome `RUNNING`/`COMPLETED`/`DIED` + retry count): deliberate stops and clean exits settle as `COMPLETED` (no re-dispatch while the PR state is unchanged), unexpected exits settle as `DIED` and are re-dispatched for the same PR state up to 3 times. Review comments belonging to resolved review threads (GraphQL `reviewThreads.isResolved`) are excluded from fixer dispatch prompts and from the "has actionable review comments" trigger; they still count toward the review-activity timestamp so dispatch snapshot keys stay stable when threads get resolved. Dispatch state is persisted as soon as prompt execution begins, without waiting for the full ACP turn to complete; a later prompt failure conditionally settles the matching dispatch as `DIED`.
 - **GitHub integration:** Uses local `gh` auth; issue fetch supports workspace issue picker (`listIssuesForWorkspace`) and Kanban intake (`listIssuesForProject`, assigned to `@me`). Starting from an issue creates a linked workspace (`githubIssueNumber`, `githubIssueUrl`).
 - **Linear integration:** Per-project issue provider can be set to Linear with encrypted API key + team selection. Kanban intake uses Linear issues assigned to the configured viewer. Starting from an issue creates a linked workspace (`linearIssueId`, `linearIssueIdentifier`, `linearIssueUrl`) and workspace lifecycle events best-effort sync issue state in Linear.
 - **Kanban model:** UI has a provider-driven intake column (`GitHub Issues` or `Linear Issues`) plus DB columns `WORKING`, `WAITING`, `DONE`. Column state is derived, not manually set; READY workspaces with no prior sessions are intentionally hidden, and archived workspaces preserve cached pre-archive column.
 - **Quick actions:** Workspace quick actions are markdown-driven from `prompts/quick-actions/` (frontmatter metadata + prompt body). Agent quick actions create follow-up sessions and auto-send prompt content when session is ready.
+- **Periodic Tasks:** Scheduled recurring tasks that create a fresh workspace on a configured cadence (daily, weekly, monthly, or testing cadences every minute/five minutes). Daily/weekly/monthly tasks can optionally be configured to run at a specific time of day in the user's browser timezone (`scheduledTime` HH:MM + IANA `timezone` fields). Each execution runs the configured prompt, monitors for PR creation, and advances the schedule. Concurrent runs are skipped. Managed via the "Periodic Tasks" admin tab and created from the Kanban launch dropdown. Workspace right panel shows execution history for periodic-task-sourced workspaces. Service capsule: `src/backend/services/periodic-task/`.
+- **Child Workspaces:** A parent workspace can spawn child workspaces (in any project) via MCP tools exposed to the agent (`spawn_child_workspace`, `send_message_to_child`, `archive_child_workspace`, `list_projects`). Children report back via `send_message_to_parent`. Messages are persisted first as `WorkspaceNotification` rows, then delivered live to active sessions when available; undelivered rows are delivered at the next session start. Max depth is 1 (children cannot have children). UI: ChildWorkspacesPanel in right panel, child badge on kanban cards, archive warning when parent has active children. Orchestration: `src/backend/orchestration/workspace-children.orchestrator.ts`. MCP server: `src/backend/services/session/service/acp/child-workspace-mcp-server.ts`.
 - **ACP Runtime:** All agent sessions use the Agent Client Protocol (ACP) via `@agentclientprotocol/sdk`. CLAUDE sessions spawn `claude-agent-acp`; CODEX sessions spawn Factory Factory's internal `codex-app-server-acp` adapter, both over stdio JSON-RPC. Session init/load is fail-fast and requires provider `configOptions` with model/mode categories. Permission requests present multi-option selection (`allow_once`, `allow_always`, `deny_once`, `deny_always`) and are bridged through ACP permission response handlers.

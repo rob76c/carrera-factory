@@ -14,12 +14,18 @@ import {
   IssueProvider as CoreIssueProvider,
   KanbanColumn as CoreKanbanColumn,
   PRState as CorePRState,
+  RatchetReviewTriggerMode as CoreRatchetReviewTriggerMode,
   RatchetState as CoreRatchetState,
   RunScriptStatus as CoreRunScriptStatus,
+  SessionPermissionPreset as CoreSessionPermissionPreset,
+  SessionProvider as CoreSessionProvider,
   SessionStatus as CoreSessionStatus,
   WorkspaceCreationSource as CoreWorkspaceCreationSource,
+  WorkspaceMode as CoreWorkspaceMode,
+  WorkspaceProviderSelection as CoreWorkspaceProviderSelection,
   WorkspaceStatus as CoreWorkspaceStatus,
 } from '@/shared/core';
+import { autoIterationConfigSchema } from './auto-iteration.schema';
 
 function enumValues<const T extends Record<string, string>>(enumObject: T) {
   return Object.values(enumObject) as [T[keyof T], ...T[keyof T][]];
@@ -30,14 +36,16 @@ const WorkspaceStatus = z.enum(enumValues(CoreWorkspaceStatus));
 const WorkspaceCreationSource = z.enum(enumValues(CoreWorkspaceCreationSource));
 const IssueProvider = z.enum(enumValues(CoreIssueProvider));
 const RunScriptStatus = z.enum(enumValues(CoreRunScriptStatus));
+const WorkspaceMode = z.enum(enumValues(CoreWorkspaceMode));
 const PRState = z.enum(enumValues(CorePRState));
 const CIStatus = z.enum(enumValues(CoreCIStatus));
 const KanbanColumn = z.enum(enumValues(CoreKanbanColumn));
 const RatchetState = z.enum(enumValues(CoreRatchetState));
+const RatchetReviewTriggerMode = z.enum(enumValues(CoreRatchetReviewTriggerMode));
 const SessionStatus = z.enum(enumValues(CoreSessionStatus));
-const SessionProvider = z.enum(['CLAUDE', 'CODEX']);
-const SessionPermissionPreset = z.enum(['STRICT', 'RELAXED', 'YOLO']);
-const WorkspaceProviderSelection = z.enum(['WORKSPACE_DEFAULT', 'CLAUDE', 'CODEX']);
+const SessionProvider = z.enum(enumValues(CoreSessionProvider));
+const SessionPermissionPreset = z.enum(enumValues(CoreSessionPermissionPreset));
+const WorkspaceProviderSelection = z.enum(enumValues(CoreWorkspaceProviderSelection));
 
 const exportedProjectSchema = z.object({
   id: z.string(),
@@ -80,6 +88,8 @@ const exportedWorkspaceSchema = z.object({
   runScriptPort: z.number().nullable(),
   runScriptStartedAt: z.string().nullable(),
   runScriptStatus: RunScriptStatus,
+  mode: WorkspaceMode.optional().default('STANDARD'),
+  autoIterationConfig: autoIterationConfigSchema.nullable().optional().default(null),
   prUrl: z.string().nullable(),
   githubIssueNumber: z.number().nullable(),
   githubIssueUrl: z.string().nullable(),
@@ -142,9 +152,12 @@ const exportedUserSettingsSchema = z.object({
   notificationSoundPath: z.string().nullable(),
   ratchetEnabled: z.boolean(),
   ratchetReplyToPrComments: z.boolean().optional().default(true),
+  ratchetReviewTriggerMode: RatchetReviewTriggerMode.optional().default('CHANGES_REQUESTED'),
   defaultSessionProvider: SessionProvider,
   defaultClaudeModel: z.string().optional().default('sonnet'),
   defaultCodexModel: z.string().optional().default('default'),
+  defaultClaudeReasoningEffort: z.string().nullable().optional().default(null),
+  defaultCodexReasoningEffort: z.string().nullable().optional().default(null),
   defaultWorkspacePermissions: SessionPermissionPreset.optional().default('STRICT'),
   ratchetPermissions: SessionPermissionPreset.optional().default('YOLO'),
 });

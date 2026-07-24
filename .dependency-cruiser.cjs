@@ -96,7 +96,7 @@ module.exports = {
       from: {
         path: '^src/backend',
         pathNot:
-          '^src/backend/(db\\.ts|server\\.ts|services/[^/]+/resources/)|^src/backend/.*\\.test\\.ts$',
+          '^src/backend/(app-context\\.ts|db\\.ts|services/[^/]+/resources/)|^src/backend/.*\\.test\\.ts$',
       },
       to: { path: '^src/backend/db\\.ts$' },
     },
@@ -111,8 +111,22 @@ module.exports = {
       name: 'no-orchestration-importing-service-internals',
       severity: 'error',
       comment: 'Orchestration must import service barrels only.',
-      from: { path: '^src/backend/orchestration/' },
+      from: {
+        path: '^src/backend/orchestration/',
+        pathNot: '^src/backend/orchestration/data-backup\\.service\\.ts$',
+      },
       to: { path: '^src/backend/services/[^/]+/(?!index\\.ts$).+' },
+    },
+    {
+      name: 'data-backup-orchestration-imports-only-data-backup-accessor',
+      severity: 'error',
+      comment: 'The backup orchestrator has one exact persistence exception.',
+      from: { path: '^src/backend/orchestration/data-backup\\.service\\.ts$' },
+      to: {
+        path: '^src/backend/services/[^/]+/(?!index\\.ts$).+',
+        pathNot:
+          '^src/backend/services/settings/resources/data-backup\\.accessor\\.ts$',
+      },
     },
     {
       name: 'only-service-layers-import-service-resources',
@@ -121,7 +135,7 @@ module.exports = {
       from: {
         path: '^src/backend',
         pathNot:
-          '^src/backend/services/[^/]+/(index\\.ts|service/|resources/)|^src/backend/.*\\.test\\.ts$',
+          '^src/backend/services/[^/]+/(index\\.ts|service/|resources/)|^src/backend/.*\\.test\\.ts$|^src/backend/orchestration/data-backup\\.service\\.ts$',
       },
       to: { path: '^src/backend/services/[^/]+/resources/' },
     },
@@ -158,7 +172,8 @@ module.exports = {
       comment: 'External consumers must import from service barrels only.',
       from: {
         path: '^src/backend',
-        pathNot: '^src/backend/services/([^/]+)/|^src/backend/.*\\.test\\.ts$',
+        pathNot:
+          '^src/backend/services/([^/]+)/|^src/backend/.*\\.test\\.ts$|^src/backend/orchestration/data-backup\\.service\\.ts$',
       },
       to: { path: '^src/backend/services/[^/]+/(?!index\\.ts$).+' },
     },
@@ -168,6 +183,15 @@ module.exports = {
       comment: 'Services should not depend on routers or tRPC transport layers.',
       from: { path: '^src/backend/services/' },
       to: { path: '^src/backend/(routers|trpc)/' },
+    },
+    {
+      name: 'no-trpc-server-in-services-or-orchestration',
+      severity: 'error',
+      comment: 'Services and orchestration must use transport-neutral application errors.',
+      from: { path: '^src/backend/(services|orchestration)/' },
+      to: {
+        path: '^node_modules/(?:\\.pnpm/[^/]+/node_modules/@trpc/server|@trpc/server)(?:/|$)',
+      },
     },
     {
       name: 'no-services-importing-agents',

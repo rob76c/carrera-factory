@@ -2,32 +2,31 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   WorkspaceGitHubBridge,
   WorkspacePRSnapshotBridge,
+  WorkspaceQuerySessionBridge,
   WorkspaceSessionBridge,
 } from '@/backend/services/workspace/service/bridges';
+import { WorkspaceSnapshotStore } from '@/backend/services/workspace/service/snapshot/workspace-snapshot-store.service';
 import { deriveWorkspaceFlowState } from '@/backend/services/workspace/service/state/flow-state';
 import { computeKanbanColumn } from '@/backend/services/workspace/service/state/kanban-state';
-import { WorkspaceSnapshotStore } from '@/backend/services/workspace-snapshot-store.service';
 import { CIStatus, PRState, RatchetState, RunScriptStatus, WorkspaceStatus } from '@/shared/core';
 import { deriveWorkspaceSidebarStatus } from '@/shared/workspace-sidebar-status';
 import { workspaceQueryService } from './workspace-query.service';
 
 const mockFindByProjectIdWithSessions = vi.fn();
-const mockFindByProjectId = vi.fn();
 const mockFindById = vi.fn();
 const mockFindByIdWithProject = vi.fn();
 const mockWorkspaceUpdate = vi.fn();
+const mockResetPRDiscoveryBackoff = vi.fn();
 const mockProjectFindById = vi.fn();
 const mockDeriveWorkspaceRuntimeState = vi.fn();
-const mockReadConfig = vi.fn();
 const mockGetWorkspaceGitStats = vi.fn();
-const mockSyncWorkspaceCommandsFromWorktreeConfig = vi.fn();
 
 vi.mock('@/backend/services/workspace/resources/workspace.accessor', () => ({
   workspaceAccessor: {
     findByProjectIdWithSessions: (...args: unknown[]) => mockFindByProjectIdWithSessions(...args),
-    findByProjectId: (...args: unknown[]) => mockFindByProjectId(...args),
     findById: (...args: unknown[]) => mockFindById(...args),
     findByIdWithProject: (...args: unknown[]) => mockFindByIdWithProject(...args),
+    resetPRDiscoveryBackoff: (...args: unknown[]) => mockResetPRDiscoveryBackoff(...args),
     update: (...args: unknown[]) => mockWorkspaceUpdate(...args),
   },
 }));
@@ -42,20 +41,7 @@ vi.mock('@/backend/services/workspace/service/state/workspace-runtime-state', ()
   deriveWorkspaceRuntimeState: (...args: unknown[]) => mockDeriveWorkspaceRuntimeState(...args),
 }));
 
-vi.mock('@/backend/services/factory-config.service', () => ({
-  FactoryConfigService: {
-    readConfig: (...args: unknown[]) => mockReadConfig(...args),
-  },
-}));
-
-vi.mock('@/backend/services/run-script-config-persistence.service', () => ({
-  runScriptConfigPersistenceService: {
-    syncWorkspaceCommandsFromWorktreeConfig: (...args: unknown[]) =>
-      mockSyncWorkspaceCommandsFromWorktreeConfig(...args),
-  },
-}));
-
-vi.mock('@/backend/services/git-ops.service', () => ({
+vi.mock('@/backend/services/workspace/service/worktree/git-ops.service', () => ({
   gitOpsService: {
     getWorkspaceGitStats: (...args: unknown[]) => mockGetWorkspaceGitStats(...args),
   },
@@ -73,9 +59,11 @@ vi.mock('@/backend/services/logger.service', () => ({
 describe('WorkspaceQueryService', () => {
   const mockIsAnySessionWorking = vi.fn<WorkspaceSessionBridge['isAnySessionWorking']>();
   const mockGetAllPendingRequests = vi.fn<WorkspaceSessionBridge['getAllPendingRequests']>();
-  const mockSessionBridge: WorkspaceSessionBridge = {
+  const mockGetRuntimeSnapshot = vi.fn<WorkspaceQuerySessionBridge['getRuntimeSnapshot']>();
+  const mockSessionBridge: WorkspaceQuerySessionBridge = {
     isAnySessionWorking: mockIsAnySessionWorking,
     getAllPendingRequests: mockGetAllPendingRequests,
+    getRuntimeSnapshot: mockGetRuntimeSnapshot,
   };
 
   const mockGithubCheckHealth = vi.fn();
@@ -92,6 +80,12 @@ describe('WorkspaceQueryService', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetRuntimeSnapshot.mockReturnValue({
+      phase: 'idle',
+      processState: 'alive',
+      activity: 'IDLE',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
 
     workspaceQueryService.configure({
       session: mockSessionBridge,
@@ -144,7 +138,7 @@ describe('WorkspaceQueryService', () => {
     });
   });
 
-  it('listWithKanbanState filters hidden columns and applies runtime-derived flags', async () => {
+  it('listWithKanbanState shows empty workspaces and applies runtime-derived reasons', async () => {
     mockFindByProjectIdWithSessions.mockResolvedValue([
       {
         id: 'w1',
@@ -153,8 +147,10 @@ describe('WorkspaceQueryService', () => {
         prState: 'NONE',
         prCiStatus: 'UNKNOWN',
         ratchetState: 'IDLE',
+        runScriptStatus: 'IDLE',
         hasHadSessions: false,
         createdAt: new Date('2026-01-01T00:00:00.000Z'),
+        agentSessions: [],
       },
       {
         id: 'w2',
@@ -163,8 +159,10 @@ describe('WorkspaceQueryService', () => {
         prState: 'OPEN',
         prCiStatus: 'PENDING',
         ratchetState: 'REVIEW_PENDING',
+        runScriptStatus: 'IDLE',
         hasHadSessions: true,
         createdAt: new Date('2026-01-02T00:00:00.000Z'),
+        agentSessions: [],
       },
     ]);
 
@@ -176,7 +174,7 @@ describe('WorkspaceQueryService', () => {
         hasActivePr: workspace.id === 'w2',
         isWorking: false,
         shouldAnimateRatchetButton: workspace.id === 'w2',
-        phase: 'HAS_PR',
+        phase: workspace.id === 'w2' ? 'CI_WAIT' : 'NO_PR',
         ciObservation: 'CHECKS_UNKNOWN',
       },
     }));
@@ -184,13 +182,231 @@ describe('WorkspaceQueryService', () => {
 
     const result = await workspaceQueryService.listWithKanbanState({ projectId: 'proj-1' });
 
-    expect(result).toHaveLength(1);
+    expect(result).toHaveLength(2);
     expect(result[0]).toMatchObject({
       id: 'w2',
       kanbanColumn: 'WAITING',
       pendingRequestType: 'user_question',
       ratchetButtonAnimated: true,
-      flowPhase: 'HAS_PR',
+      flowPhase: 'CI_WAIT',
+      statusReason: {
+        code: 'NEEDS_ANSWER',
+        label: 'Needs your answer',
+      },
+    });
+    expect(result[1]).toMatchObject({
+      id: 'w1',
+      kanbanColumn: 'WAITING',
+      statusReason: {
+        code: 'NO_SESSION_STARTED',
+        label: 'No session started',
+      },
+    });
+  });
+
+  it('keeps pending CI automation-owned without marking the session working', async () => {
+    mockProjectFindById.mockResolvedValue({ id: 'p1', defaultBranch: 'main' });
+    mockFindByProjectIdWithSessions.mockResolvedValue([
+      {
+        id: 'w-ci',
+        name: 'Pending CI',
+        status: WorkspaceStatus.READY,
+        createdAt: new Date('2026-01-01T00:00:00.000Z'),
+        worktreePath: null,
+        branchName: 'feature/pending-ci',
+        prUrl: 'https://github.com/org/repo/pull/1',
+        prNumber: 1,
+        prState: PRState.OPEN,
+        prCiStatus: CIStatus.PENDING,
+        prUpdatedAt: new Date('2026-01-01T00:00:00.000Z'),
+        ratchetEnabled: true,
+        ratchetState: RatchetState.CI_RUNNING,
+        ratchetDispatchOutcome: null,
+        ratchetDispatchRetryCount: 0,
+        runScriptStatus: RunScriptStatus.IDLE,
+        hasHadSessions: true,
+        stateComputedAt: null,
+        agentSessions: [],
+        terminalSessions: [],
+      },
+    ]);
+    mockDeriveWorkspaceRuntimeState.mockReturnValue({
+      sessionIds: [],
+      isSessionWorking: false,
+      isWorking: true,
+      flowState: {
+        hasActivePr: true,
+        isWorking: true,
+        shouldAnimateRatchetButton: true,
+        phase: 'CI_WAIT',
+        ciObservation: 'CHECKS_PENDING',
+      },
+    });
+    mockGetAllPendingRequests.mockReturnValue(new Map());
+    mockGithubCheckHealth.mockResolvedValue({ isInstalled: false, isAuthenticated: false });
+
+    const result = await workspaceQueryService.getProjectSummaryState('p1');
+
+    expect(result.workspaces[0]).toMatchObject({
+      id: 'w-ci',
+      isWorking: false,
+      cachedKanbanColumn: 'WORKING',
+    });
+  });
+
+  it('listWithKanbanState returns only workspaces matching the requested live kanbanColumn', async () => {
+    mockFindByProjectIdWithSessions.mockResolvedValue([
+      {
+        id: 'w1',
+        status: WorkspaceStatus.READY,
+        prUrl: null,
+        prState: PRState.NONE,
+        prCiStatus: CIStatus.UNKNOWN,
+        ratchetState: RatchetState.IDLE,
+        runScriptStatus: RunScriptStatus.IDLE,
+        hasHadSessions: true,
+        cachedKanbanColumn: 'WAITING',
+        createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      },
+    ]);
+
+    mockDeriveWorkspaceRuntimeState.mockReturnValue({
+      sessionIds: ['s-1'],
+      isSessionWorking: true,
+      isWorking: true,
+      flowState: {
+        hasActivePr: false,
+        isWorking: true,
+        shouldAnimateRatchetButton: false,
+        phase: 'NO_PR',
+        ciObservation: 'CHECKS_UNKNOWN',
+      },
+    });
+    mockGetAllPendingRequests.mockReturnValue(new Map());
+
+    const result = await workspaceQueryService.listWithKanbanState({
+      projectId: 'proj-1',
+      kanbanColumn: 'WAITING',
+    });
+
+    expect(result).toHaveLength(0);
+    expect(mockFindByProjectIdWithSessions).toHaveBeenCalledWith('proj-1', {
+      kanbanColumn: 'WAITING',
+      excludeStatuses: [WorkspaceStatus.ARCHIVING, WorkspaceStatus.ARCHIVED],
+    });
+  });
+
+  it('listWithKanbanState returns FAILED workspaces from the WAITING cache bucket', async () => {
+    mockFindByProjectIdWithSessions.mockResolvedValue([
+      {
+        id: 'w1',
+        status: WorkspaceStatus.FAILED,
+        prUrl: null,
+        prState: PRState.NONE,
+        prCiStatus: CIStatus.UNKNOWN,
+        ratchetState: RatchetState.IDLE,
+        runScriptStatus: RunScriptStatus.IDLE,
+        hasHadSessions: true,
+        cachedKanbanColumn: 'WAITING',
+        createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      },
+    ]);
+
+    mockDeriveWorkspaceRuntimeState.mockReturnValue({
+      sessionIds: [],
+      isSessionWorking: false,
+      isWorking: false,
+      flowState: {
+        hasActivePr: false,
+        isWorking: false,
+        shouldAnimateRatchetButton: false,
+        phase: 'NO_PR',
+        ciObservation: 'CHECKS_UNKNOWN',
+      },
+    });
+    mockGetAllPendingRequests.mockReturnValue(new Map());
+
+    const result = await workspaceQueryService.listWithKanbanState({
+      projectId: 'proj-1',
+      kanbanColumn: 'WAITING',
+    });
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      id: 'w1',
+      status: WorkspaceStatus.FAILED,
+      kanbanColumn: 'WAITING',
+    });
+    expect(mockFindByProjectIdWithSessions).toHaveBeenCalledWith('proj-1', {
+      kanbanColumn: 'WAITING',
+      excludeStatuses: [WorkspaceStatus.ARCHIVING, WorkspaceStatus.ARCHIVED],
+    });
+  });
+
+  it('surfaces session runtime errors in initial workspace query paths', async () => {
+    const erroredWorkspace = {
+      id: 'w1',
+      name: 'W1',
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      worktreePath: null,
+      branchName: null,
+      prUrl: null,
+      prNumber: null,
+      prState: PRState.NONE,
+      prCiStatus: CIStatus.UNKNOWN,
+      ratchetEnabled: false,
+      ratchetState: RatchetState.IDLE,
+      runScriptStatus: RunScriptStatus.IDLE,
+      hasHadSessions: true,
+      cachedKanbanColumn: 'WAITING',
+      stateComputedAt: null,
+      agentSessions: [
+        {
+          id: 's1',
+          name: null,
+          workflow: null,
+          model: null,
+          status: 'FAILED',
+          updatedAt: new Date('2026-01-01T00:00:00.000Z'),
+        },
+      ],
+      terminalSessions: [],
+    };
+
+    mockProjectFindById.mockResolvedValue({ id: 'p1', defaultBranch: 'main' });
+    mockFindByProjectIdWithSessions.mockResolvedValue([erroredWorkspace]);
+    mockDeriveWorkspaceRuntimeState.mockReturnValue({
+      sessionIds: ['s1'],
+      isSessionWorking: false,
+      isWorking: false,
+      flowState: {
+        hasActivePr: false,
+        isWorking: false,
+        shouldAnimateRatchetButton: false,
+        phase: 'NO_PR',
+        ciObservation: 'CHECKS_UNKNOWN',
+      },
+    });
+    mockGetRuntimeSnapshot.mockReturnValue({
+      phase: 'error',
+      processState: 'stopped',
+      activity: 'IDLE',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      errorMessage: 'Session crashed',
+    });
+    mockGetAllPendingRequests.mockReturnValue(new Map());
+    mockGithubCheckHealth.mockResolvedValue({ isInstalled: false, isAuthenticated: false });
+
+    const summary = await workspaceQueryService.getProjectSummaryState('p1');
+    const kanban = await workspaceQueryService.listWithKanbanState({ projectId: 'p1' });
+
+    expect(summary.workspaces[0]?.statusReason).toMatchObject({
+      code: 'SESSION_ERROR',
+      label: 'Session error',
+    });
+    expect(kanban[0]?.statusReason).toMatchObject({
+      code: 'SESSION_ERROR',
+      label: 'Session error',
     });
   });
 
@@ -210,6 +426,7 @@ describe('WorkspaceQueryService', () => {
         ratchetEnabled: false,
         ratchetState: 'IDLE',
         runScriptStatus: 'IDLE',
+        hasHadSessions: true,
         cachedKanbanColumn: 'WAITING',
         stateComputedAt: null,
         agentSessions: [{ updatedAt: new Date('2026-01-03T00:00:00.000Z') }],
@@ -243,7 +460,7 @@ describe('WorkspaceQueryService', () => {
         hasActivePr: workspace.id === 'w2',
         isWorking: workspace.id === 'w2',
         shouldAnimateRatchetButton: workspace.id === 'w2',
-        phase: workspace.id === 'w2' ? 'HAS_PR' : 'NO_PR',
+        phase: workspace.id === 'w2' ? 'CI_WAIT' : 'NO_PR',
         ciObservation: 'CHECKS_UNKNOWN',
       },
     }));
@@ -271,6 +488,7 @@ describe('WorkspaceQueryService', () => {
       isWorking: false,
       gitStats: expect.objectContaining({ total: 3 }),
     });
+    expect(mockGetWorkspaceGitStats).toHaveBeenCalledWith('/tmp/w1', 'main');
 
     // Flush background refresh promises (checkHealth → listReviewRequests → cache write).
     await new Promise((resolve) => setImmediate(resolve));
@@ -323,7 +541,7 @@ describe('WorkspaceQueryService', () => {
     mockDeriveWorkspaceRuntimeState.mockReturnValue({
       sessionIds: ['s-eq'],
       isSessionWorking: false,
-      isWorking: flowState.isWorking,
+      isWorking: false,
       flowState,
     });
 
@@ -373,62 +591,12 @@ describe('WorkspaceQueryService', () => {
     expect(summaryWorkspace?.ciObservation).toBe(snapshotEntry?.ciObservation);
     expect(summaryWorkspace?.sidebarStatus).toEqual(snapshotEntry?.sidebarStatus);
     expect(summaryWorkspace?.cachedKanbanColumn).toBe(snapshotEntry?.kanbanColumn);
+    expect(summaryWorkspace?.statusReason).toEqual(snapshotEntry?.statusReason);
 
     expect(kanban[0]?.flowPhase).toBe(snapshotEntry?.flowPhase);
     expect(kanban[0]?.ciObservation).toBe(snapshotEntry?.ciObservation);
     expect(kanban[0]?.kanbanColumn).toBe(snapshotEntry?.kanbanColumn);
-  });
-
-  it('refreshFactoryConfigs updates script commands and reports per-workspace errors', async () => {
-    mockFindByProjectId.mockResolvedValue([
-      { id: 'w1', worktreePath: '/tmp/w1' },
-      { id: 'w2', worktreePath: '/tmp/w2' },
-      { id: 'w3', worktreePath: null },
-    ]);
-
-    mockSyncWorkspaceCommandsFromWorktreeConfig
-      .mockResolvedValueOnce({
-        runScriptCommand: 'pnpm dev',
-        runScriptPostRunCommand: null,
-        runScriptCleanupCommand: 'pkill node',
-      })
-      .mockRejectedValueOnce(new Error('bad config'));
-
-    const result = await workspaceQueryService.refreshFactoryConfigs('p1');
-
-    expect(result).toEqual({
-      updatedCount: 1,
-      totalWorkspaces: 3,
-      errors: [{ workspaceId: 'w2', error: 'bad config' }],
-    });
-    expect(mockSyncWorkspaceCommandsFromWorktreeConfig).toHaveBeenCalledWith({
-      workspaceId: 'w1',
-      worktreePath: '/tmp/w1',
-      persistWorkspaceCommands: expect.any(Function),
-    });
-    expect(mockSyncWorkspaceCommandsFromWorktreeConfig).toHaveBeenCalledWith({
-      workspaceId: 'w2',
-      worktreePath: '/tmp/w2',
-      persistWorkspaceCommands: expect.any(Function),
-    });
-    expect(mockSyncWorkspaceCommandsFromWorktreeConfig).toHaveBeenCalledTimes(2);
-  });
-
-  it('getFactoryConfig validates project and handles read errors', async () => {
-    mockProjectFindById.mockResolvedValueOnce(null);
-    await expect(workspaceQueryService.getFactoryConfig('missing')).rejects.toThrow(
-      'Project not found'
-    );
-
-    mockProjectFindById.mockResolvedValueOnce({ id: 'p1', repoPath: '/repo' });
-    mockReadConfig.mockResolvedValueOnce({ scripts: { run: 'pnpm dev' } });
-    await expect(workspaceQueryService.getFactoryConfig('p1')).resolves.toEqual({
-      scripts: { run: 'pnpm dev' },
-    });
-
-    mockProjectFindById.mockResolvedValueOnce({ id: 'p1', repoPath: '/repo' });
-    mockReadConfig.mockRejectedValueOnce(new Error('boom'));
-    await expect(workspaceQueryService.getFactoryConfig('p1')).resolves.toBeNull();
+    expect(kanban[0]?.statusReason).toEqual(snapshotEntry?.statusReason);
   });
 
   it('syncPRStatus and syncAllPRStatuses handle success and failure paths', async () => {
@@ -481,9 +649,95 @@ describe('WorkspaceQueryService', () => {
     });
   });
 
+  it('syncPRStatus resets discovery backoff before returning no_pr_url', async () => {
+    mockFindById.mockResolvedValue({ id: 'w1', prUrl: null });
+    mockResetPRDiscoveryBackoff.mockResolvedValue(true);
+
+    await expect(workspaceQueryService.syncPRStatus('w1')).resolves.toEqual({
+      success: false,
+      reason: 'no_pr_url',
+    });
+
+    expect(mockResetPRDiscoveryBackoff).toHaveBeenCalledOnce();
+    expect(mockResetPRDiscoveryBackoff).toHaveBeenCalledWith('w1');
+    expect(mockRefreshWorkspace).not.toHaveBeenCalled();
+  });
+
+  it('syncAllPRStatuses does not reset discovery backoff for workspaces without PRs', async () => {
+    mockFindByProjectIdWithSessions.mockResolvedValue([
+      { id: 'w1', prUrl: null },
+      { id: 'w2', prUrl: null },
+    ]);
+
+    await expect(workspaceQueryService.syncAllPRStatuses('p1')).resolves.toEqual({ queued: 0 });
+
+    expect(mockResetPRDiscoveryBackoff).not.toHaveBeenCalled();
+  });
+
+  it('skips concurrent syncAllPRStatuses calls while the workspace lookup is pending', async () => {
+    let resolveLookup:
+      | ((workspaces: Array<{ id: string; prUrl: string | null }>) => void)
+      | undefined;
+    const lookupPromise = new Promise<Array<{ id: string; prUrl: string | null }>>((resolve) => {
+      resolveLookup = resolve;
+    });
+
+    mockFindByProjectIdWithSessions.mockReturnValueOnce(lookupPromise);
+    mockRefreshWorkspace.mockResolvedValueOnce({ success: true });
+
+    const firstSync = workspaceQueryService.syncAllPRStatuses('p1');
+    await Promise.resolve();
+
+    await expect(workspaceQueryService.syncAllPRStatuses('p1')).resolves.toEqual({ queued: 0 });
+    expect(mockFindByProjectIdWithSessions).toHaveBeenCalledTimes(1);
+
+    resolveLookup?.([{ id: 'w1', prUrl: 'https://github.com/o/r/pull/1' }]);
+    await expect(firstSync).resolves.toEqual({ queued: 1 });
+    await vi.waitFor(() => {
+      expect(mockRefreshWorkspace).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('runs syncAllPRStatuses independently for different projects', async () => {
+    let resolveFirstRefresh: ((result: { success: boolean }) => void) | undefined;
+    const firstRefresh = new Promise<{ success: boolean }>((resolve) => {
+      resolveFirstRefresh = resolve;
+    });
+
+    mockFindByProjectIdWithSessions.mockImplementation(async (projectId: string) => [
+      {
+        id: projectId === 'p1' ? 'w1' : 'w2',
+        prUrl: `https://github.com/o/r/pull/${projectId === 'p1' ? '1' : '2'}`,
+      },
+    ]);
+    mockRefreshWorkspace.mockImplementation((workspaceId: string) =>
+      workspaceId === 'w1' ? firstRefresh : Promise.resolve({ success: true })
+    );
+
+    try {
+      await expect(workspaceQueryService.syncAllPRStatuses('p1')).resolves.toEqual({ queued: 1 });
+      await vi.waitFor(() => {
+        expect(mockRefreshWorkspace).toHaveBeenCalledWith('w1', 'https://github.com/o/r/pull/1');
+      });
+
+      await expect(workspaceQueryService.syncAllPRStatuses('p2')).resolves.toEqual({ queued: 1 });
+      expect(mockFindByProjectIdWithSessions).toHaveBeenCalledWith('p2', {
+        excludeStatuses: [WorkspaceStatus.ARCHIVING, WorkspaceStatus.ARCHIVED],
+      });
+      await vi.waitFor(() => {
+        expect(mockRefreshWorkspace).toHaveBeenCalledWith('w2', 'https://github.com/o/r/pull/2');
+      });
+    } finally {
+      resolveFirstRefresh?.({ success: true });
+      await firstRefresh;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  });
+
   it('hasChanges checks workspace metadata and git stats safely', async () => {
     mockFindByIdWithProject.mockResolvedValueOnce(null);
     await expect(workspaceQueryService.hasChanges('w1')).resolves.toBe(false);
+    expect(mockGetWorkspaceGitStats).not.toHaveBeenCalled();
 
     mockFindByIdWithProject.mockResolvedValueOnce({
       id: 'w1',
@@ -497,6 +751,7 @@ describe('WorkspaceQueryService', () => {
       hasUncommitted: false,
     });
     await expect(workspaceQueryService.hasChanges('w1')).resolves.toBe(false);
+    expect(mockGetWorkspaceGitStats).toHaveBeenLastCalledWith('/tmp/w1', 'main');
 
     mockFindByIdWithProject.mockResolvedValueOnce({
       id: 'w1',
@@ -510,6 +765,7 @@ describe('WorkspaceQueryService', () => {
       hasUncommitted: false,
     });
     await expect(workspaceQueryService.hasChanges('w1')).resolves.toBe(true);
+    expect(mockGetWorkspaceGitStats).toHaveBeenLastCalledWith('/tmp/w1', 'main');
 
     mockFindByIdWithProject.mockResolvedValueOnce({
       id: 'w1',
