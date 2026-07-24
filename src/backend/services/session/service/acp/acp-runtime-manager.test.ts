@@ -238,10 +238,18 @@ describe('AcpRuntimeManager', () => {
         defaultContext()
       );
 
-      // Verify spawn was called with correct args
+      // Verify spawn was called with correct args: the packaged adapter bin
+      // script is run with the current Node executable so it works on Windows
       expect(mockSpawn).toHaveBeenCalledTimes(1);
       const spawnArgs = mockSpawn.mock.calls[0]!;
-      expect(spawnArgs[1]).toEqual([]);
+      expect(spawnArgs[0]).toBe(process.execPath);
+      const claudeArgs = spawnArgs[1] as string[];
+      expect(claudeArgs).toHaveLength(1);
+      expect(claudeArgs[0]).toContain('claude-agent-acp');
+      expect(claudeArgs[0]!.endsWith('.js')).toBe(true);
+      expect((spawnArgs[2] as { env?: Record<string, string> }).env?.ELECTRON_RUN_AS_NODE).toBe(
+        '1'
+      );
       expect(spawnArgs[2]).toMatchObject({
         cwd: '/tmp/workspace',
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -292,9 +300,12 @@ describe('AcpRuntimeManager', () => {
       expect(spawnArgs[1]).toContain('internal');
       expect(spawnArgs[1]).toContain('codex-app-server-acp');
       expect(
-        (spawnArgs[1] as string[]).some(
-          (arg) => arg.endsWith('src/cli/index.ts') || arg.endsWith('dist/src/cli/index.js')
-        )
+        (spawnArgs[1] as string[]).some((arg) => {
+          const normalized = arg.replaceAll('\\', '/');
+          return (
+            normalized.endsWith('src/cli/index.ts') || normalized.endsWith('dist/src/cli/index.js')
+          );
+        })
       ).toBe(true);
       expect(typeof spawnArgs[0]).toBe('string');
       expect((spawnArgs[0] as string).length).toBeGreaterThan(0);
@@ -343,9 +354,12 @@ describe('AcpRuntimeManager', () => {
         expect(args.some((arg) => arg.endsWith('tsconfig.json'))).toBe(true);
       }
       expect(
-        args.some(
-          (arg) => arg.endsWith('src/cli/index.ts') || arg.endsWith('dist/src/cli/index.js')
-        )
+        args.some((arg) => {
+          const normalized = arg.replaceAll('\\', '/');
+          return (
+            normalized.endsWith('src/cli/index.ts') || normalized.endsWith('dist/src/cli/index.js')
+          );
+        })
       ).toBe(true);
     });
 
