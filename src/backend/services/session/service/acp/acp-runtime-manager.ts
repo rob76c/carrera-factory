@@ -255,16 +255,7 @@ export class AcpRuntimeManager {
         }
       : isCodex
         ? resolveInternalCodexAcpSpawnCommand(this.preferSourceEntrypoint)
-        : (() => {
-            const binaryName = 'claude-agent-acp';
-            const packageName = '@agentclientprotocol/claude-agent-acp';
-            const binaryPath = resolveAcpBinary(packageName, binaryName);
-            return {
-              command: binaryPath,
-              args: [],
-              commandLabel: binaryPath,
-            };
-          })();
+        : resolveAcpBinary('@agentclientprotocol/claude-agent-acp', 'claude-agent-acp');
 
     logger.info('Spawning ACP subprocess', {
       sessionId,

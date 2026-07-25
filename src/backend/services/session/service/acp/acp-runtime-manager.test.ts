@@ -270,7 +270,13 @@ describe('AcpRuntimeManager', () => {
       // Verify spawn was called with correct args
       expect(mockSpawn).toHaveBeenCalledTimes(1);
       const spawnArgs = mockSpawn.mock.calls[0]!;
-      expect(spawnArgs[1]).toEqual([]);
+      // The packaged adapter bin is a .js script, so it is run with the current
+      // Node executable rather than spawned directly (Windows cannot exec .js).
+      expect(spawnArgs[0]).toBe(process.execPath);
+      const claudeArgs = spawnArgs[1] as string[];
+      expect(claudeArgs).toHaveLength(1);
+      expect(claudeArgs[0]).toContain('claude-agent-acp');
+      expect(claudeArgs[0]?.endsWith('.js')).toBe(true);
       expect(spawnArgs[2]).toMatchObject({
         cwd: '/tmp/workspace',
         stdio: ['pipe', 'pipe', 'pipe'],

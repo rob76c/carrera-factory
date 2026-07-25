@@ -25,11 +25,17 @@ export function createAcpSpawnError(commandLabel: string, error: unknown): Error
 }
 
 /**
- * Resolves the full path to an ACP adapter binary by finding its package
- * directory and reading the bin field from package.json.
- * Falls back to the bare command name (relies on PATH).
+ * Resolves the spawn command for an ACP adapter shipped as an npm package by
+ * finding its package directory and reading the bin field from package.json.
+ *
+ * The bin target is a .js script, which Windows cannot execute directly (and
+ * the node_modules/.bin shims are .cmd files that spawn() cannot run either),
+ * so it is invoked with the current Node executable.
+ *
+ * Falls back to the bare command name on PATH, which is how the Docker image
+ * resolves the adapter (node_modules/.bin is on PATH there).
  */
-export function resolveAcpBinary(packageName: string, binaryName: string): string {
+export function resolveAcpBinary(packageName: string, binaryName: string): SpawnCommand {
   try {
     const packageJsonPath = requireFromCurrentModule.resolve(`${packageName}/package.json`);
     const packageDir = dirname(packageJsonPath);
@@ -43,7 +49,12 @@ export function resolveAcpBinary(packageName: string, binaryName: string): strin
           ? pkg.bin[binaryName]
           : undefined;
     if (binPath) {
-      return join(packageDir, binPath);
+      const scriptPath = join(packageDir, binPath);
+      return {
+        command: process.execPath,
+        args: [scriptPath],
+        commandLabel: `${process.execPath} ${scriptPath}`,
+      };
     }
   } catch {
     logger.debug('Could not resolve binary via package.json, falling back to PATH', {
@@ -51,7 +62,7 @@ export function resolveAcpBinary(packageName: string, binaryName: string): strin
       binaryName,
     });
   }
-  return binaryName;
+  return { command: binaryName, args: [], commandLabel: binaryName };
 }
 
 export async function withTimeout<T>(params: {
