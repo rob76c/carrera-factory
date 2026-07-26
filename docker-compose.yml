@@ -24,6 +24,10 @@ services:
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:7001}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - CLOUD_MODE=${CLOUD_MODE:-cloudflare}
+      # WebSocket upgrades (terminal, chat, setup-terminal, logs) require a loopback
+      # or trusted-local client address. With a published port, browser traffic from
+      # the host arrives as the Docker bridge gateway, so it must be trusted here.
+      - TRUSTED_LOCAL_CIDRS=${TRUSTED_LOCAL_CIDRS:-172.19.0.1/32}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7001/health"]
       interval: 30s

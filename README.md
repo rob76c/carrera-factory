@@ -119,6 +119,11 @@ pnpm typecheck
 pnpm check
 ```
 
+If you want to use this in docker run the command:
+```bash
+docker compose up -d --build
+```
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for project structure, conventions, and the full contributor workflow.
 
 ## Acknowledgements
