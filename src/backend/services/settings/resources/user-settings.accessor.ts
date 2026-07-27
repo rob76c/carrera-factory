@@ -7,6 +7,12 @@ import type {
 import { Prisma } from '@prisma-gen/client';
 import { prisma } from '@/backend/db';
 import { normalizeSessionModelForProvider } from '@/backend/lib/session-model';
+import {
+  DEFAULT_CLAUDE_MODEL,
+  DEFAULT_CLAUDE_REASONING_EFFORT,
+  DEFAULT_CODEX_MODEL,
+  DEFAULT_CODEX_REASONING_EFFORT,
+} from '@/shared/provider-defaults';
 import { workspaceOrderMapSchema } from '@/shared/schemas/persisted-stores.schema';
 
 interface UpdateUserSettingsInput {
@@ -100,10 +106,10 @@ class UserSettingsAccessor {
           customIdeCommand: null,
           playSoundOnComplete: true,
           defaultSessionProvider: 'CLAUDE',
-          defaultClaudeModel: 'sonnet',
-          defaultCodexModel: 'default',
-          defaultClaudeReasoningEffort: null,
-          defaultCodexReasoningEffort: null,
+          defaultClaudeModel: DEFAULT_CLAUDE_MODEL,
+          defaultCodexModel: DEFAULT_CODEX_MODEL,
+          defaultClaudeReasoningEffort: DEFAULT_CLAUDE_REASONING_EFFORT,
+          defaultCodexReasoningEffort: DEFAULT_CODEX_REASONING_EFFORT,
           defaultWorkspacePermissions: 'STRICT',
           ratchetReplyToPrComments: true,
           ratchetReviewTriggerMode: 'CHANGES_REQUESTED',
@@ -158,10 +164,17 @@ class UserSettingsAccessor {
         playSoundOnComplete: data.playSoundOnComplete ?? true,
         cachedSlashCommands: data.cachedSlashCommands ?? undefined,
         defaultSessionProvider: data.defaultSessionProvider ?? 'CLAUDE',
-        defaultClaudeModel: normalizedClaudeModel ?? 'sonnet',
-        defaultCodexModel: normalizedCodexModel ?? 'default',
-        defaultClaudeReasoningEffort: normalizedClaudeEffort ?? null,
-        defaultCodexReasoningEffort: normalizedCodexEffort ?? null,
+        defaultClaudeModel: normalizedClaudeModel ?? DEFAULT_CLAUDE_MODEL,
+        defaultCodexModel: normalizedCodexModel ?? DEFAULT_CODEX_MODEL,
+        // `null` is an explicit "provider default" choice; only an absent field seeds.
+        defaultClaudeReasoningEffort:
+          normalizedClaudeEffort === undefined
+            ? DEFAULT_CLAUDE_REASONING_EFFORT
+            : normalizedClaudeEffort,
+        defaultCodexReasoningEffort:
+          normalizedCodexEffort === undefined
+            ? DEFAULT_CODEX_REASONING_EFFORT
+            : normalizedCodexEffort,
         defaultWorkspacePermissions: data.defaultWorkspacePermissions ?? 'STRICT',
         ratchetReplyToPrComments: data.ratchetReplyToPrComments ?? true,
         ratchetReviewTriggerMode: data.ratchetReviewTriggerMode ?? 'CHANGES_REQUESTED',

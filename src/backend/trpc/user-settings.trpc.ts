@@ -36,15 +36,19 @@ type ProviderOptions = {
 const CLAUDE_FALLBACK_OPTIONS: ProviderOptions = {
   source: 'fallback',
   models: [
-    { value: 'sonnet', label: 'Sonnet' },
     { value: 'opus', label: 'Opus' },
+    { value: 'sonnet', label: 'Sonnet' },
     { value: 'haiku', label: 'Haiku' },
     { value: 'fable', label: 'Fable' },
   ],
+  // Mirrors the Claude adapter's effort levels. Levels a model does not support
+  // are skipped at session start rather than failing the session.
   efforts: [
     { value: 'low', label: 'Low' },
     { value: 'medium', label: 'Medium' },
     { value: 'high', label: 'High' },
+    { value: 'xhigh', label: 'Extra High' },
+    { value: 'max', label: 'Max' },
   ],
 };
 

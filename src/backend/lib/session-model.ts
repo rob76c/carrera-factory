@@ -3,7 +3,7 @@ import type { SessionProvider } from '@prisma-gen/client';
 const CLAUDE_MODEL_ALIASES = new Set(['opus', 'sonnet', 'haiku', 'fable']);
 
 export const DEFAULT_SESSION_MODEL_BY_PROVIDER: Record<SessionProvider, string> = {
-  CLAUDE: 'sonnet',
+  CLAUDE: 'opus',
   CODEX: 'default',
 };
 

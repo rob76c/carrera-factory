@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
 import {
   ClientSideConnection,
@@ -20,6 +20,8 @@ import {
   resolveAcpBinary,
   resolveInternalCodexAcpSpawnCommand,
   type SpawnCommand,
+  spawnAcpAdapter,
+  toAcpSpawnCommand,
   withTimeout,
 } from './acp-runtime-spawn';
 import { requireSessionConfigOptions } from './acp-session-config-options';
@@ -248,23 +250,12 @@ export class AcpRuntimeManager {
 
     const isCodex = options.provider === 'CODEX';
     const spawnCommand: SpawnCommand = options.adapterBinaryPath
-      ? {
-          command: options.adapterBinaryPath,
-          args: [],
-          commandLabel: options.adapterBinaryPath,
-        }
+      ? toAcpSpawnCommand(options.adapterBinaryPath)
       : isCodex
         ? resolveInternalCodexAcpSpawnCommand(this.preferSourceEntrypoint)
-        : (() => {
-            const binaryName = 'claude-agent-acp';
-            const packageName = '@agentclientprotocol/claude-agent-acp';
-            const binaryPath = resolveAcpBinary(packageName, binaryName);
-            return {
-              command: binaryPath,
-              args: [],
-              commandLabel: binaryPath,
-            };
-          })();
+        : toAcpSpawnCommand(
+            resolveAcpBinary('@agentclientprotocol/claude-agent-acp', 'claude-agent-acp')
+          );
 
     logger.info('Spawning ACP subprocess', {
       sessionId,
@@ -281,7 +272,7 @@ export class AcpRuntimeManager {
     };
 
     // Spawn subprocess (CRITICAL: detached MUST be false for orphan prevention)
-    const child: ChildProcess = spawn(spawnCommand.command, spawnCommand.args, {
+    const child: ChildProcess = spawnAcpAdapter(spawnCommand, {
       cwd: options.workingDir,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: spawnEnv,

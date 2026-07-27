@@ -177,8 +177,8 @@ describe('userSettingsRouter', () => {
       CLAUDE: {
         source: 'fallback',
         models: [
-          { value: 'sonnet', label: 'Sonnet' },
           { value: 'opus', label: 'Opus' },
+          { value: 'sonnet', label: 'Sonnet' },
           { value: 'haiku', label: 'Haiku' },
           { value: 'fable', label: 'Fable' },
         ],
@@ -186,6 +186,8 @@ describe('userSettingsRouter', () => {
           { value: 'low', label: 'Low' },
           { value: 'medium', label: 'Medium' },
           { value: 'high', label: 'High' },
+          { value: 'xhigh', label: 'Extra High' },
+          { value: 'max', label: 'Max' },
         ],
       },
       CODEX: {

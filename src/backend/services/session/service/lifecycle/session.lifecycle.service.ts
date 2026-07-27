@@ -635,6 +635,12 @@ export class SessionLifecycleService {
     try {
       handle = await creationPromise;
       this.assertStartupAllowed(sessionId, stopGeneration);
+      // Model first: providers rebuild their effort option around the selected model.
+      await this.sessionConfigService.applyConfiguredModel(sessionId, handle, clientOptions.model, {
+        persistSnapshot: false,
+        emitUpdates: false,
+      });
+      this.assertStartupAllowed(sessionId, stopGeneration);
       await this.sessionConfigService.applyConfiguredReasoningEffort(sessionId, handle, {
         persistSnapshot: false,
         emitUpdates: false,

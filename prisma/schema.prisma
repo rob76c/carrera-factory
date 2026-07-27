@@ -392,9 +392,9 @@ model UserSettings {
   ratchetReplyToPrComments  Boolean  @default(true)   // Whether Ratchet should post PR/review comment replies
   ratchetReviewTriggerMode  RatchetReviewTriggerMode @default(CHANGES_REQUESTED)
   defaultSessionProvider    SessionProvider @default(CLAUDE)
-  defaultClaudeModel        String @default("sonnet")
+  defaultClaudeModel        String @default("opus")
   defaultCodexModel         String @default("default")
-  defaultClaudeReasoningEffort String?
+  defaultClaudeReasoningEffort String? @default("max")
   defaultCodexReasoningEffort  String?
   defaultWorkspacePermissions SessionPermissionPreset @default(STRICT) // Default execution-mode preset for non-ratchet sessions
   ratchetPermissions        SessionPermissionPreset @default(YOLO) // Default execution-mode preset for ratchet sessions

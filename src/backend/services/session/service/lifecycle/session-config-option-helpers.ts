@@ -37,6 +37,82 @@ export function getConfigOptionValues(option: SessionConfigOption): string[] {
   return getSelectOptions(option).map((entry) => entry.value);
 }
 
+// Tokens that carry no model identity, so they must not drive a fuzzy match.
+const MODEL_TOKEN_STOPWORDS = new Set(['claude', 'default', 'recommended', 'latest']);
+
+function tokenizeModelIdentifier(value: string): string[] {
+  return value
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length > 0 && !MODEL_TOKEN_STOPWORDS.has(token));
+}
+
+function isTokenSubset(subset: string[], superset: string[]): boolean {
+  if (subset.length === 0) {
+    return false;
+  }
+  const values = new Set(superset);
+  return subset.every((token) => values.has(token));
+}
+
+/**
+ * Map a stored model preference onto a value the provider actually offers.
+ *
+ * Settings hold provider-agnostic aliases ("opus"), while ACP model options are
+ * whatever the adapter reports for its version — the same alias, a dated id
+ * ("claude-opus-4-6"), or a "default" sentinel. Matching only on exact equality
+ * silently drops the user's choice, so fall back to display names and token
+ * overlap before giving up.
+ */
+export function resolveModelOptionValue(
+  option: SessionConfigOption,
+  requestedModel: string
+): string | null {
+  const requested = requestedModel.trim();
+  if (!requested) {
+    return null;
+  }
+
+  const selectOptions = getSelectOptions(option);
+  if (selectOptions.length === 0) {
+    // Provider did not enumerate values; pass the request through unchanged.
+    return requested;
+  }
+
+  const lower = requested.toLowerCase();
+  const exactValue = selectOptions.find(
+    (entry) => entry.value === requested || entry.value.toLowerCase() === lower
+  );
+  if (exactValue) {
+    return exactValue.value;
+  }
+
+  const exactName = selectOptions.find((entry) => entry.name?.toLowerCase() === lower);
+  if (exactName) {
+    return exactName.value;
+  }
+
+  const requestedTokens = tokenizeModelIdentifier(requested);
+  if (requestedTokens.length === 0) {
+    return null;
+  }
+
+  const tokenMatch = selectOptions.find((entry) => {
+    if (entry.value.toLowerCase() === 'default') {
+      return false;
+    }
+    const valueTokens = tokenizeModelIdentifier(entry.value);
+    const nameTokens = entry.name ? tokenizeModelIdentifier(entry.name) : [];
+    return (
+      isTokenSubset(requestedTokens, valueTokens) ||
+      isTokenSubset(valueTokens, requestedTokens) ||
+      isTokenSubset(requestedTokens, nameTokens)
+    );
+  });
+
+  return tokenMatch?.value ?? null;
+}
+
 function toNonEmptyString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value : null;
 }
