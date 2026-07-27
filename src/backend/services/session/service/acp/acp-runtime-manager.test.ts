@@ -3,6 +3,21 @@ import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+// Spawn args carry native paths, so compare on separator-agnostic suffixes.
+function normalizePathArg(arg: string): string {
+  return arg.replace(/\\/g, '/');
+}
+
+function isCliEntrypointArg(arg: string): boolean {
+  const normalized = normalizePathArg(arg);
+  return normalized.endsWith('src/cli/index.ts') || normalized.endsWith('dist/src/cli/index.js');
+}
+
+function isTsxArg(arg: string): boolean {
+  const normalized = normalizePathArg(arg);
+  return /(^|\/)tsx(\.cmd)?$/i.test(normalized) || normalized.includes('/tsx/dist/');
+}
+
 // ---- Hoisted mock state (shared between factory and tests) ----
 
 const {
@@ -267,10 +282,13 @@ describe('AcpRuntimeManager', () => {
         defaultContext()
       );
 
-      // Verify spawn was called with correct args
+      // Verify spawn was called with correct args. The Claude adapter bin is a
+      // shebang JS file, so it must run through Node rather than be executed
+      // directly — Windows cannot spawn a .js file (`spawn UNKNOWN`).
       expect(mockSpawn).toHaveBeenCalledTimes(1);
       const spawnArgs = mockSpawn.mock.calls[0]!;
-      expect(spawnArgs[1]).toEqual([]);
+      expect(spawnArgs[0]).toBe(process.execPath);
+      expect(spawnArgs[1]).toEqual([expect.stringContaining('claude-agent-acp')]);
       expect(spawnArgs[2]).toMatchObject({
         cwd: '/tmp/workspace',
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -320,20 +338,13 @@ describe('AcpRuntimeManager', () => {
       const spawnArgs = mockSpawn.mock.calls[0]!;
       expect(spawnArgs[1]).toContain('internal');
       expect(spawnArgs[1]).toContain('codex-app-server-acp');
-      expect(
-        (spawnArgs[1] as string[]).some(
-          (arg) => arg.endsWith('src/cli/index.ts') || arg.endsWith('dist/src/cli/index.js')
-        )
-      ).toBe(true);
+      expect((spawnArgs[1] as string[]).some(isCliEntrypointArg)).toBe(true);
       expect(typeof spawnArgs[0]).toBe('string');
       expect((spawnArgs[0] as string).length).toBeGreaterThan(0);
       expect((spawnArgs[2] as { env?: Record<string, string> }).env?.DOTENV_CONFIG_QUIET).toBe(
         'true'
       );
-      if (
-        (spawnArgs[0] as string).endsWith('tsx') ||
-        (spawnArgs[0] as string).endsWith('tsx.cmd')
-      ) {
+      if ((spawnArgs[1] as string[]).some(isTsxArg)) {
         expect(spawnArgs[1]).toContain('--tsconfig');
         expect((spawnArgs[1] as string[]).some((arg) => arg.endsWith('tsconfig.json'))).toBe(true);
       }
@@ -367,15 +378,11 @@ describe('AcpRuntimeManager', () => {
       expect(command.length).toBeGreaterThan(0);
       expect(args).toContain('internal');
       expect(args).toContain('codex-app-server-acp');
-      if (command.endsWith('tsx') || command.endsWith('tsx.cmd')) {
+      if (args.some(isTsxArg)) {
         expect(args).toContain('--tsconfig');
         expect(args.some((arg) => arg.endsWith('tsconfig.json'))).toBe(true);
       }
-      expect(
-        args.some(
-          (arg) => arg.endsWith('src/cli/index.ts') || arg.endsWith('dist/src/cli/index.js')
-        )
-      ).toBe(true);
+      expect(args.some(isCliEntrypointArg)).toBe(true);
     });
 
     it('rejects cleanly when ACP binary spawn fails (ENOENT)', async () => {

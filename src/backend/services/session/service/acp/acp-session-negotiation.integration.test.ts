@@ -105,7 +105,9 @@ const CODEX_SESSION_FIXTURE: SessionFixture = {
 };
 
 function createFakeAcpBinary(tempDir: string, fileName: string, fixture: SessionFixture): string {
-  const binaryPath = join(tempDir, fileName);
+  // `.js` so the adapter runs through Node on every platform. An extensionless
+  // shebang script is unspawnable on Windows, which made this suite Windows-only red.
+  const binaryPath = join(tempDir, `${fileName}.js`);
   const script = `#!/usr/bin/env node
 const sessionFixture = ${JSON.stringify(fixture)};
 

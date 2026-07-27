@@ -1,6 +1,7 @@
+import { type ChildProcess, type SpawnOptions, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
+import { dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createLogger } from '@/backend/services/logger.service';
 import { normalizeUnknownError } from './acp-stream-normalizer';
@@ -15,8 +16,84 @@ export type SpawnCommand = {
   commandLabel: string;
 };
 
+const NODE_SCRIPT_EXTENSIONS = new Set(['.js', '.mjs', '.cjs']);
+
 export function hasUsableWorkingDir(workingDir: string | null | undefined): boolean {
   return typeof workingDir === 'string' && workingDir.trim().length > 0;
+}
+
+/**
+ * Wrap a resolved adapter path into a command that spawns on every platform.
+ *
+ * npm package bins are shebang JS files. POSIX runs them via the shebang, but
+ * Windows `CreateProcess` cannot execute a `.js` file at all — spawning one
+ * throws `spawn UNKNOWN` synchronously, which is why ACP adapters only ever
+ * started under Docker. Running the script through the current Node binary is
+ * equivalent on POSIX and also drops the dependency on the file's exec bit.
+ */
+export function toAcpSpawnCommand(binaryPath: string, extraArgs: string[] = []): SpawnCommand {
+  if (NODE_SCRIPT_EXTENSIONS.has(extname(binaryPath).toLowerCase())) {
+    const args = [binaryPath, ...extraArgs];
+    return {
+      command: process.execPath,
+      args,
+      commandLabel: `${process.execPath} ${args.join(' ')}`.trim(),
+    };
+  }
+
+  return {
+    command: binaryPath,
+    args: extraArgs,
+    commandLabel: `${binaryPath} ${extraArgs.join(' ')}`.trim(),
+  };
+}
+
+/**
+ * Spawn an ACP adapter, normalizing failures into one error shape.
+ *
+ * An unspawnable command (`spawn UNKNOWN` on a Windows `.js` path, `spawn EINVAL`
+ * on a `.cmd` shim) throws synchronously instead of emitting 'error', so callers
+ * cannot rely on the child's error listener alone.
+ */
+export function spawnAcpAdapter(
+  spawnCommand: SpawnCommand,
+  spawnOptions: SpawnOptions
+): ChildProcess {
+  try {
+    return spawn(spawnCommand.command, spawnCommand.args, spawnOptions);
+  } catch (error) {
+    throw createAcpSpawnError(spawnCommand.commandLabel, error);
+  }
+}
+
+/**
+ * Resolve a package bin to its on-disk script path, following the package's own
+ * `bin` field. Returns null when the package is not installed.
+ */
+function resolvePackageBinScript(
+  projectRoot: string,
+  packageName: string,
+  binaryName: string
+): string | null {
+  const packageJsonPath = join(projectRoot, 'node_modules', packageName, 'package.json');
+  if (!existsSync(packageJsonPath)) {
+    return null;
+  }
+
+  try {
+    const pkg = requireFromCurrentModule(packageJsonPath) as {
+      bin?: string | Record<string, string | undefined>;
+    };
+    const binPath =
+      typeof pkg.bin === 'string'
+        ? pkg.bin
+        : typeof pkg.bin?.[binaryName] === 'string'
+          ? pkg.bin[binaryName]
+          : undefined;
+    return binPath ? join(dirname(packageJsonPath), binPath) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function createAcpSpawnError(commandLabel: string, error: unknown): Error {
@@ -127,12 +204,15 @@ export function resolveInternalCodexAcpSpawnCommand(preferSourceEntrypoint: bool
   const cliSourceEntrypoint = join(projectRoot, 'src', 'cli', 'index.ts');
   const cliDistEntrypoint = join(projectRoot, 'dist', 'src', 'cli', 'index.js');
   const tsconfigPath = join(projectRoot, 'tsconfig.json');
-  const tsxBin = join(
-    projectRoot,
-    'node_modules',
-    '.bin',
-    process.platform === 'win32' ? 'tsx.cmd' : 'tsx'
-  );
+  // Prefer tsx's own JS entrypoint over the `node_modules/.bin` shim: on Windows
+  // that shim is a `.cmd`, and spawning one without a shell throws `spawn EINVAL`.
+  const tsxScript = resolvePackageBinScript(projectRoot, 'tsx', 'tsx');
+  const tsxShim = join(projectRoot, 'node_modules', '.bin', 'tsx');
+  const tsxCommand: SpawnCommand | null = tsxScript
+    ? toAcpSpawnCommand(tsxScript)
+    : process.platform !== 'win32' && existsSync(tsxShim)
+      ? toAcpSpawnCommand(tsxShim)
+      : null;
   const hasTypeScriptRuntime =
     process.execArgv.some((arg) => arg.includes('tsx')) ||
     process.execArgv.some((arg) => arg.includes('ts-node'));
@@ -150,17 +230,18 @@ export function resolveInternalCodexAcpSpawnCommand(preferSourceEntrypoint: bool
     if (!existsSync(cliSourceEntrypoint)) {
       return null;
     }
-    if (existsSync(tsxBin)) {
+    if (tsxCommand) {
       const args = [
+        ...tsxCommand.args,
         ...(existsSync(tsconfigPath) ? ['--tsconfig', tsconfigPath] : []),
         cliSourceEntrypoint,
         'internal',
         'codex-app-server-acp',
       ];
       return {
-        command: tsxBin,
+        command: tsxCommand.command,
         args,
-        commandLabel: `${tsxBin} ${args.join(' ')}`.trim(),
+        commandLabel: `${tsxCommand.command} ${args.join(' ')}`.trim(),
       };
     }
     if (hasTypeScriptRuntime) {
