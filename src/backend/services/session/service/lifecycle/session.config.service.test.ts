@@ -746,6 +746,151 @@ describe('SessionConfigService', () => {
     expect(sessionDomain.emitDelta).not.toHaveBeenCalled();
   });
 
+  it('applies the session model to a new ACP handle without immediate emit when requested', async () => {
+    const handle = unsafeCoerce<AcpProcessHandle>({
+      provider: 'CLAUDE',
+      providerSessionId: 'provider-session-1',
+      configOptions: [
+        {
+          id: 'model',
+          name: 'Model',
+          type: 'select',
+          category: 'model',
+          currentValue: 'sonnet',
+          options: [
+            { value: 'sonnet', name: 'Sonnet 4.5' },
+            { value: 'opus', name: 'Opus 4.6' },
+          ],
+        },
+      ],
+    });
+    runtimeManager.setSessionModel.mockResolvedValue([
+      { ...handle.configOptions[0], currentValue: 'opus' },
+    ]);
+
+    await service.applyConfiguredModel('session-1', handle, 'opus', {
+      persistSnapshot: false,
+      emitUpdates: false,
+    });
+
+    expect(runtimeManager.setSessionModel).toHaveBeenCalledWith('session-1', 'opus');
+    expect(handle.configOptions[0]?.currentValue).toBe('opus');
+    expect(repository.updateSession).not.toHaveBeenCalled();
+    expect(sessionDomain.emitDelta).not.toHaveBeenCalled();
+  });
+
+  it('resolves a stored model alias against dated ACP model ids', async () => {
+    const handle = unsafeCoerce<AcpProcessHandle>({
+      provider: 'CLAUDE',
+      providerSessionId: 'provider-session-1',
+      configOptions: [
+        {
+          id: 'model',
+          name: 'Model',
+          type: 'select',
+          category: 'model',
+          currentValue: 'claude-sonnet-4-5',
+          options: [
+            { value: 'claude-sonnet-4-5', name: 'Sonnet 4.5' },
+            { value: 'claude-opus-4-6', name: 'Opus 4.6' },
+          ],
+        },
+      ],
+    });
+    runtimeManager.setSessionModel.mockResolvedValue([
+      { ...handle.configOptions[0], currentValue: 'claude-opus-4-6' },
+    ]);
+
+    await service.applyConfiguredModel('session-1', handle, 'opus', {
+      persistSnapshot: false,
+      emitUpdates: false,
+    });
+
+    expect(runtimeManager.setSessionModel).toHaveBeenCalledWith('session-1', 'claude-opus-4-6');
+  });
+
+  it('falls back to the configured default model when the session has none', async () => {
+    vi.mocked(userSettingsService.get).mockResolvedValue(
+      unsafeCoerce({ defaultClaudeModel: 'opus' })
+    );
+    const handle = unsafeCoerce<AcpProcessHandle>({
+      provider: 'CLAUDE',
+      providerSessionId: 'provider-session-1',
+      configOptions: [
+        {
+          id: 'model',
+          name: 'Model',
+          type: 'select',
+          category: 'model',
+          currentValue: 'sonnet',
+          options: [
+            { value: 'sonnet', name: 'Sonnet 4.5' },
+            { value: 'opus', name: 'Opus 4.6' },
+          ],
+        },
+      ],
+    });
+    runtimeManager.setSessionModel.mockResolvedValue([
+      { ...handle.configOptions[0], currentValue: 'opus' },
+    ]);
+
+    await service.applyConfiguredModel('session-1', handle, null, {
+      persistSnapshot: false,
+      emitUpdates: false,
+    });
+
+    expect(runtimeManager.setSessionModel).toHaveBeenCalledWith('session-1', 'opus');
+  });
+
+  it('skips applying the configured model when the provider already selected it', async () => {
+    const handle = unsafeCoerce<AcpProcessHandle>({
+      provider: 'CLAUDE',
+      providerSessionId: 'provider-session-1',
+      configOptions: [
+        {
+          id: 'model',
+          name: 'Model',
+          type: 'select',
+          category: 'model',
+          currentValue: 'opus',
+          options: [
+            { value: 'sonnet', name: 'Sonnet 4.5' },
+            { value: 'opus', name: 'Opus 4.6' },
+          ],
+        },
+      ],
+    });
+
+    await service.applyConfiguredModel('session-1', handle, 'opus');
+
+    expect(runtimeManager.setSessionModel).not.toHaveBeenCalled();
+  });
+
+  it('skips applying the configured model when the provider does not offer it', async () => {
+    const handle = unsafeCoerce<AcpProcessHandle>({
+      provider: 'CODEX',
+      providerSessionId: 'provider-codex-1',
+      configOptions: [
+        {
+          id: 'model',
+          name: 'Model',
+          type: 'select',
+          category: 'model',
+          currentValue: 'gpt-5.3-codex',
+          options: [{ value: 'gpt-5.3-codex', name: 'GPT-5.3 Codex' }],
+        },
+      ],
+    });
+
+    await service.applyConfiguredModel('session-codex', handle, 'opus');
+
+    expect(runtimeManager.setSessionModel).not.toHaveBeenCalled();
+    expect(mockLogger.debug).toHaveBeenCalledWith(
+      'Skipping unsupported configured model for ACP session',
+      expect.objectContaining({ model: 'opus', availableValues: ['gpt-5.3-codex'] })
+    );
+  });
+
   it('updates cached config snapshot when setting config on inactive session', async () => {
     runtimeManager.getClient.mockReturnValue(undefined);
     repository.getSessionById.mockResolvedValue(

@@ -801,6 +801,7 @@ function createStartableLifecycleService(options?: {
     clearSession: vi.fn(),
   };
   const sessionConfigService = {
+    applyConfiguredModel: vi.fn(async () => undefined),
     applyConfiguredReasoningEffort: vi.fn(async () => undefined),
     applyStartupModePreset: vi.fn(async () => undefined),
     applyConfiguredPermissionPreset: vi.fn(async () => undefined),

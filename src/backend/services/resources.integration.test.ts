@@ -779,8 +779,10 @@ describe('resource accessors integration', () => {
       expect(settings.userId).toBe('default');
       expect(settings.preferredIde).toBe('cursor');
       expect(settings.playSoundOnComplete).toBe(true);
-      expect(settings.defaultClaudeModel).toBe('sonnet');
+      expect(settings.defaultClaudeModel).toBe('opus');
       expect(settings.defaultCodexModel).toBe('default');
+      expect(settings.defaultClaudeReasoningEffort).toBe('max');
+      expect(settings.defaultCodexReasoningEffort).toBeNull();
     });
 
     it('returns one default row for concurrent first reads', async () => {

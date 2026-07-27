@@ -18,6 +18,7 @@ import {
   buildCodexConfigOptionsWithModelCatalog,
   getConfigOptionValues,
   getSelectOptions,
+  resolveModelOptionValue,
   type SessionProvider,
 } from './session-config-option-helpers';
 
@@ -259,18 +260,18 @@ export class SessionConfigService {
     if (acpHandle) {
       const modelOption = acpHandle.configOptions.find((option) => option.category === 'model');
       if (modelOption && model) {
-        const availableValues = getConfigOptionValues(modelOption);
-        if (availableValues.length > 0 && !availableValues.includes(model)) {
+        const resolvedModel = resolveModelOptionValue(modelOption, model);
+        if (!resolvedModel) {
           logger.debug('Skipping unsupported model for ACP session', {
             sessionId,
             provider: acpHandle.provider,
             model,
-            availableValues,
+            availableValues: getConfigOptionValues(modelOption),
           });
           return;
         }
 
-        await this.setSessionConfigOption(sessionId, modelOption.id, model);
+        await this.setSessionConfigOption(sessionId, modelOption.id, resolvedModel);
       }
       return;
     }
@@ -332,6 +333,78 @@ export class SessionConfigService {
       targetReasoningEffort,
       source: requestedReasoningEffort ? 'message' : 'settings',
     });
+  }
+
+  /**
+   * Push the session's configured model onto a freshly created ACP session.
+   *
+   * ACP adapters pick their own model at `newSession` time (Claude falls back to
+   * the CLI's own settings), so without this the configured default is never
+   * applied and every session silently starts on the adapter's choice. Must run
+   * before {@link applyConfiguredReasoningEffort}: providers rebuild the effort
+   * option around the selected model.
+   */
+  async applyConfiguredModel(
+    sessionId: string,
+    handle: AcpProcessHandle,
+    requestedModel: string | null | undefined,
+    options?: {
+      persistSnapshot?: boolean;
+      emitUpdates?: boolean;
+    }
+  ): Promise<void> {
+    const provider = handle.provider as SessionProvider;
+    const targetModel =
+      requestedModel?.trim() ||
+      (await this.resolveConfiguredModelFromSettings(sessionId, provider));
+    if (!targetModel) {
+      return;
+    }
+
+    const modelOption = handle.configOptions.find((option) => option.category === 'model');
+    if (!modelOption) {
+      logger.debug('Skipping configured model because provider has no model option', {
+        sessionId,
+        provider,
+      });
+      return;
+    }
+
+    const resolvedModel = resolveModelOptionValue(modelOption, targetModel);
+    if (!resolvedModel) {
+      logger.debug('Skipping unsupported configured model for ACP session', {
+        sessionId,
+        provider,
+        model: targetModel,
+        availableValues: getConfigOptionValues(modelOption),
+      });
+      return;
+    }
+
+    const currentModel = modelOption.currentValue ? String(modelOption.currentValue) : null;
+    if (currentModel === resolvedModel) {
+      return;
+    }
+
+    const configOptions = await this.runtimeManager.setSessionModel(sessionId, resolvedModel);
+    handle.configOptions = configOptions;
+    if (options?.persistSnapshot !== false) {
+      await this.persistAcpConfigSnapshot(sessionId, {
+        provider,
+        providerSessionId: handle.providerSessionId,
+        configOptions,
+      });
+    }
+    if (options?.emitUpdates !== false) {
+      this.sessionDomainService.emitDelta(sessionId, {
+        type: 'config_options_update',
+        configOptions,
+      } as SessionDeltaEvent);
+      this.sessionDomainService.emitDelta(sessionId, {
+        type: 'chat_capabilities',
+        capabilities: this.buildAcpChatBarCapabilities(handle),
+      });
+    }
   }
 
   async applyConfiguredReasoningEffort(
@@ -663,6 +736,25 @@ export class SessionConfigService {
         error: error instanceof Error ? error.message : String(error),
       });
       return fallback;
+    }
+  }
+
+  private async resolveConfiguredModelFromSettings(
+    sessionId: string,
+    provider: SessionProvider
+  ): Promise<string | null> {
+    try {
+      const settings = await userSettingsService.get();
+      const value =
+        provider === 'CLAUDE' ? settings.defaultClaudeModel : settings.defaultCodexModel;
+      return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+    } catch (error) {
+      logger.warn('Failed loading user model defaults; using provider default', {
+        sessionId,
+        provider,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
     }
   }
 

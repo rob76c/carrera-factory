@@ -40,6 +40,7 @@ import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { RatchetWrenchIcon, WorkspacesBackLink } from '@/components/workspace';
 import { DevServerSetupPanel } from '@/components/workspace/dev-server-setup-panel';
+import { DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL } from '@/shared/provider-defaults';
 import type { PublicIssueTrackerConfig } from '@/shared/schemas/issue-tracker-config.schema';
 import {
   ApiUsageSection,
@@ -474,8 +475,8 @@ function ChatProviderDefaultsSection() {
     staleTime: 30_000,
   });
   const utils = trpc.useUtils();
-  const [localClaudeModel, setLocalClaudeModel] = useState('sonnet');
-  const [localCodexModel, setLocalCodexModel] = useState('default');
+  const [localClaudeModel, setLocalClaudeModel] = useState(DEFAULT_CLAUDE_MODEL);
+  const [localCodexModel, setLocalCodexModel] = useState(DEFAULT_CODEX_MODEL);
   const updateSettings = trpc.userSettings.update.useMutation({
     onSuccess: () => {
       toast.success('Chat defaults updated');
@@ -487,8 +488,8 @@ function ChatProviderDefaultsSection() {
   });
 
   useEffect(() => {
-    setLocalClaudeModel(settings?.defaultClaudeModel ?? 'sonnet');
-    setLocalCodexModel(settings?.defaultCodexModel ?? 'default');
+    setLocalClaudeModel(settings?.defaultClaudeModel ?? DEFAULT_CLAUDE_MODEL);
+    setLocalCodexModel(settings?.defaultCodexModel ?? DEFAULT_CODEX_MODEL);
   }, [settings?.defaultClaudeModel, settings?.defaultCodexModel]);
 
   if (isLoading) {
@@ -506,8 +507,8 @@ function ChatProviderDefaultsSection() {
   }
 
   const currentProvider = settings?.defaultSessionProvider ?? 'CLAUDE';
-  const currentClaudeModel = settings?.defaultClaudeModel ?? 'sonnet';
-  const currentCodexModel = settings?.defaultCodexModel ?? 'default';
+  const currentClaudeModel = settings?.defaultClaudeModel ?? DEFAULT_CLAUDE_MODEL;
+  const currentCodexModel = settings?.defaultCodexModel ?? DEFAULT_CODEX_MODEL;
   const currentClaudeReasoningEffort = settings?.defaultClaudeReasoningEffort ?? null;
   const currentCodexReasoningEffort = settings?.defaultCodexReasoningEffort ?? null;
   const currentWorkspacePermissions = settings?.defaultWorkspacePermissions ?? 'STRICT';
@@ -528,7 +529,7 @@ function ChatProviderDefaultsSection() {
   };
   const modelSettingsByProvider = {
     CLAUDE: {
-      fallbackValue: 'sonnet',
+      fallbackValue: DEFAULT_CLAUDE_MODEL,
       currentValue: currentClaudeModel,
       localValue: localClaudeModel,
       setLocalValue: setLocalClaudeModel,
@@ -536,7 +537,7 @@ function ChatProviderDefaultsSection() {
       buildEffortPayload: (effort: string | null) => ({ defaultClaudeReasoningEffort: effort }),
     },
     CODEX: {
-      fallbackValue: 'default',
+      fallbackValue: DEFAULT_CODEX_MODEL,
       currentValue: currentCodexModel,
       localValue: localCodexModel,
       setLocalValue: setLocalCodexModel,

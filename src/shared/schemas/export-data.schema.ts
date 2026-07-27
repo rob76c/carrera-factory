@@ -25,6 +25,12 @@ import {
   WorkspaceProviderSelection as CoreWorkspaceProviderSelection,
   WorkspaceStatus as CoreWorkspaceStatus,
 } from '@/shared/core';
+import {
+  DEFAULT_CLAUDE_MODEL,
+  DEFAULT_CLAUDE_REASONING_EFFORT,
+  DEFAULT_CODEX_MODEL,
+  DEFAULT_CODEX_REASONING_EFFORT,
+} from '@/shared/provider-defaults';
 import { autoIterationConfigSchema } from './auto-iteration.schema';
 
 function enumValues<const T extends Record<string, string>>(enumObject: T) {
@@ -154,10 +160,18 @@ const exportedUserSettingsSchema = z.object({
   ratchetReplyToPrComments: z.boolean().optional().default(true),
   ratchetReviewTriggerMode: RatchetReviewTriggerMode.optional().default('CHANGES_REQUESTED'),
   defaultSessionProvider: SessionProvider,
-  defaultClaudeModel: z.string().optional().default('sonnet'),
-  defaultCodexModel: z.string().optional().default('default'),
-  defaultClaudeReasoningEffort: z.string().nullable().optional().default(null),
-  defaultCodexReasoningEffort: z.string().nullable().optional().default(null),
+  defaultClaudeModel: z.string().optional().default(DEFAULT_CLAUDE_MODEL),
+  defaultCodexModel: z.string().optional().default(DEFAULT_CODEX_MODEL),
+  defaultClaudeReasoningEffort: z
+    .string()
+    .nullable()
+    .optional()
+    .default(DEFAULT_CLAUDE_REASONING_EFFORT),
+  defaultCodexReasoningEffort: z
+    .string()
+    .nullable()
+    .optional()
+    .default(DEFAULT_CODEX_REASONING_EFFORT),
   defaultWorkspacePermissions: SessionPermissionPreset.optional().default('STRICT'),
   ratchetPermissions: SessionPermissionPreset.optional().default('YOLO'),
 });
